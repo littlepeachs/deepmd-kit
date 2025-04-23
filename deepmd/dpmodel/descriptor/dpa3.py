@@ -124,6 +124,8 @@ class RepFlowArgs:
     smooth_edge_update : bool, optional
         Whether to make edge update smooth.
         If True, the edge update from angle message will not use self as padding.
+    use_rbf : bool, optional
+        Whether to use RBF for edge update.
     """
 
     def __init__(
@@ -151,6 +153,7 @@ class RepFlowArgs:
         skip_stat: bool = False,
         optim_update: bool = True,
         smooth_edge_update: bool = False,
+        use_rbf: bool = False,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
     ) -> None:
@@ -179,6 +182,7 @@ class RepFlowArgs:
         self.a_compress_use_split = a_compress_use_split
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
+        self.use_rbf = use_rbf
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
 
@@ -212,6 +216,7 @@ class RepFlowArgs:
             "fix_stat_std": self.fix_stat_std,
             "optim_update": self.optim_update,
             "smooth_edge_update": self.smooth_edge_update,
+            "use_rbf": self.use_rbf,
         }
 
     @classmethod
@@ -308,6 +313,7 @@ class DescrptDPA3(NativeOP, BaseDescriptor):
             fix_stat_std=self.repflow_args.fix_stat_std,
             optim_update=self.repflow_args.optim_update,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
+            use_rbf=self.repflow_args.use_rbf,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

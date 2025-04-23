@@ -1,194 +1,626 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-import os
 import unittest
-
-import numpy as np
-import tensorflow.compat.v1 as tf
-import torch
-
-tf.disable_eager_execution()
-
-import json
-from pathlib import (
-    Path,
+from collections import (
+    OrderedDict,
 )
 
-from deepmd.pt.model.descriptor import (
-    prod_env_mat,
+from deepmd.dpmodel.descriptor import (
+    DescrptDPA1,
+    DescrptDPA2,
+    DescrptDPA3,
+    DescrptHybrid,
+    DescrptSeA,
+    DescrptSeR,
+    DescrptSeT,
+    DescrptSeTTebd,
 )
-from deepmd.pt.utils import (
-    dp_random,
-    env,
+from deepmd.dpmodel.descriptor.dpa2 import (
+    RepformerArgs,
+    RepinitArgs,
 )
-from deepmd.pt.utils.dataset import (
-    DeepmdDataSetForLoader,
-)
-from deepmd.pt.utils.env import (
-    DEVICE,
-    GLOBAL_NP_FLOAT_PRECISION,
-    GLOBAL_PT_FLOAT_PRECISION,
-)
-from deepmd.pt.utils.nlist import (
-    extend_input_and_build_neighbor_list,
-)
-from deepmd.tf.common import (
-    expand_sys_str,
-)
-from deepmd.tf.env import (
-    op_module,
+from deepmd.dpmodel.descriptor.dpa3 import (
+    RepFlowArgs,
 )
 
-from ..test_finetune import (
-    energy_data_requirement,
+from ....consistent.common import (
+    parameterize_func,
+    parameterized,
 )
-from .test_embedding_net import (
-    get_single_batch,
+from ....seed import (
+    GLOBAL_SEED,
+)
+from ....utils import (
+    CI,
+    TEST_DEVICE,
+)
+from ...common.cases.descriptor.descriptor import (
+    DescriptorTest,
+)
+from ..backend import (
+    DPTestCase,
 )
 
-CUR_DIR = os.path.dirname(__file__)
+
+def DescriptorParamSeA(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    env_protection=0.0,
+    exclude_types=[],
+    resnet_dt=False,
+    type_one_side=True,
+    precision="float64",
+):
+    input_dict = {
+        "ntypes": ntypes,
+        "rcut": rcut,
+        "rcut_smth": rcut_smth,
+        "sel": sel,
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+        "env_protection": env_protection,
+        "resnet_dt": resnet_dt,
+        "type_one_side": type_one_side,
+        "exclude_types": exclude_types,
+        "precision": precision,
+    }
+    return input_dict
 
 
-def base_se_a(rcut, rcut_smth, sel, batch, mean, stddev):
-    g = tf.Graph()
-    with g.as_default():
-        coord = tf.placeholder(GLOBAL_NP_FLOAT_PRECISION, [None, None])
-        box = tf.placeholder(GLOBAL_NP_FLOAT_PRECISION, [None, None])
-        atype = tf.placeholder(tf.int32, [None, None])
-        natoms_vec = tf.placeholder(tf.int32, [None])
-        default_mesh = tf.placeholder(tf.int32, [None])
-        stat_descrpt, descrpt_deriv, rij, nlist = op_module.prod_env_mat_a(
-            coord,
-            atype,
-            natoms_vec,
-            box,
-            default_mesh,
-            tf.constant(mean),
-            tf.constant(stddev),
-            rcut_a=-1.0,
-            rcut_r=rcut,
-            rcut_r_smth=rcut_smth,
-            sel_a=sel,
-            sel_r=[0 for i in sel],
-        )
-
-        net_deriv_reshape = tf.ones_like(stat_descrpt)
-        force = op_module.prod_force_se_a(
-            net_deriv_reshape,
-            descrpt_deriv,
-            nlist,
-            natoms_vec,
-            n_a_sel=sum(sel),
-            n_r_sel=0,
-        )
-
-    with tf.Session(graph=g) as sess:
-        y = sess.run(
-            [stat_descrpt, force, nlist],
-            feed_dict={
-                coord: batch["coord"],
-                box: batch["box"],
-                natoms_vec: batch["natoms"],
-                atype: batch["atype"],
-                default_mesh: np.array([0, 0, 0, 2, 2, 2]),
-            },
-        )
-    tf.reset_default_graph()
-    return y
+DescriptorParamSeAList = parameterize_func(
+    DescriptorParamSeA,
+    OrderedDict(
+        {
+            "resnet_dt": (False, True),
+            "type_one_side": (True, False),
+            "exclude_types": ([], [[0, 1]]),
+            "env_protection": (0.0, 1e-8, 1e-2),
+            "precision": ("float64",),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamSeA = DescriptorParamSeAList[0]
 
 
-class TestSeA(unittest.TestCase):
+def DescriptorParamSeR(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    env_protection=0.0,
+    exclude_types=[],
+    resnet_dt=False,
+    type_one_side=True,
+    precision="float64",
+):
+    input_dict = {
+        "ntypes": ntypes,
+        "rcut": rcut,
+        "rcut_smth": rcut_smth,
+        "sel": sel,
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+        "env_protection": env_protection,
+        "resnet_dt": resnet_dt,
+        "type_one_side": type_one_side,
+        "exclude_types": exclude_types,
+        "precision": precision,
+    }
+    return input_dict
+
+
+DescriptorParamSeRList = parameterize_func(
+    DescriptorParamSeR,
+    OrderedDict(
+        {
+            "resnet_dt": (False, True),
+            "type_one_side": (True,),  # type_one_side == False not implemented
+            "exclude_types": ([], [[0, 1]]),
+            "env_protection": (0.0, 1e-8),
+            "precision": ("float64",),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamSeR = DescriptorParamSeRList[0]
+
+
+def DescriptorParamSeT(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    env_protection=0.0,
+    exclude_types=[],
+    resnet_dt=False,
+    precision="float64",
+):
+    input_dict = {
+        "ntypes": ntypes,
+        "rcut": rcut,
+        "rcut_smth": rcut_smth,
+        "sel": sel,
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+        "env_protection": env_protection,
+        "resnet_dt": resnet_dt,
+        "exclude_types": exclude_types,
+        "precision": precision,
+    }
+    return input_dict
+
+
+DescriptorParamSeTList = parameterize_func(
+    DescriptorParamSeT,
+    OrderedDict(
+        {
+            "resnet_dt": (False, True),
+            "exclude_types": ([], [[0, 1]]),
+            "env_protection": (0.0, 1e-8),
+            "precision": ("float64",),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamSeT = DescriptorParamSeTList[0]
+
+
+def DescriptorParamSeTTebd(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    env_protection=0.0,
+    exclude_types=[],
+    tebd_dim=4,
+    tebd_input_mode="concat",
+    concat_output_tebd=True,
+    resnet_dt=True,
+    set_davg_zero=True,
+    smooth=True,
+    use_econf_tebd=False,
+    use_tebd_bias=False,
+    precision="float64",
+):
+    input_dict = {
+        "ntypes": ntypes,
+        "rcut": rcut,
+        "rcut_smth": rcut_smth,
+        "sel": sel,  # use a small sel for efficiency
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+        "tebd_dim": tebd_dim,
+        "tebd_input_mode": tebd_input_mode,
+        "concat_output_tebd": concat_output_tebd,
+        "resnet_dt": resnet_dt,
+        "exclude_types": exclude_types,
+        "env_protection": env_protection,
+        "set_davg_zero": set_davg_zero,
+        "smooth": smooth,
+        "use_econf_tebd": use_econf_tebd,
+        "use_tebd_bias": use_tebd_bias,
+        "precision": precision,
+    }
+    return input_dict
+
+
+DescriptorParamSeTTebdList = parameterize_func(
+    DescriptorParamSeTTebd,
+    OrderedDict(
+        {
+            "tebd_dim": (4,),
+            "tebd_input_mode": ("concat", "strip"),
+            "resnet_dt": (True,),
+            "exclude_types": ([], [[0, 1]]),
+            "env_protection": (0.0,),
+            "set_davg_zero": (False,),
+            "smooth": (True, False),
+            "concat_output_tebd": (True,),
+            "use_econf_tebd": (False, True),
+            "use_tebd_bias": (False,),
+            "precision": ("float64",),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamSeTTebd = DescriptorParamSeTTebdList[0]
+
+
+def DescriptorParamDPA1(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    env_protection=0.0,
+    exclude_types=[],
+    tebd_dim=4,
+    tebd_input_mode="concat",
+    attn=20,
+    attn_layer=2,
+    attn_dotr=True,
+    scaling_factor=1.0,
+    normalize=True,
+    temperature=None,
+    ln_eps=1e-5,
+    concat_output_tebd=True,
+    resnet_dt=True,
+    type_one_side=True,
+    set_davg_zero=True,
+    smooth_type_embedding=True,
+    use_econf_tebd=False,
+    use_tebd_bias=False,
+    precision="float64",
+):
+    input_dict = {
+        "ntypes": ntypes,
+        "rcut": rcut,
+        "rcut_smth": rcut_smth,
+        "sel": sel,
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+        "tebd_dim": tebd_dim,
+        "tebd_input_mode": tebd_input_mode,
+        "attn": attn,
+        "attn_layer": attn_layer,
+        "attn_dotr": attn_dotr,
+        "attn_mask": False,
+        "scaling_factor": scaling_factor,
+        "normalize": normalize,
+        "temperature": temperature,
+        "ln_eps": ln_eps,
+        "concat_output_tebd": concat_output_tebd,
+        "resnet_dt": resnet_dt,
+        "type_one_side": type_one_side,
+        "exclude_types": exclude_types,
+        "env_protection": env_protection,
+        "set_davg_zero": set_davg_zero,
+        "smooth_type_embedding": smooth_type_embedding,
+        "use_econf_tebd": use_econf_tebd,
+        "use_tebd_bias": use_tebd_bias,
+        "precision": precision,
+    }
+    return input_dict
+
+
+DescriptorParamDPA1List = parameterize_func(
+    DescriptorParamDPA1,
+    OrderedDict(
+        {
+            "tebd_dim": (4,),
+            "tebd_input_mode": ("concat", "strip"),
+            "resnet_dt": (True,),
+            "type_one_side": (False,),
+            "attn": (20,),
+            "attn_layer": (0, 2),
+            "attn_dotr": (True,),
+            "exclude_types": ([], [[0, 1]]),
+            "env_protection": (0.0,),
+            "set_davg_zero": (False,),
+            "scaling_factor": (1.0,),
+            "normalize": (True,),
+            "temperature": (None, 1.0),
+            "ln_eps": (1e-5,),
+            "smooth_type_embedding": (True, False),
+            "concat_output_tebd": (True,),
+            "use_econf_tebd": (False, True),
+            "use_tebd_bias": (False,),
+            "precision": ("float64",),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamDPA1 = DescriptorParamDPA1List[0]
+
+
+def DescriptorParamDPA2(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    repinit_tebd_input_mode="concat",
+    repinit_set_davg_zero=False,
+    repinit_type_one_side=False,
+    repinit_use_three_body=False,
+    repformer_direct_dist=False,
+    repformer_update_g1_has_conv=True,
+    repformer_update_g1_has_drrd=True,
+    repformer_update_g1_has_grrg=True,
+    repformer_update_g1_has_attn=True,
+    repformer_update_g2_has_g1g1=True,
+    repformer_update_g2_has_attn=True,
+    repformer_update_h2=False,
+    repformer_attn2_has_gate=True,
+    repformer_update_style="res_avg",
+    repformer_update_residual_init="norm",
+    repformer_set_davg_zero=False,
+    repformer_trainable_ln=True,
+    repformer_ln_eps=1e-5,
+    repformer_use_sqrt_nnei=False,
+    repformer_g1_out_conv=False,
+    repformer_g1_out_mlp=False,
+    smooth=True,
+    add_tebd_to_repinit_out=True,
+    use_econf_tebd=False,
+    use_tebd_bias=False,
+    env_protection=0.0,
+    exclude_types=[],
+    precision="float64",
+):
+    input_dict = {
+        "ntypes": ntypes,
+        # kwargs for repinit
+        "repinit": RepinitArgs(
+            **{
+                "rcut": rcut,
+                "rcut_smth": rcut_smth,
+                "nsel": sum(sel),
+                "neuron": [6, 12, 24],
+                "axis_neuron": 3,
+                "tebd_dim": 4,
+                "tebd_input_mode": repinit_tebd_input_mode,
+                "set_davg_zero": repinit_set_davg_zero,
+                "activation_function": "tanh",
+                "type_one_side": repinit_type_one_side,
+                "use_three_body": repinit_use_three_body,
+                "three_body_sel": min(sum(sel) // 2, 10),
+                "three_body_rcut": rcut / 2,
+                "three_body_rcut_smth": rcut_smth / 2,
+            }
+        ),
+        # kwargs for repformer
+        "repformer": RepformerArgs(
+            **{
+                "rcut": rcut / 2,
+                "rcut_smth": rcut_smth / 2,
+                "nsel": sum(sel) // 2,
+                "nlayers": 3,
+                "g1_dim": 20,
+                "g2_dim": 10,
+                "axis_neuron": 3,
+                "direct_dist": repformer_direct_dist,
+                "update_g1_has_conv": repformer_update_g1_has_conv,
+                "update_g1_has_drrd": repformer_update_g1_has_drrd,
+                "update_g1_has_grrg": repformer_update_g1_has_grrg,
+                "update_g1_has_attn": repformer_update_g1_has_attn,
+                "update_g2_has_g1g1": repformer_update_g2_has_g1g1,
+                "update_g2_has_attn": repformer_update_g2_has_attn,
+                "update_h2": repformer_update_h2,
+                "attn1_hidden": 12,
+                "attn1_nhead": 2,
+                "attn2_hidden": 10,
+                "attn2_nhead": 2,
+                "attn2_has_gate": repformer_attn2_has_gate,
+                "activation_function": "tanh",
+                "update_style": repformer_update_style,
+                "update_residual": 0.001,
+                "update_residual_init": repformer_update_residual_init,
+                "set_davg_zero": repformer_set_davg_zero,
+                "trainable_ln": repformer_trainable_ln,
+                "ln_eps": repformer_ln_eps,
+                "use_sqrt_nnei": repformer_use_sqrt_nnei,
+                "g1_out_conv": repformer_g1_out_conv,
+                "g1_out_mlp": repformer_g1_out_mlp,
+            }
+        ),
+        # kwargs for descriptor
+        "concat_output_tebd": True,
+        "precision": precision,
+        "smooth": smooth,
+        "exclude_types": exclude_types,
+        "env_protection": env_protection,
+        "trainable": True,
+        "use_econf_tebd": use_econf_tebd,
+        "use_tebd_bias": use_tebd_bias,
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+        "add_tebd_to_repinit_out": add_tebd_to_repinit_out,
+    }
+    return input_dict
+
+
+DescriptorParamDPA2List = parameterize_func(
+    DescriptorParamDPA2,
+    OrderedDict(
+        {
+            "repinit_tebd_input_mode": ("concat", "strip"),
+            "repinit_set_davg_zero": (True,),
+            "repinit_type_one_side": (False,),
+            "repinit_use_three_body": (True, False),
+            "repformer_direct_dist": (False,),
+            "repformer_update_g1_has_conv": (True,),
+            "repformer_update_g1_has_drrd": (True,),
+            "repformer_update_g1_has_grrg": (True,),
+            "repformer_update_g1_has_attn": (True,),
+            "repformer_update_g2_has_g1g1": (True,),
+            "repformer_update_g2_has_attn": (True,),
+            "repformer_update_h2": (False,),
+            "repformer_attn2_has_gate": (True,),
+            "repformer_update_style": ("res_avg", "res_residual"),
+            "repformer_update_residual_init": ("norm",),
+            "repformer_set_davg_zero": (True,),
+            "repformer_trainable_ln": (True,),
+            "repformer_ln_eps": (1e-5,),
+            "repformer_use_sqrt_nnei": (True,),
+            "repformer_g1_out_conv": (True,),
+            "repformer_g1_out_mlp": (True,),
+            "smooth": (True, False),
+            "exclude_types": ([], [[0, 1]]),
+            "precision": ("float64",),
+            "add_tebd_to_repinit_out": (True, False),
+            "use_econf_tebd": (False,),
+            "use_tebd_bias": (False,),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamDPA2 = DescriptorParamDPA2List[0]
+
+
+def DescriptorParamDPA3(
+    ntypes,
+    rcut,
+    rcut_smth,
+    sel,
+    type_map,
+    env_protection=0.0,
+    exclude_types=[],
+    update_style="res_residual",
+    update_residual=0.1,
+    update_residual_init="const",
+    update_angle=True,
+    n_multi_edge_message=1,
+    a_compress_rate=0,
+    a_compress_e_rate=1,
+    a_compress_use_split=False,
+    optim_update=True,
+    smooth_edge_update=False,
+    fix_stat_std=0.3,
+    precision="float64",
+):
+    input_dict = {
+        # kwargs for repformer
+        "repflow": RepFlowArgs(
+            **{
+                "n_dim": 20,
+                "e_dim": 10,
+                "a_dim": 8,
+                "nlayers": 2,
+                "e_rcut": rcut,
+                "e_rcut_smth": rcut_smth,
+                "e_sel": sum(sel),
+                "a_rcut": rcut / 2,
+                "a_rcut_smth": rcut_smth / 2,
+                "a_sel": sum(sel) // 4,
+                "a_compress_rate": a_compress_rate,
+                "a_compress_e_rate": a_compress_e_rate,
+                "a_compress_use_split": a_compress_use_split,
+                "optim_update": optim_update,
+                "smooth_edge_update": smooth_edge_update,
+                "fix_stat_std": fix_stat_std,
+                "n_multi_edge_message": n_multi_edge_message,
+                "axis_neuron": 2,
+                "update_angle": update_angle,
+                "update_style": update_style,
+                "update_residual": update_residual,
+                "update_residual_init": update_residual_init,
+                "use_rbf": True,
+                "use_dynamic_sel": True,
+            }
+        ),
+        "ntypes": ntypes,
+        "concat_output_tebd": False,
+        "precision": precision,
+        "activation_function": "silu",
+        "exclude_types": exclude_types,
+        "env_protection": env_protection,
+        "trainable": True,
+        "use_econf_tebd": False,
+        "use_tebd_bias": False,
+        "type_map": type_map,
+        "seed": GLOBAL_SEED,
+    }
+    return input_dict
+
+
+DescriptorParamDPA3List = parameterize_func(
+    DescriptorParamDPA3,
+    OrderedDict(
+        {
+            "update_residual_init": ("const",),
+            "exclude_types": ([], [[0, 1]]),
+            "update_angle": (True, False),
+            "a_compress_rate": (1,),
+            "a_compress_e_rate": (2,),
+            "a_compress_use_split": (True, False),
+            "optim_update": (True, False),
+            "smooth_edge_update": (True,),
+            "fix_stat_std": (0.3,),
+            "n_multi_edge_message": (1, 2),
+            "env_protection": (0.0, 1e-8),
+            "precision": ("float64",),
+        }
+    ),
+)
+# to get name for the default function
+DescriptorParamDPA3 = DescriptorParamDPA3List[0]
+
+
+def DescriptorParamHybrid(ntypes, rcut, rcut_smth, sel, type_map, **kwargs):
+    ddsub0 = {
+        "type": "se_e2_a",
+        **DescriptorParamSeA(ntypes, rcut, rcut_smth, sel, type_map, **kwargs),
+    }
+    ddsub1 = {
+        "type": "dpa1",
+        **DescriptorParamDPA1(ntypes, rcut, rcut_smth, sum(sel), type_map, **kwargs),
+    }
+    input_dict = {
+        "list": [ddsub0, ddsub1],
+    }
+    return input_dict
+
+
+def DescriptorParamHybridMixed(ntypes, rcut, rcut_smth, sel, type_map, **kwargs):
+    ddsub0 = {
+        "type": "dpa1",
+        **DescriptorParamDPA1(ntypes, rcut, rcut_smth, sum(sel), type_map, **kwargs),
+    }
+    ddsub1 = {
+        "type": "dpa1",
+        **DescriptorParamDPA1(ntypes, rcut, rcut_smth, sum(sel), type_map, **kwargs),
+    }
+    input_dict = {
+        "list": [ddsub0, ddsub1],
+    }
+    return input_dict
+
+
+def DescriptorParamHybridMixedTTebd(ntypes, rcut, rcut_smth, sel, type_map, **kwargs):
+    ddsub0 = {
+        "type": "dpa1",
+        **DescriptorParamDPA1(ntypes, rcut, rcut_smth, sum(sel), type_map, **kwargs),
+    }
+    ddsub1 = {
+        "type": "se_e3_tebd",
+        **DescriptorParamSeTTebd(
+            ntypes, rcut / 2, rcut_smth / 2, min(sum(sel) // 2, 10), type_map, **kwargs
+        ),
+    }  # use a small sel for efficiency
+    input_dict = {
+        "list": [ddsub0, ddsub1],
+    }
+    return input_dict
+
+
+@parameterized(
+    (
+        (DescriptorParamSeA, DescrptSeA),
+        (DescriptorParamSeR, DescrptSeR),
+        (DescriptorParamSeT, DescrptSeT),
+        (DescriptorParamSeTTebd, DescrptSeTTebd),
+        (DescriptorParamDPA1, DescrptDPA1),
+        (DescriptorParamDPA2, DescrptDPA2),
+        (DescriptorParamDPA3, DescrptDPA3),
+        (DescriptorParamHybrid, DescrptHybrid),
+        (DescriptorParamHybridMixed, DescrptHybrid),
+        (DescriptorParamHybridMixedTTebd, DescrptHybrid),
+    )  # class_param & class
+)
+@unittest.skipIf(TEST_DEVICE != "cpu" and CI, "Only test on CPU.")
+class TestDescriptorDP(unittest.TestCase, DescriptorTest, DPTestCase):
     def setUp(self) -> None:
-        dp_random.seed(20)
-        with open(str(Path(__file__).parent / "water/se_e2_a.json")) as fin:
-            content = fin.read()
-        config = json.loads(content)
-        data_file = [str(Path(__file__).parent / "water/data/data_0")]
-        config["training"]["training_data"]["systems"] = data_file
-        config["training"]["validation_data"]["systems"] = data_file
-        model_config = config["model"]
-        self.rcut = model_config["descriptor"]["rcut"]
-        self.rcut_smth = model_config["descriptor"]["rcut_smth"]
-        self.sel = model_config["descriptor"]["sel"]
-        self.bsz = config["training"]["training_data"]["batch_size"]
-        self.systems = config["training"]["validation_data"]["systems"]
-        if isinstance(self.systems, str):
-            self.systems = expand_sys_str(self.systems)
-        ds = DeepmdDataSetForLoader(
-            self.systems[0],
-            model_config["type_map"],
+        DescriptorTest.setUp(self)
+        (DescriptorParam, Descrpt) = self.param[0]
+        self.module_class = Descrpt
+        self.input_dict = DescriptorParam(
+            self.nt, self.rcut, self.rcut_smth, self.sel, ["O", "H"]
         )
-        ds.add_data_requirement(energy_data_requirement)
-        self.np_batch, self.pt_batch = get_single_batch(ds)
-        self.sec = np.cumsum(self.sel)
-        self.ntypes = len(self.sel)
-        self.nnei = sum(self.sel)
-
-    def test_consistency(self) -> None:
-        avg_zero = torch.zeros(
-            [self.ntypes, self.nnei * 4],
-            dtype=GLOBAL_PT_FLOAT_PRECISION,
-            device=env.DEVICE,
-        )
-        std_ones = torch.ones(
-            [self.ntypes, self.nnei * 4],
-            dtype=GLOBAL_PT_FLOAT_PRECISION,
-            device=env.DEVICE,
-        )
-        base_d, base_force, base_nlist = base_se_a(
-            rcut=self.rcut,
-            rcut_smth=self.rcut_smth,
-            sel=self.sel,
-            batch=self.np_batch,
-            mean=avg_zero.detach().cpu(),
-            stddev=std_ones.detach().cpu(),
-        )
-
-        pt_coord = self.pt_batch["coord"].to(env.DEVICE)
-        atype = self.pt_batch["atype"].to(env.DEVICE)
-        pt_coord.requires_grad_(True)
-        (
-            extended_coord,
-            extended_atype,
-            mapping,
-            nlist,
-        ) = extend_input_and_build_neighbor_list(
-            pt_coord,
-            self.pt_batch["atype"].to(env.DEVICE),
-            self.rcut,
-            self.sel,
-            mixed_types=False,
-            box=self.pt_batch["box"].to(env.DEVICE),
-        )
-        my_d, _, _ = prod_env_mat(
-            extended_coord,
-            nlist,
-            atype,
-            avg_zero.reshape([-1, self.nnei, 4]).to(DEVICE),
-            std_ones.reshape([-1, self.nnei, 4]).to(DEVICE),
-            self.rcut,
-            self.rcut_smth,
-        )
-        my_d.sum().backward()
-        bsz = pt_coord.shape[0]
-        my_force = pt_coord.grad.view(bsz, -1, 3).cpu().detach().numpy()
-        base_force = base_force.reshape(bsz, -1, 3)
-        base_d = base_d.reshape(bsz, -1, self.nnei, 4)
-        my_d = my_d.view(bsz, -1, self.nnei, 4).cpu().detach().numpy()
-        base_nlist = base_nlist.reshape(bsz, -1, self.nnei)
-
-        mapping = mapping.cpu()
-        my_nlist = nlist.view(bsz, -1).cpu()
-        mask = my_nlist == -1
-        my_nlist = my_nlist * ~mask
-        my_nlist = torch.gather(mapping, dim=-1, index=my_nlist)
-        my_nlist = my_nlist * ~mask - mask.long()
-        my_nlist = my_nlist.cpu().view(bsz, -1, self.nnei).numpy()
-        self.assertTrue(np.allclose(base_nlist, my_nlist))
-        self.assertTrue(np.allclose(np.mean(base_d, axis=2), np.mean(my_d, axis=2)))
-        self.assertTrue(np.allclose(np.std(base_d, axis=2), np.std(my_d, axis=2)))
-        # descriptors may be different when there are multiple neighbors in the same distance
-        self.assertTrue(np.allclose(base_force, -my_force))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.module = Descrpt(**self.input_dict)

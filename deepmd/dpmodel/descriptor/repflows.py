@@ -165,6 +165,7 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
         fix_stat_std: float = 0.3,
         optim_update: bool = True,
         smooth_edge_update: bool = False,
+        use_rbf: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -196,7 +197,7 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
         self.a_compress_use_split = a_compress_use_split
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
-
+        self.use_rbf = use_rbf
         self.n_dim = n_dim
         self.e_dim = e_dim
         self.a_dim = a_dim
@@ -249,6 +250,7 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
                     precision=precision,
                     optim_update=self.optim_update,
                     smooth_edge_update=self.smooth_edge_update,
+                    use_rbf=self.use_rbf,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -570,6 +572,7 @@ class RepFlowLayer(NativeOP):
         update_angle: bool = True,
         optim_update: bool = True,
         smooth_edge_update: bool = False,
+        use_rbf: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -615,6 +618,7 @@ class RepFlowLayer(NativeOP):
         self.prec = PRECISION_DICT[precision]
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
+        self.use_rbf = use_rbf
 
         assert update_residual_init in [
             "norm",
@@ -1272,6 +1276,7 @@ class RepFlowLayer(NativeOP):
             "precision": self.precision,
             "optim_update": self.optim_update,
             "smooth_edge_update": self.smooth_edge_update,
+            "use_rbf": self.use_rbf,
             "node_self_mlp": self.node_self_mlp.serialize(),
             "node_sym_linear": self.node_sym_linear.serialize(),
             "node_edge_linear": self.node_edge_linear.serialize(),

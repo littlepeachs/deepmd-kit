@@ -58,6 +58,7 @@ class RepFlowLayer(torch.nn.Module):
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         smooth_edge_update: bool = False,
+        use_rbf: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -103,6 +104,7 @@ class RepFlowLayer(torch.nn.Module):
         self.prec = PRECISION_DICT[precision]
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
+        self.use_rbf = use_rbf
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
@@ -156,6 +158,13 @@ class RepFlowLayer(torch.nn.Module):
                     seed=child_seed(seed, 3),
                 )
             )
+
+        if self.use_rbf:
+            self.rbf_linear = MLPLayer(
+                6, self.e_dim, precision=precision, seed=child_seed(seed, 4)
+            )
+        else:
+            self.rbf_linear = None
 
         # node edge message
         self.node_edge_linear = MLPLayer(
@@ -584,7 +593,7 @@ class RepFlowLayer(torch.nn.Module):
         else:
             raise NotImplementedError
         assert angle_dim + node_dim + 2 * edge_dim == matrix.size()[0]
-
+        
         # n_angle * angle_dim
         sub_angle_update = torch.matmul(
             flat_angle_ebd, matrix[sub_angle_idx[0] : sub_angle_idx[1]]
@@ -723,6 +732,7 @@ class RepFlowLayer(torch.nn.Module):
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         edge_index: torch.Tensor,  # n_edge x 2
         angle_index: torch.Tensor,  # n_angle x 3
+        rbf_ebd: Optional[torch.Tensor] = None,
     ):
         """
         Parameters
@@ -795,6 +805,14 @@ class RepFlowLayer(torch.nn.Module):
                 node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
             )
         )
+
+        if self.use_rbf:
+            assert self.rbf_linear is not None
+            assert rbf_ebd is not None
+            edge_rbf_ebd = self.rbf_linear(rbf_ebd)
+            edge_ebd = edge_ebd * edge_rbf_ebd
+        else:
+            edge_ebd = edge_ebd
 
         n_update_list: list[torch.Tensor] = [node_ebd]
         e_update_list: list[torch.Tensor] = [edge_ebd]

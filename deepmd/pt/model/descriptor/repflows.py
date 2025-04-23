@@ -51,6 +51,10 @@ from .repflow_layer import (
     RepFlowLayer,
 )
 
+from .bessel_layer import (
+    BesselBasisLayer,
+)
+
 if not hasattr(torch.ops.deepmd, "border_op"):
 
     def border_op(
@@ -136,6 +140,8 @@ class DescrptBlockRepflows(DescriptorBlock):
     smooth_edge_update : bool, optional
         Whether to make edge update smooth.
         If True, the edge update from angle message will not use self as padding.
+    use_rbf : bool, optional
+        Whether to use RBF for edge update.
     optim_update : bool, optional
         Whether to enable the optimized update method.
         Uses a more efficient process when enabled. Defaults to True
@@ -186,6 +192,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         precision: str = "float64",
         fix_stat_std: float = 0.3,
         smooth_edge_update: bool = False,
+        use_rbf: bool = False,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         optim_update: bool = True,
@@ -220,6 +227,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.a_compress_use_split = a_compress_use_split
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
+        self.use_rbf = use_rbf
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
 
@@ -242,9 +250,21 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
 
-        self.edge_embd = MLPLayer(
-            1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
-        )
+        if self.use_rbf:
+            self.bessel_basis = BesselBasisLayer(
+                num_radial=6,
+                cutoff=self.e_rcut,
+                envelope_exponent=5,
+            )
+            self.edge_embd = MLPLayer(
+                1+6, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+        else:
+            self.bessel_basis = None
+            self.edge_embd = MLPLayer(
+                1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+
         self.angle_embd = MLPLayer(
             1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
         )
@@ -277,6 +297,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_dynamic_sel=self.use_dynamic_sel,
                     sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
+                    use_rbf=self.use_rbf,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -406,6 +427,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.e_rcut_smth,
             protection=self.env_protection,
         )
+        
         nlist_mask = nlist != -1
         sw = torch.squeeze(sw, -1)
         # beyond the cutoff sw should be 0.0
@@ -472,7 +494,6 @@ class DescrptBlockRepflows(DescriptorBlock):
             edge_input = edge_input[nlist_mask]
             # n_edge x 3
             h2 = h2[nlist_mask]
-            # n_edge x 1
             sw = sw[nlist_mask]
             # nb x nloc x a_nnei x a_nnei
             a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
@@ -487,10 +508,38 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
-        edge_ebd = self.act(self.edge_embd(edge_input))
+        # 把nlist_mask全部置为false
+        
+        if self.use_rbf and not self.use_dynamic_sel:
+            assert self.bessel_basis is not None
+            length = torch.linalg.norm(diff, dim=-1, keepdim=True)
+            rbf_mask = nlist_mask.view(nframes, -1)
+            rbf_length = torch.where(rbf_mask, length.squeeze(-1).view(nframes, -1), 2*self.e_rcut*torch.ones_like(length.squeeze(-1)).view(nframes, -1))
+            rbf_ebd = self.bessel_basis(rbf_length).view(nframes, nloc, nnei, -1)
+            edge_input = torch.cat([edge_input, rbf_ebd], dim=-1)
+            edge_ebd = self.act(self.edge_embd(edge_input))
+
+        elif self.use_rbf and self.use_dynamic_sel:
+            assert self.bessel_basis is not None
+            # TODO: implement this
+            length = torch.linalg.norm(diff, dim=-1, keepdim=True)
+            length = length[nlist_mask]
+            n_edge = length.shape[0]
+            if n_edge > 0:
+                rbf_ebd = self.bessel_basis(length).view(n_edge, -1)
+            else:
+                rbf_ebd = torch.zeros(edge_input.shape[0], 6, device=nlist.device, dtype=self.prec)
+            edge_input = torch.cat([edge_input, rbf_ebd], dim=-1)
+            edge_ebd = self.act(self.edge_embd(edge_input))
+            
+        else:
+            edge_ebd = self.act(self.edge_embd(edge_input))
+            rbf_ebd = None
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
 
+        
+        
         # nb x nall x n_dim
         if comm_dict is None:
             assert mapping is not None
@@ -573,6 +622,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_sw,
                 edge_index=edge_index,
                 angle_index=angle_index,
+                rbf_ebd=rbf_ebd,
             )
 
         # nb x nloc x 3 x e_dim

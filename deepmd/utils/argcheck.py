@@ -1497,6 +1497,12 @@ def dpa3_repflow_args():
         "Whether to make edge update smooth. "
         "If True, the edge update from angle message will not use self as padding."
     )
+    doc_use_rbf = (
+        "Whether to use RBF for edge update. "
+        "If True, the edge update will use RBF for edge update. "
+        "Defaults to False."
+    )
+    
 
     return [
         # repflow args
@@ -1596,6 +1602,13 @@ def dpa3_repflow_args():
             optional=True,
             default=False,  # For compatability. This will be True in the future
             doc=doc_smooth_edge_update,
+        ),
+        Argument(
+            "use_rbf",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_rbf,
         ),
         Argument(
             "use_dynamic_sel",

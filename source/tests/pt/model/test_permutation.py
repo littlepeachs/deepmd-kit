@@ -191,6 +191,7 @@ model_dpa3 = {
             "update_residual": 0.1,
             "update_residual_init": "const",
             "smooth_edge_update": True,
+            "use_rbf": True,
         },
         "activation_function": "silut:10.0",
         "use_tebd_bias": False,

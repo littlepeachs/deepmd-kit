@@ -150,6 +150,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             fix_stat_std=self.repflow_args.fix_stat_std,
             optim_update=self.repflow_args.optim_update,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
+            use_rbf=self.repflow_args.use_rbf,
             use_dynamic_sel=self.repflow_args.use_dynamic_sel,
             sel_reduce_factor=self.repflow_args.sel_reduce_factor,
             exclude_types=exclude_types,
@@ -472,7 +473,6 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         extended_coord = extended_coord.to(dtype=self.prec)
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
-
         node_ebd_ext = self.type_embedding(extended_atype)
         node_ebd_inp = node_ebd_ext[:, :nloc, :]
         # repflows
