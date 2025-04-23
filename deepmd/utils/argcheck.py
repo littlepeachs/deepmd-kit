@@ -1502,7 +1502,16 @@ def dpa3_repflow_args():
         "If True, the edge update will use RBF for edge update. "
         "Defaults to False."
     )
-    
+    doc_use_torsion = (
+        "Whether to use torsion update. "
+        "If True, the torsion update will be used. "
+        "Defaults to False."
+    )
+    doc_node_torsion = (
+        "Whether to use torsion update for node. "
+        "If True, the torsion update will be used for node. "
+        "Defaults to False."
+    )
 
     return [
         # repflow args
@@ -1609,6 +1618,20 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
             doc=doc_use_rbf,
+        ),
+        Argument(
+            "use_torsion",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_torsion,
+        ),
+        Argument(
+            "node_torsion",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_node_torsion,
         ),
         Argument(
             "use_dynamic_sel",

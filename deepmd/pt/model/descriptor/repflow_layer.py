@@ -59,6 +59,8 @@ class RepFlowLayer(torch.nn.Module):
         sel_reduce_factor: float = 10.0,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_torsion: bool = False,
+        node_torsion: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -105,6 +107,8 @@ class RepFlowLayer(torch.nn.Module):
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_torsion = use_torsion
+        self.node_torsion = node_torsion
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
@@ -120,6 +124,7 @@ class RepFlowLayer(torch.nn.Module):
         self.n_residual = []
         self.e_residual = []
         self.a_residual = []
+        self.t_residual = []
         self.edge_info_dim = self.n_dim * 2 + self.e_dim
 
         # node self mlp
@@ -289,10 +294,95 @@ class RepFlowLayer(torch.nn.Module):
             self.a_compress_e_linear = None
             self.angle_dim = 0
 
+        if self.use_torsion:
+            self.torsion_dim = self.a_dim
+            if self.a_compress_rate == 0:
+                # torsion + node + edge * 2
+                self.torsion_dim += self.n_dim + 2 * self.e_dim
+                self.t_compress_n_linear = None
+                self.t_compress_e_linear = None
+                self.e_t_compress_dim = self.e_dim
+                self.n_t_compress_dim = self.n_dim
+            else:
+                # torsion + t_dim/c + t_dim/2c * 2 * e_rate
+                self.torsion_dim += 5*self.a_dim
+                self.e_t_compress_dim = self.a_dim
+                self.n_t_compress_dim = self.a_dim
+                self.t_compress_n_linear = MLPLayer(
+                    self.n_dim,
+                    self.n_t_compress_dim,
+                    precision=precision,
+                    bias=False,
+                    seed=child_seed(seed, 15),
+                )
+                self.t_compress_e_linear = MLPLayer(
+                    self.e_dim,
+                    self.e_t_compress_dim,
+                    precision=precision,
+                    bias=False,
+                    seed=child_seed(seed, 16),
+                )
+            self.edge_torsion_linear1 = MLPLayer(
+                self.torsion_dim,
+                self.e_dim,
+                precision=precision,
+                seed=child_seed(seed, 17),
+            )
+            if self.node_torsion:
+                if self.update_style == "res_residual":
+                    self.n_residual.append(
+                        get_residual(
+                        self.n_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 18),
+                    )
+                )
+            self.node_torsion_linear = MLPLayer(
+                self.e_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 19),
+            )
+            if self.update_style == "res_residual":
+                self.e_residual.append(
+                    get_residual(
+                        self.e_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 18),
+                    )
+                )
+            # torsion self message
+            self.torsion_self_linear = MLPLayer(
+                self.torsion_dim,
+                self.a_dim,
+                precision=precision,
+                seed=child_seed(seed, 17),
+            )
+            if self.update_style == "res_residual":
+                self.t_residual.append(
+                    get_residual(
+                        self.a_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 18),
+                    )
+                )
+        else:
+            self.torsion_self_linear = None
+            self.edge_torsion_linear1 = None
+            self.t_compress_n_linear = None
+            self.t_compress_e_linear = None
+            self.torsion_dim = 0
+
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
         self.a_residual = nn.ParameterList(self.a_residual)
-
+        self.t_residual = nn.ParameterList(self.t_residual)
     @staticmethod
     def _cal_hg(
         edge_ebd: torch.Tensor,
@@ -618,11 +708,99 @@ class RepFlowLayer(torch.nn.Module):
         # n_angle * angle_dim
         sub_edge_update_ik = torch.index_select(sub_edge_update_ik, 0, eik2a_index)
         sub_edge_update_ij = torch.index_select(sub_edge_update_ij, 0, eij2a_index)
-
         result_update = (
             sub_angle_update + sub_node_update + sub_edge_update_ik + sub_edge_update_ij
         ) + bias
+        
         return result_update
+    
+    def optim_torsion_update(
+        self,
+        torsion_ebd: torch.Tensor,
+        node_ebd: torch.Tensor,
+        edge_ebd: torch.Tensor,
+        feat: str = "angle",
+    ) -> torch.Tensor:
+        pass
+
+    def optim_torsion_update_dynamic(
+        self,
+        torsion_ebd: torch.Tensor,
+        node_ebd: torch.Tensor,
+        flat_edge_ebd: torch.Tensor,
+        torsion_index: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        torsion_mask: Optional[torch.Tensor] = None,
+        feat: str = "edge",
+    ) -> torch.Tensor:
+        assert torsion_index is not None
+        assert torsion_mask is not None
+        
+        nf, nloc, node_dim = node_ebd.shape
+        angle_dim = torsion_ebd.shape[-1]
+        edge_dim = flat_edge_ebd.shape[-1]
+        sub_angle_idx = (0, angle_dim)
+        sub_node_idx_i = (angle_dim, angle_dim + node_dim)
+        sub_node_idx_j = (angle_dim + node_dim, angle_dim + 2 * node_dim)
+        sub_node_idx_ij = (angle_dim + 2 * node_dim, angle_dim + 2 * node_dim+edge_dim)
+        sub_edge_idx_iref_i = (angle_dim + 2 * node_dim+edge_dim, angle_dim + 2 * node_dim + 2*edge_dim)
+        sub_edge_idx_jref_i = (
+            angle_dim + 2 * node_dim + 2*edge_dim,
+            angle_dim + 2 * node_dim + 3*edge_dim,
+        )
+        
+        i2t_index, j2t_index, ij2t_index, i_iref2t_index, j_jref2t_index = torsion_index
+        if feat == "edge":
+            matrix, bias = self.edge_torsion_linear1.matrix, self.edge_torsion_linear1.bias
+        elif feat == "torsion":
+            matrix, bias = self.torsion_self_linear.matrix, self.torsion_self_linear.bias
+        else:
+            raise NotImplementedError
+        
+        assert angle_dim + 2 * node_dim + 3*edge_dim == matrix.size()[0]
+        
+        # n_angle * angle_dim
+        torsion_update = torch.matmul(
+            torsion_ebd, matrix[sub_angle_idx[0] : sub_angle_idx[1]]
+        )
+        node_update_i = torch.zeros_like(torsion_update)
+        node_update_j = torch.zeros_like(torsion_update)
+        edge_update_ij = torch.zeros_like(torsion_update)
+        edge_update_iref_i = torch.zeros_like(torsion_update)
+        edge_update_jref_j = torch.zeros_like(torsion_update)
+
+        # nf * nloc * angle_dim
+        sub_node_update_i = torch.matmul(
+            node_ebd, matrix[sub_node_idx_i[0] : sub_node_idx_i[1]]
+        )
+        sub_node_update_j = torch.matmul(
+            node_ebd, matrix[sub_node_idx_j[0] : sub_node_idx_j[1]]
+        )
+        sub_edge_update_ij = torch.matmul(
+            flat_edge_ebd, matrix[sub_node_idx_ij[0] : sub_node_idx_ij[1]]
+        )
+        sub_edge_update_iref_i = torch.matmul(
+            flat_edge_ebd, matrix[sub_edge_idx_iref_i[0] : sub_edge_idx_iref_i[1]]
+        )
+        sub_edge_update_jref_j = torch.matmul(
+            flat_edge_ebd, matrix[sub_edge_idx_jref_i[0] : sub_edge_idx_jref_i[1]]
+        )
+        # n_angle * angle_dim
+        node_update_i[torsion_mask] = torch.index_select(
+            sub_node_update_i.reshape(nf * nloc, -1), 0, i2t_index
+        )
+        node_update_j[torsion_mask] = torch.index_select(
+            sub_node_update_j.reshape(nf * nloc, -1), 0, j2t_index
+        )
+        edge_update_ij[torsion_mask] = torch.index_select(sub_edge_update_ij, 0, ij2t_index)
+        edge_update_iref_i[torsion_mask] = torch.index_select(sub_edge_update_iref_i, 0, i_iref2t_index)
+        edge_update_jref_j[torsion_mask] = torch.index_select(sub_edge_update_jref_j, 0, j_jref2t_index)
+        
+        result_update = (
+            torsion_update + node_update_i + node_update_j + edge_update_ij + edge_update_iref_i + edge_update_jref_j
+        ) + bias
+        
+        return result_update
+    
 
     def optim_edge_update(
         self,
@@ -717,7 +895,6 @@ class RepFlowLayer(torch.nn.Module):
 
         result_update = (sub_edge_update + sub_node_ext_update + sub_node_update) + bias
         return result_update
-
     def forward(
         self,
         node_ebd_ext: torch.Tensor,  # nf x nall x n_dim
@@ -733,7 +910,11 @@ class RepFlowLayer(torch.nn.Module):
         edge_index: torch.Tensor,  # n_edge x 2
         angle_index: torch.Tensor,  # n_angle x 3
         rbf_ebd: Optional[torch.Tensor] = None,
+        torsion_ebd: Optional[torch.Tensor] = None,
+        torsion_mask: Optional[torch.Tensor] = None,
+        torsion_index: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
+        
         """
         Parameters
         ----------
@@ -789,7 +970,6 @@ class RepFlowLayer(torch.nn.Module):
         else:
             assert (n_edge, 3) == h2.shape
         del a_nlist  # may be used in the future
-
         n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
         n2a_index, eij2a_index, eik2a_index = (
             angle_index[:, 0],
@@ -813,11 +993,14 @@ class RepFlowLayer(torch.nn.Module):
             edge_ebd = edge_ebd * edge_rbf_ebd
         else:
             edge_ebd = edge_ebd
-
+        
         n_update_list: list[torch.Tensor] = [node_ebd]
         e_update_list: list[torch.Tensor] = [edge_ebd]
         a_update_list: list[torch.Tensor] = [angle_ebd]
-
+        if torsion_ebd is not None:
+            t_update_list = [torsion_ebd]
+        else:
+            t_update_list = None
         # node self mlp
         node_self_mlp = self.act(self.node_self_mlp(node_ebd))
         n_update_list.append(node_self_mlp)
@@ -932,7 +1115,7 @@ class RepFlowLayer(torch.nn.Module):
                 / self.dynamic_e_sel
             )
         )
-
+        
         if self.n_multi_edge_message > 1:
             # nb x nloc x h x n_dim
             node_edge_update_mul_head = node_edge_update.view(
@@ -943,7 +1126,7 @@ class RepFlowLayer(torch.nn.Module):
         else:
             n_update_list.append(node_edge_update)
         # update node_ebd
-        n_updated = self.list_update(n_update_list, "node")
+        
 
         # edge self message
         if not self.optim_update:
@@ -1125,7 +1308,7 @@ class RepFlowLayer(torch.nn.Module):
                 self.act(self.edge_angle_linear2(padding_edge_angle_update))
             )
             # update edge_ebd
-            e_updated = self.list_update(e_update_list, "edge")
+            
 
             # angle self message
             # nb x nloc x a_nnei x a_nnei x dim_a
@@ -1151,14 +1334,88 @@ class RepFlowLayer(torch.nn.Module):
                         "angle",
                     )
                 )
+            
             a_update_list.append(angle_self_update)
         else:
             # update edge_ebd
-            e_updated = self.list_update(e_update_list, "edge")
+            pass
+        if torsion_ebd is not None and self.use_torsion:
+            assert self.t_compress_e_linear is not None
+            assert self.node_torsion_linear is not None
+            assert t_update_list is not None
+            assert torsion_index is not None
+            assert torsion_mask is not None
+            node_ebd_for_torsion = self.t_compress_n_linear(node_ebd)
+            edge_ebd_for_torsion = self.t_compress_e_linear(edge_ebd)
+            torsion_self_update = self.act(
+                self.optim_angle_update(
+                    torsion_ebd,
+                    node_ebd_for_torsion,
+                    edge_ebd_for_torsion,
+                    "angle",
+                )
+                if not self.use_dynamic_sel
+                else self.optim_torsion_update_dynamic(
+                    torsion_ebd,
+                    node_ebd_for_torsion,
+                    edge_ebd_for_torsion,
+                    torsion_index,
+                    torsion_mask,
+                    "torsion",
+                )
+            )
+            t_update_list.append(torsion_self_update)
 
+            edge_torsion_update = self.act(
+                self.optim_angle_update(
+                    torsion_ebd,
+                    node_ebd_for_torsion,
+                    edge_ebd_for_torsion,
+                    "edge",
+                )
+                if not self.use_dynamic_sel
+                else self.optim_torsion_update_dynamic(
+                    torsion_ebd,
+                    node_ebd_for_torsion,
+                    edge_ebd_for_torsion,
+                    torsion_index,
+                    torsion_mask,
+                    "edge",
+                )
+            )
+            e_update_list.append(edge_torsion_update)
+            if self.node_torsion:
+                node_torsion_update = self.node_torsion_linear(edge_torsion_update)* sw.unsqueeze(-1)
+                
+                node_torsion_update = (
+                    (torch.sum(node_torsion_update, dim=-2) / self.nnei)
+                    if not self.use_dynamic_sel
+                    else (
+                        aggregate(
+                            node_torsion_update,
+                            n2e_index,
+                            average=False,
+                            num_owner=nb * nloc,
+                        ).reshape(nb, nloc, -1)
+                        / self.dynamic_e_sel
+                    )
+                )
+                n_update_list.append(node_torsion_update)
+            else:
+                pass
+
+        else:
+            pass
         # update angle_ebd
+        n_updated = self.list_update(n_update_list, "node")
+        e_updated = self.list_update(e_update_list, "edge")
         a_updated = self.list_update(a_update_list, "angle")
-        return n_updated, e_updated, a_updated
+        if t_update_list is not None:
+            t_updated = self.list_update(t_update_list, "torsion")
+            # t_updated = t_update_list[0]
+        else:
+            t_updated = None
+        return n_updated, e_updated, a_updated, t_updated
 
     @torch.jit.export
     def list_update_res_avg(
@@ -1184,18 +1441,25 @@ class RepFlowLayer(torch.nn.Module):
     def list_update_res_residual(
         self, update_list: list[torch.Tensor], update_name: str = "node"
     ) -> torch.Tensor:
-        nitem = len(update_list)
+        nitem = len(update_list)-1
         uu = update_list[0]
-        # make jit happy
+        # 使用枚举以避免在TorchScript中使用变量索引ModuleList
         if update_name == "node":
-            for ii, vv in enumerate(self.n_residual):
-                uu = uu + vv * update_list[ii + 1]
+            for idx, residual in enumerate(self.n_residual):
+                if idx < nitem:
+                    uu = uu + residual * update_list[idx + 1]
         elif update_name == "edge":
-            for ii, vv in enumerate(self.e_residual):
-                uu = uu + vv * update_list[ii + 1]
+            for idx, residual in enumerate(self.e_residual):
+                if idx < nitem:
+                    uu = uu + residual * update_list[idx + 1]
         elif update_name == "angle":
-            for ii, vv in enumerate(self.a_residual):
-                uu = uu + vv * update_list[ii + 1]
+            for idx, residual in enumerate(self.a_residual):
+                if idx < nitem:
+                    uu = uu + residual * update_list[idx + 1]
+        elif update_name == "torsion":
+            for idx, residual in enumerate(self.t_residual):
+                if idx < nitem:
+                    uu = uu + residual * update_list[idx + 1]
         else:
             raise NotImplementedError
         return uu

@@ -166,6 +166,8 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
         optim_update: bool = True,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_torsion: bool = False,
+        node_torsion: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -198,6 +200,8 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_torsion = use_torsion
+        self.node_torsion = node_torsion
         self.n_dim = n_dim
         self.e_dim = e_dim
         self.a_dim = a_dim
@@ -251,6 +255,8 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
                     optim_update=self.optim_update,
                     smooth_edge_update=self.smooth_edge_update,
                     use_rbf=self.use_rbf,
+                    use_torsion=self.use_torsion,
+                    node_torsion=self.node_torsion,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -573,6 +579,8 @@ class RepFlowLayer(NativeOP):
         optim_update: bool = True,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_torsion: bool = False,
+        node_torsion: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -619,6 +627,8 @@ class RepFlowLayer(NativeOP):
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_torsion = use_torsion
+        self.node_torsion = node_torsion
 
         assert update_residual_init in [
             "norm",
@@ -1277,6 +1287,8 @@ class RepFlowLayer(NativeOP):
             "optim_update": self.optim_update,
             "smooth_edge_update": self.smooth_edge_update,
             "use_rbf": self.use_rbf,
+            "use_torsion": self.use_torsion,
+            "node_torsion": self.node_torsion,
             "node_self_mlp": self.node_self_mlp.serialize(),
             "node_sym_linear": self.node_sym_linear.serialize(),
             "node_edge_linear": self.node_edge_linear.serialize(),

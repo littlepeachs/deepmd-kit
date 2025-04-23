@@ -477,11 +477,11 @@ def DescriptorParamDPA3(
     update_residual_init="const",
     update_angle=True,
     n_multi_edge_message=1,
-    a_compress_rate=0,
-    a_compress_e_rate=1,
-    a_compress_use_split=False,
+    a_compress_rate=1,
+    a_compress_e_rate=2,
+    a_compress_use_split=True,
     optim_update=True,
-    smooth_edge_update=False,
+    smooth_edge_update=True,
     fix_stat_std=0.3,
     precision="float64",
 ):
@@ -511,6 +511,10 @@ def DescriptorParamDPA3(
                 "update_style": update_style,
                 "update_residual": update_residual,
                 "update_residual_init": update_residual_init,
+                "use_rbf": True,
+                "use_dynamic_sel": True,
+                "use_torsion": True,
+                "node_torsion": True,
             }
         ),
         "ntypes": ntypes,
@@ -528,21 +532,17 @@ def DescriptorParamDPA3(
     return input_dict
 
 
+
 DescriptorParamDPA3List = parameterize_func(
     DescriptorParamDPA3,
     OrderedDict(
         {
             "update_residual_init": ("const",),
-            "exclude_types": ([], [[0, 1]]),
+            "exclude_types": ([],),
             "update_angle": (True, False),
             "a_compress_rate": (1,),
-            "a_compress_e_rate": (2,),
-            "a_compress_use_split": (True, False),
-            "optim_update": (True, False),
-            "smooth_edge_update": (True,),
-            "fix_stat_std": (0.3,),
-            "n_multi_edge_message": (1, 2),
-            "env_protection": (0.0, 1e-8),
+            "n_multi_edge_message": (1,),
+            "env_protection": (0.0,),
             "precision": ("float64",),
         }
     ),

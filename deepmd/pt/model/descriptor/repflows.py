@@ -4,8 +4,11 @@ from typing import (
     Optional,
     Union,
 )
-
+import os
+import pickle
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 from deepmd.dpmodel.utils.seed import (
     child_seed,
@@ -54,6 +57,10 @@ from .repflow_layer import (
 from .bessel_layer import (
     BesselBasisLayer,
 )
+
+from torch_scatter import scatter_min
+
+import math
 
 if not hasattr(torch.ops.deepmd, "border_op"):
 
@@ -142,6 +149,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         If True, the edge update from angle message will not use self as padding.
     use_rbf : bool, optional
         Whether to use RBF for edge update.
+    use_torsion : bool, optional
+        Whether to use torsion update.
+    node_torsion : bool, optional
+        Whether to use torsion update for node.
     optim_update : bool, optional
         Whether to enable the optimized update method.
         Uses a more efficient process when enabled. Defaults to True
@@ -193,6 +204,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         fix_stat_std: float = 0.3,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_torsion: bool = False,
+        node_torsion: bool = False,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         optim_update: bool = True,
@@ -228,6 +241,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_torsion = use_torsion
+        self.node_torsion = node_torsion
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
 
@@ -265,6 +280,13 @@ class DescrptBlockRepflows(DescriptorBlock):
                 1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
             )
 
+        if self.use_torsion:
+            self.torsion_embd = MLPLayer(
+                1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
+            )
+        else:
+            self.torsion_embd = None
+
         self.angle_embd = MLPLayer(
             1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
         )
@@ -298,6 +320,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
                     use_rbf=self.use_rbf,
+                    use_torsion=self.use_torsion,
+                    node_torsion=self.node_torsion,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -509,6 +533,119 @@ class DescrptBlockRepflows(DescriptorBlock):
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         # 把nlist_mask全部置为false
+
+        if self.use_torsion and self.use_dynamic_sel:
+            # TODO: implement this
+            assert self.torsion_embd is not None
+            distance = torch.linalg.norm(diff, dim=-1, keepdim=True)
+            dist = distance[nlist_mask].squeeze(-1)
+            n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+            # 创建掩码，过滤掉大于max(n2e_index)的n_ext2e_index
+
+
+            extended_mask = n2e_index // nloc
+            extended_mask = extended_mask * nloc *27 + nloc
+            
+            mask = n_ext2e_index < extended_mask
+            j = n_ext2e_index[mask]
+            j = j % (nloc) + j//(nloc * 27) * nloc
+            i = n2e_index[mask]
+            
+            # 计算向量差
+            
+            # 通过scatter_min找到每个中心原子i的最近邻
+            # 对于每个原子i，在所有与其连接的边中找到距离最小的边
+            # 返回每个i对应的最小距离值和最小距离的索引argmin0
+            frame_shift = torch.arange(0, nframes, dtype=nlist.dtype, device=nlist.device) * nall
+            shifted_nlist = nlist + frame_shift[:, None, None]
+            nearest_nlist = shifted_nlist.view(nframes*nloc, -1)
+            n0,n1 = nearest_nlist[i,0],nearest_nlist[i,1]
+            
+            n0_j,n1_j = nearest_nlist[j,0],nearest_nlist[j,1]
+            
+            # tau: (iref, i, j, jref)
+            # when compute tau, do not use n0, n0_j as ref for i and j,
+            # because if n0 = j, or n0_j = i, the computed tau is zero
+            # so if n0 = j, we choose iref = n1
+            # if n0_j = i, we choose jref = n1_j
+            temp_n0 = n0 % nall + n0 // nall * nloc
+            mask_iref = temp_n0 == j
+            iref = torch.clone(n0)
+            
+            iref[mask_iref] = n1[mask_iref]
+            
+            # 找到i-iref在edge_index中的索引
+            # 创建唯一标识符，用于匹配边
+            # 找到edge_index中第一列等于i且第二列等于iref的边索引
+            i_mask = (edge_index[:, 0].unsqueeze(1) == i.unsqueeze(0))
+            iref_mask = (edge_index[:, 1].unsqueeze(1) == iref.unsqueeze(0))
+            
+            i_iref_mask = i_mask & iref_mask
+            
+            idx_iref = torch.zeros_like(i, dtype=torch.int64)
+            idx_iref = torch.where(i_iref_mask.any(dim=0), 
+                                   i_iref_mask.int().argmax(dim=0), 
+                                   torch.zeros_like(i))
+            
+            temp_n0_j = n0_j % nall+ n0_j // nall * nloc
+            mask_jref = temp_n0_j == i
+            jref = torch.clone(n0_j)
+            
+            jref[mask_jref] = n1_j[mask_jref]
+            
+            j_mask = (edge_index[:, 0].unsqueeze(1) == j.unsqueeze(0))
+            jref_mask = (edge_index[:, 1].unsqueeze(1) == jref.unsqueeze(0))
+            
+            j_jref_mask = j_mask & jref_mask
+            
+            # 获取每个(j, jref)对应的边索引
+            idx_jref = torch.zeros_like(j, dtype=torch.int64)
+            idx_jref = torch.where(j_jref_mask.any(dim=0), 
+                                   j_jref_mask.int().argmax(dim=0), 
+                                   torch.zeros_like(j))
+            
+            idx_ij = torch.nonzero(mask).squeeze(-1)
+            vecs = diff[nlist_mask]
+
+
+            pos_ji, pos_iref, pos_jref_j = (
+                vecs[idx_ij],
+                vecs[idx_iref],
+                vecs[idx_jref]
+            )
+            
+            # 把公共边 p_ji 先做单位化，避免后面反复除
+            plane1 = torch.cross(pos_ji, pos_jref_j)
+            plane2 = torch.cross(pos_ji, pos_iref)
+            
+            # torch.matmul(plane1, rmat.T)
+            norm1 = torch.norm(plane1, dim=-1, keepdim=True)
+            norm2 = torch.norm(plane2, dim=-1, keepdim=True)
+            plane1_norm = plane1 / (norm1 + 1e-10)
+            plane2_norm = plane2 / (norm2 + 1e-10)
+
+            cos_angle = (plane1_norm * plane2_norm).sum(dim=-1)
+            # sin_angle = (torch.cross(plane1_norm, plane2_norm) * pos_ji).sum(dim=-1) / (torch.norm(pos_ji, dim=-1) + 1e-10)
+            # import pdb; pdb.set_trace()
+            # tau = torch.atan2(sin_angle, cos_angle)
+            
+            # tau = torch.abs(tau)
+            
+            tau_input_list = cos_angle.unsqueeze(-1)
+            
+            torsion_input = torch.zeros(edge_input.shape[0], 1, device=nlist.device, dtype=self.prec)
+            torsion_input[mask] = tau_input_list / (torch.pi**0.5)
+             
+            torsion_ebd = self.torsion_embd(torsion_input)
+            
+            torsion_mask = mask
+            torsion_index = (i, j, idx_ij, idx_iref, idx_jref)
+            # 将torsion_ebd和torsion_index写入txt文件
+            
+        else:
+            torsion_ebd = None
+            torsion_mask = None
+            torsion_index = None
         
         if self.use_rbf and not self.use_dynamic_sel:
             assert self.bessel_basis is not None
@@ -535,10 +672,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             edge_ebd = self.act(self.edge_embd(edge_input))
             rbf_ebd = None
+
+
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
 
-        
         
         # nb x nall x n_dim
         if comm_dict is None:
@@ -609,7 +747,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            node_ebd, edge_ebd, angle_ebd = ll.forward(
+            node_ebd, edge_ebd, angle_ebd, torsion_ebd = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
                 h2,
@@ -623,7 +761,11 @@ class DescrptBlockRepflows(DescriptorBlock):
                 edge_index=edge_index,
                 angle_index=angle_index,
                 rbf_ebd=rbf_ebd,
+                torsion_ebd=torsion_ebd,
+                torsion_mask=torsion_mask,
+                torsion_index=torsion_index,
             )
+                
 
         # nb x nloc x 3 x e_dim
         h2g2 = (
@@ -641,7 +783,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         )
         # (nb x nloc) x e_dim x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
-
+        # 检查node_ebd和edge_ebd中是否存在nan
+        
         return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
 
     def compute_input_stats(
