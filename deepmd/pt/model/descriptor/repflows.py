@@ -58,7 +58,6 @@ from .bessel_layer import (
     BesselBasisLayer,
 )
 
-from torch_scatter import scatter_min
 
 import math
 
@@ -583,9 +582,14 @@ class DescrptBlockRepflows(DescriptorBlock):
             i_iref_mask = i_mask & iref_mask
             
             idx_iref = torch.zeros_like(i, dtype=torch.int64)
-            idx_iref = torch.where(i_iref_mask.any(dim=0), 
-                                   i_iref_mask.int().argmax(dim=0), 
-                                   torch.zeros_like(i))
+            # 处理i_iref_mask为空的情况
+            if i_iref_mask.numel() == 0 or i_iref_mask.size(0) == 0:
+                idx_iref = torch.zeros_like(i, dtype=torch.int64)
+            else:
+                # 只有在mask非空时才执行argmax操作
+                idx_iref = torch.where(i_iref_mask.any(dim=0), 
+                                    i_iref_mask.int().argmax(dim=0), 
+                                    torch.zeros_like(i))
             
             temp_n0_j = n0_j % nall+ n0_j // nall * nloc
             mask_jref = temp_n0_j == i
@@ -600,9 +604,13 @@ class DescrptBlockRepflows(DescriptorBlock):
             
             # 获取每个(j, jref)对应的边索引
             idx_jref = torch.zeros_like(j, dtype=torch.int64)
-            idx_jref = torch.where(j_jref_mask.any(dim=0), 
-                                   j_jref_mask.int().argmax(dim=0), 
-                                   torch.zeros_like(j))
+            if j_jref_mask.numel() == 0 or j_jref_mask.size(0) == 0:
+                idx_jref = torch.zeros_like(j, dtype=torch.int64)
+            else:
+                # 只有在mask非空时才执行argmax操作
+                idx_jref = torch.where(j_jref_mask.any(dim=0), 
+                                    j_jref_mask.int().argmax(dim=0), 
+                                    torch.zeros_like(j))
             
             idx_ij = torch.nonzero(mask).squeeze(-1)
             vecs = diff[nlist_mask]
