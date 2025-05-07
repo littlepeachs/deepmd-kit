@@ -56,6 +56,11 @@ from .repflow_layer import (
 
 from .bessel_layer import (
     BesselBasisLayer,
+    SphLayer,
+)
+
+from .angular_layer import (
+    SphericalHarmonics,
 )
 
 
@@ -148,6 +153,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         If True, the edge update from angle message will not use self as padding.
     use_rbf : bool, optional
         Whether to use RBF for edge update.
+    use_angular : bool, optional
+        Whether to use angular message for edge update.
     use_torsion : bool, optional
         Whether to use torsion update.
     node_torsion : bool, optional
@@ -203,6 +210,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         fix_stat_std: float = 0.3,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_angular: bool = False,
         use_torsion: bool = False,
         node_torsion: bool = False,
         use_dynamic_sel: bool = False,
@@ -240,6 +248,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_angular = use_angular
         self.use_torsion = use_torsion
         self.node_torsion = node_torsion
         self.use_dynamic_sel = use_dynamic_sel
@@ -264,19 +273,46 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
 
-        if self.use_rbf:
+        if self.use_rbf and self.use_angular:
             self.bessel_basis = BesselBasisLayer(
-                num_radial=6,
+                num_radial=8,
+                cutoff=self.e_rcut,
+                envelope_exponent=5,
+            )
+            self.spherical_harmonics = SphericalHarmonics(
+                lmax=3,
+                normalize=True,
+                normalization="component",
+            )
+            self.sph_layer = SphLayer(
+                num_spherical=8,
+            )
+            self.edge_embd = MLPLayer(
+                9, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+            self.angle_embd = MLPLayer(
+                8, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
+            )
+        elif self.use_rbf and not self.use_angular:
+            self.bessel_basis = BesselBasisLayer(
+                num_radial=8,
                 cutoff=self.e_rcut,
                 envelope_exponent=5,
             )
             self.edge_embd = MLPLayer(
-                1+6, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+                9, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+            self.angle_embd = MLPLayer(
+                1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
             )
         else:
             self.bessel_basis = None
+            self.spherical_harmonics = None
             self.edge_embd = MLPLayer(
                 1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+            self.angle_embd = MLPLayer(
+                1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
             )
 
         if self.use_torsion:
@@ -286,9 +322,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             self.torsion_embd = None
 
-        self.angle_embd = MLPLayer(
-            1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
-        )
+
         layers = []
         for ii in range(nlayers):
             layers.append(
@@ -319,6 +353,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
                     use_rbf=self.use_rbf,
+                    use_angular=self.use_angular,
                     use_torsion=self.use_torsion,
                     node_torsion=self.node_torsion,
                     seed=child_seed(child_seed(seed, 1), ii),
@@ -655,35 +690,48 @@ class DescrptBlockRepflows(DescriptorBlock):
             torsion_mask = None
             torsion_index = None
         
-        if self.use_rbf and not self.use_dynamic_sel:
-            assert self.bessel_basis is not None
+        # if self.use_rbf and self.use_angular:
+        #     assert self.bessel_basis is not None
+        #     assert self.spherical_harmonics is not None
+        #     # TODO: implement this
+        #     length = torch.linalg.norm(diff, dim=-1, keepdim=True)
+        #     vectors = diff[nlist_mask]
+        #     length = length[nlist_mask]
+        #     n_edge = length.shape[0]
+        #     if n_edge > 0:
+        #         rbf_ebd = self.bessel_basis(length).view(n_edge, -1)
+        #         sph_ebd = self.spherical_harmonics(vectors)
+        #         outer_product = rbf_ebd[:, :, None] * sph_ebd[:, None, :]
+        #         edge_input = outer_product.view(n_edge, -1)
+        #     else:
+        #         edge_input = torch.zeros(edge_input.shape[0], 128, device=nlist.device, dtype=self.prec)
+        #         rbf_ebd = torch.zeros(edge_input.shape[0], 8, device=nlist.device, dtype=self.prec)
+        #     edge_ebd = self.act(self.edge_embd(edge_input))
+        
+        if self.use_rbf:
+        # elif self.use_rbf and not self.use_angular:
             length = torch.linalg.norm(diff, dim=-1, keepdim=True)
-            rbf_mask = nlist_mask.view(nframes, -1)
-            rbf_length = torch.where(rbf_mask, length.squeeze(-1).view(nframes, -1), 2*self.e_rcut*torch.ones_like(length.squeeze(-1)).view(nframes, -1))
-            rbf_ebd = self.bessel_basis(rbf_length).view(nframes, nloc, nnei, -1)
-            edge_input = torch.cat([edge_input, rbf_ebd], dim=-1)
-            edge_ebd = self.act(self.edge_embd(edge_input))
-
-        elif self.use_rbf and self.use_dynamic_sel:
-            assert self.bessel_basis is not None
-            # TODO: implement this
-            length = torch.linalg.norm(diff, dim=-1, keepdim=True)
+            vectors = diff[nlist_mask]
             length = length[nlist_mask]
             n_edge = length.shape[0]
             if n_edge > 0:
                 rbf_ebd = self.bessel_basis(length).view(n_edge, -1)
+                edge_input = torch.concat([edge_input, rbf_ebd], dim=-1)
             else:
-                rbf_ebd = torch.zeros(edge_input.shape[0], 6, device=nlist.device, dtype=self.prec)
-            edge_input = torch.cat([edge_input, rbf_ebd], dim=-1)
+                edge_input = torch.zeros((0, 9), device=nlist.device, dtype=self.prec)
+                rbf_ebd = torch.zeros((0, 8), device=nlist.device, dtype=self.prec)
             edge_ebd = self.act(self.edge_embd(edge_input))
-            
+            sph_ebd = None
         else:
             edge_ebd = self.act(self.edge_embd(edge_input))
             rbf_ebd = None
+            sph_ebd = None
 
-
+        # 将角度的cos值转换为弧度制的角度
+        angle_input = torch.acos(angle_input)
+        angle_sph_ebd = self.sph_layer(angle_input).squeeze(-1)
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
-        angle_ebd = self.angle_embd(angle_input)
+        angle_ebd = self.angle_embd(angle_sph_ebd)
 
         
         # nb x nall x n_dim

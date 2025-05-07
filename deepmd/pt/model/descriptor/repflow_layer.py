@@ -59,6 +59,7 @@ class RepFlowLayer(torch.nn.Module):
         sel_reduce_factor: float = 10.0,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_angular: bool = False,
         use_torsion: bool = False,
         node_torsion: bool = False,
         activation_function: str = "silu",
@@ -107,6 +108,7 @@ class RepFlowLayer(torch.nn.Module):
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_angular = use_angular
         self.use_torsion = use_torsion
         self.node_torsion = node_torsion
         self.use_dynamic_sel = use_dynamic_sel
@@ -166,7 +168,7 @@ class RepFlowLayer(torch.nn.Module):
 
         if self.use_rbf:
             self.rbf_linear = MLPLayer(
-                6, self.e_dim, precision=precision, seed=child_seed(seed, 4)
+                8, self.e_dim, precision=precision, seed=child_seed(seed, 4)
             )
         else:
             self.rbf_linear = None
@@ -985,7 +987,7 @@ class RepFlowLayer(torch.nn.Module):
                 node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
             )
         )
-
+        
         if self.use_rbf:
             assert self.rbf_linear is not None
             assert rbf_ebd is not None

@@ -126,6 +126,8 @@ class RepFlowArgs:
         If True, the edge update from angle message will not use self as padding.
     use_rbf : bool, optional
         Whether to use RBF for edge update.
+    use_angular : bool, optional
+        Whether to use angular message for edge.
     use_torsion : bool, optional
         Whether to use torsion update.
     node_torsion : bool, optional
@@ -158,6 +160,7 @@ class RepFlowArgs:
         optim_update: bool = True,
         smooth_edge_update: bool = False,
         use_rbf: bool = False,
+        use_angular: bool = False,
         use_torsion: bool = False,
         node_torsion: bool = False,
         use_dynamic_sel: bool = False,
@@ -189,6 +192,7 @@ class RepFlowArgs:
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.use_rbf = use_rbf
+        self.use_angular = use_angular
         self.use_torsion = use_torsion
         self.node_torsion = node_torsion
         self.use_dynamic_sel = use_dynamic_sel
@@ -225,6 +229,7 @@ class RepFlowArgs:
             "optim_update": self.optim_update,
             "smooth_edge_update": self.smooth_edge_update,
             "use_rbf": self.use_rbf,
+            "use_angular": self.use_angular,
             "use_torsion": self.use_torsion,
             "node_torsion": self.node_torsion,
         }
@@ -324,6 +329,7 @@ class DescrptDPA3(NativeOP, BaseDescriptor):
             optim_update=self.repflow_args.optim_update,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
             use_rbf=self.repflow_args.use_rbf,
+            use_angular=self.repflow_args.use_angular,
             use_torsion=self.repflow_args.use_torsion,
             node_torsion=self.repflow_args.node_torsion,
             exclude_types=exclude_types,

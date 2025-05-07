@@ -151,6 +151,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             optim_update=self.repflow_args.optim_update,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
             use_rbf=self.repflow_args.use_rbf,
+            use_angular=self.repflow_args.use_angular,
             use_torsion=self.repflow_args.use_torsion,
             node_torsion=self.repflow_args.node_torsion,
             use_dynamic_sel=self.repflow_args.use_dynamic_sel,

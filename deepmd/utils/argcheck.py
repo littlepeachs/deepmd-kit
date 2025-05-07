@@ -1502,6 +1502,11 @@ def dpa3_repflow_args():
         "If True, the edge update will use RBF for edge update. "
         "Defaults to False."
     )
+    doc_use_angular = (
+        "Whether to use angular message for edge update. "
+        "If True, the edge update will use angular message for edge update. "
+        "Defaults to False."
+    )
     doc_use_torsion = (
         "Whether to use torsion update. "
         "If True, the torsion update will be used. "
@@ -1618,6 +1623,13 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
             doc=doc_use_rbf,
+        ),
+        Argument(
+            "use_angular",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_angular,
         ),
         Argument(
             "use_torsion",

@@ -332,3 +332,60 @@ class BesselBasisLayer(torch.nn.Module):
         freqs = self.frequencies.to(d.device)
         return env * self.norm_const * torch.sin(freqs * d_scaled) / d
 
+class SphLayer(torch.nn.Module):
+    """
+    球谐函数层，用于编码角度信息
+
+    参数
+    ----------
+    num_spherical: int
+        球谐函数的最大角量子数
+    """
+    def __init__(
+        self,
+        num_spherical: int,
+        name="sph_basis"
+    ):
+        super().__init__()
+        self.num_spherical = num_spherical
+        
+        # 获取球谐函数表达式
+        Y_lm = real_sph_harm(
+            num_spherical, 
+            spherical_coordinates=True,
+            zero_m_only=True
+        )
+        
+        # 将表达式转换为可调用函数
+        self.sph_funcs = []
+        theta = sym.symbols("theta") 
+        modules = {"sin": torch.sin, "cos": torch.cos, "sqrt": torch.sqrt}
+        
+        m = 0
+        for l in range(len(Y_lm)):
+            if l == 0:
+                # l=0时球谐函数为常数
+                first_sph = sym.lambdify([theta], Y_lm[l][m], modules)
+                self.sph_funcs.append(
+                    lambda theta: torch.zeros_like(theta) + first_sph(theta)
+                )
+            else:
+                self.sph_funcs.append(
+                    sym.lambdify([theta], Y_lm[l][m], modules)
+                )
+
+    def forward(self, angle):
+        """
+        计算角度的球谐函数值
+
+        参数
+        ----------
+        angle: torch.Tensor
+            输入角度
+
+        返回
+        ----------
+        torch.Tensor
+            球谐函数值，形状为(batch_size, num_spherical)
+        """
+        return torch.stack([f(angle) for f in self.sph_funcs], dim=1)
