@@ -204,6 +204,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             env_protection=env_protection,
             precision=precision,
             seed=child_seed(seed, 1),
+            use_rbf=self.repflow_args.use_rbf,
+            use_torsion=self.repflow_args.use_torsion,
         )
 
         self.use_econf_tebd = use_econf_tebd

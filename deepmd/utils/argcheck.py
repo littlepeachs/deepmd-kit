@@ -1490,6 +1490,16 @@ def dpa3_repflow_args():
         "the initialization mode of residual vector weights."
         "Supported modes are: ['norm', 'const']."
     )
+    doc_use_rbf = (
+        "Whether to use RBF for edge update. "
+        "If True, the edge update will use RBF for edge update. "
+        "Defaults to False."
+    )
+    doc_use_torsion = (
+        "Whether to use torsion update. "
+        "If True, the torsion update will be used. "
+        "Defaults to False."
+    )
 
     return [
         # repflow args
@@ -1621,6 +1631,20 @@ def dpa3_repflow_args():
             bool,
             optional=True,
             default=False,
+        ),
+        Argument(
+            "use_rbf",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_rbf,
+        ),
+        Argument(
+            "use_torsion",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_torsion,
         ),
         Argument(
             "update_dihedral",

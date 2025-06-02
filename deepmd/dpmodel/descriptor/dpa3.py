@@ -64,6 +64,8 @@ class RepFlowArgs:
         message_use_self_concat: bool = False,
         use_combined_output: bool = False,
         use_slim_message: bool = False,
+        use_rbf: bool = False,
+        use_torsion: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -119,6 +121,10 @@ class RepFlowArgs:
             When update using residual mode, the initial std of residual vector weights.
         update_residual_init : str, optional
             When update using residual mode, the initialization mode of residual vector weights.
+        use_rbf : bool, optional
+            Whether to use RBF for edge update.
+        use_torsion : bool, optional
+            Whether to use torsion update.
         """
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -177,6 +183,8 @@ class RepFlowArgs:
         self.message_use_self_concat = message_use_self_concat
         self.use_combined_output = use_combined_output
         self.use_slim_message = use_slim_message
+        self.use_rbf = use_rbf
+        self.use_torsion = use_torsion
 
     def __getitem__(self, key):
         if hasattr(self, key):
@@ -205,6 +213,8 @@ class RepFlowArgs:
             "update_style": self.update_style,
             "update_residual": self.update_residual,
             "update_residual_init": self.update_residual_init,
+            "use_rbf": self.use_rbf,
+            "use_torsion": self.use_torsion,
         }
 
     @classmethod
