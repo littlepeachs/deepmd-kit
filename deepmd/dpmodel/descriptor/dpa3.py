@@ -66,6 +66,7 @@ class RepFlowArgs:
         use_slim_message: bool = False,
         use_rbf: bool = False,
         use_torsion: bool = False,
+        use_atomic_moment: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -125,6 +126,8 @@ class RepFlowArgs:
             Whether to use RBF for edge update.
         use_torsion : bool, optional
             Whether to use torsion update.
+        use_atomic_moment : bool, optional
+            Whether to use atomic moment for edge update.
         """
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -185,7 +188,7 @@ class RepFlowArgs:
         self.use_slim_message = use_slim_message
         self.use_rbf = use_rbf
         self.use_torsion = use_torsion
-
+        self.use_atomic_moment = use_atomic_moment
     def __getitem__(self, key):
         if hasattr(self, key):
             return getattr(self, key)
@@ -215,6 +218,7 @@ class RepFlowArgs:
             "update_residual_init": self.update_residual_init,
             "use_rbf": self.use_rbf,
             "use_torsion": self.use_torsion,
+            "use_atomic_moment": self.use_atomic_moment,
         }
 
     @classmethod

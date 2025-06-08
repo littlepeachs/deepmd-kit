@@ -152,6 +152,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         seed: Optional[Union[int, list[int]]] = None,
         use_rbf: bool = False,
         use_torsion: bool = False,
+        use_atomic_moment: bool = False,
     ) -> None:
         r"""
         The repflow descriptor block.
@@ -228,6 +229,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             Whether to use RBF for edge update.
         use_torsion : bool, optional
             Whether to use torsion update.
+        use_atomic_moment : bool, optional
+            Whether to use atomic moment for edge update.
         """
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -405,6 +408,24 @@ class DescrptBlockRepflows(DescriptorBlock):
         layers = []
         self.use_rbf = use_rbf
         self.use_torsion = use_torsion
+        self.use_atomic_moment = use_atomic_moment
+        if self.use_rbf:
+            self.rbf_dim = 32
+            self.bessel_basis = BesselBasisLayer(
+                num_radial=self.rbf_dim,
+                cutoff=self.e_rcut,
+                envelope_exponent=5,
+            )
+            self.edge_embd = MLPLayer(
+                1+self.rbf_dim, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+        else:
+            self.rbf_dim = 0
+            self.bessel_basis = None
+            self.edge_embd = MLPLayer(
+                1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            )
+            
         for ii in range(nlayers):
             layers.append(
                 RepFlowLayer(
@@ -449,13 +470,16 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_attn_use_ln=self.edge_attn_use_ln,
                     edge_rbf_dot_self=self.edge_rbf_dot_self,
                     edge_rbf_dot_message=self.edge_rbf_dot_message,
-                    rbf_dim=self.edge_embed_input_dim,
+                    rbf_dim=self.rbf_dim,
                     residual_pref=self.residual_pref,
                     message_use_self_concat=self.message_use_self_concat,
                     use_slim_message=self.use_slim_message,
                     seed=child_seed(child_seed(seed, 1), ii),
                     use_rbf=self.use_rbf,
                     use_torsion=self.use_torsion,
+                    use_atomic_moment=self.use_atomic_moment,
+                    layer_idx=ii,
+                    max_layer_num = nlayers,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -468,24 +492,6 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.register_buffer("mean", mean)
         self.register_buffer("stddev", stddev)
         self.stats = None
-
-        self.use_rbf = use_rbf
-        self.use_torsion = use_torsion
-
-        if self.use_rbf:
-            self.bessel_basis = BesselBasisLayer(
-                num_radial=6,
-                cutoff=self.e_rcut,
-                envelope_exponent=5,
-            )
-            self.edge_embd = MLPLayer(
-                1+6, self.e_dim, precision=precision, seed=child_seed(seed, 0)
-            )
-        else:
-            self.bessel_basis = None
-            self.edge_embd = MLPLayer(
-                1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
-            )
 
         if self.use_torsion:
             self.torsion_embd = MLPLayer(
@@ -979,7 +985,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             if n_edge > 0:
                 rbf_ebd = self.bessel_basis(length).view(n_edge, -1)
             else:
-                rbf_ebd = torch.zeros(edge_input.shape[0], 6, device=nlist.device, dtype=self.prec)
+                rbf_ebd = torch.zeros(edge_input.shape[0], 32, device=nlist.device, dtype=self.prec)
             edge_input = torch.cat([edge_input, rbf_ebd], dim=-1)
             edge_ebd = self.act(self.edge_embd(edge_input))
         elif self.edge_use_esen_rbf:
@@ -1026,6 +1032,9 @@ class DescrptBlockRepflows(DescriptorBlock):
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
+
+        atom_feats_in = None
+        
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim
@@ -1090,7 +1099,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
             
-            node_ebd, edge_ebd, angle_ebd, dihedral_ebd, torsion_ebd = ll.forward(
+            node_ebd, edge_ebd, angle_ebd, dihedral_ebd, torsion_ebd,atom_feats_in = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
                 h2,
@@ -1112,6 +1121,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 torsion_ebd=torsion_ebd,
                 torsion_mask=torsion_mask,
                 torsion_index=torsion_index,
+                atom_feats_in=atom_feats_in,
             )
 
         if self.use_combined_output:

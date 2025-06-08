@@ -1647,6 +1647,12 @@ def dpa3_repflow_args():
             doc=doc_use_torsion,
         ),
         Argument(
+            "use_atomic_moment",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "update_dihedral",
             bool,
             optional=True,

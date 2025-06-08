@@ -206,6 +206,7 @@ class MLPLayer(nn.Module):
     def forward(
         self,
         xx: torch.Tensor,
+        dims: Optional[list[int]] = None
     ) -> torch.Tensor:
         """One MLP layer used by DP model.
 
@@ -219,26 +220,47 @@ class MLPLayer(nn.Module):
         yy: torch.Tensor
             The output.
         """
-        ori_prec = xx.dtype
-        if not env.DP_DTYPE_PROMOTION_STRICT:
+        if dims is None:
+            ori_prec = xx.dtype
+            if not env.DP_DTYPE_PROMOTION_STRICT:
+                xx = xx.to(self.prec)
+            yy = (
+                torch.matmul(xx, self.matrix) + self.bias
+                if self.bias is not None
+                else torch.matmul(xx, self.matrix)
+            )
+            yy = self.activate(yy).clone()
+            yy = yy * self.idt if self.idt is not None else yy
+            if self.resnet:
+                if xx.shape[-1] == yy.shape[-1]:
+                    yy += xx
+                elif 2 * xx.shape[-1] == yy.shape[-1]:
+                    yy += torch.concat([xx, xx], dim=-1)
+                else:
+                    yy = yy
+            if not env.DP_DTYPE_PROMOTION_STRICT:
+                yy = yy.to(ori_prec)
+            return yy
+        else:
+            ori_prec = xx.dtype
             xx = xx.to(self.prec)
-        yy = (
-            torch.matmul(xx, self.matrix) + self.bias
-            if self.bias is not None
-            else torch.matmul(xx, self.matrix)
-        )
-        yy = self.activate(yy).clone()
-        yy = yy * self.idt if self.idt is not None else yy
-        if self.resnet:
-            if xx.shape[-1] == yy.shape[-1]:
-                yy += xx
-            elif 2 * xx.shape[-1] == yy.shape[-1]:
-                yy += torch.concat([xx, xx], dim=-1)
-            else:
-                yy = yy
-        if not env.DP_DTYPE_PROMOTION_STRICT:
+            yy = (
+                torch.einsum('ij,j...->i...', self.matrix, xx) + self.bias.unsqueeze(-1)
+                if self.bias is not None
+                else torch.einsum('ij,j...->i...', self.matrix, xx)
+            )
+            yy = self.activate(yy).clone()
+            yy = yy * self.idt if self.idt is not None else yy
+            if self.resnet:
+                if xx.shape[0] == yy.shape[0]:
+                    yy += xx
+                elif 2 * xx.shape[0] == yy.shape[0]:
+                    yy += torch.concat([xx, xx], dim=0)
+                else:
+                    yy = yy
             yy = yy.to(ori_prec)
-        return yy
+            return yy
+        
 
     def serialize(self) -> dict:
         """Serialize the layer to a dict.
@@ -296,6 +318,135 @@ class MLPLayer(nn.Module):
         obj.bias = check_load_param("bias")
         obj.idt = check_load_param("idt")
         return obj
+    
+class LinearCombination(nn.Module):
+    """
+    Linear combination of tensors.
+
+    Given a tensor of shape (d0, d1, d2 ...), this module computes the linear
+    combination along the first dimension d0, but separately for each d1 dimension,
+    resulting in a tensor of shape (d1, d2, ...).
+
+    Args:
+        in_features: d0
+        const_features: d1
+        init: initialization method
+        seed: random seed
+        precision: precision
+    """
+
+    def __init__(
+        self, 
+        in_features: int, 
+        const_features: int,
+        init: str = "default",
+        seed: Optional[Union[int, list[int]]] = None,
+        precision: str = DEFAULT_PRECISION,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.const_features = const_features
+        self.precision = precision
+        self.prec = PRECISION_DICT[self.precision]
+
+        self.weight = nn.Parameter(data=empty_t((in_features, const_features), self.prec))
+        random_generator = get_generator(seed)
+        
+        if init == "default":
+            init = env.MLP_INIT
+        if init == "default":
+            self._default_uniform_init(generator=random_generator)
+        elif init == "trunc_normal":
+            self._trunc_normal_init(generator=random_generator)
+        elif init == "glorot":
+            self._glorot_uniform_init(generator=random_generator)
+        elif init == "kaiming_normal":
+            self._normal_init(generator=random_generator)
+        elif init == "uniform":
+            self._default_uniform_init(generator=random_generator)
+
+    def _default_uniform_init(self, generator: Optional[torch.Generator] = None) -> None:
+        """Default uniform initialization"""
+        k = 1 / self.in_features**0.5
+        uniform_(self.weight, -k, k, generator=generator)
+
+    def _trunc_normal_init(self, generator: Optional[torch.Generator] = None) -> None:
+        """Truncated normal initialization"""
+        TRUNCATED_NORMAL_STDDEV_FACTOR = 0.87962566103423978
+        _, fan_in = self.weight.shape
+        scale = 1.0 / max(1, fan_in)
+        std = (scale**0.5) / TRUNCATED_NORMAL_STDDEV_FACTOR
+        trunc_normal_(self.weight, mean=0.0, std=std, generator=generator)
+
+    def _glorot_uniform_init(self, generator: Optional[torch.Generator] = None) -> None:
+        """Glorot uniform initialization"""
+        xavier_uniform_(self.weight, gain=1, generator=generator)
+
+    def _normal_init(self, generator: Optional[torch.Generator] = None) -> None:
+        """Kaiming normal initialization"""
+        kaiming_normal_(self.weight, nonlinearity="linear", generator=generator)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: tensor of shape (d0, d1, d2, ...)
+
+        Returns:
+            tensor of shape (d1, d2, ...)
+        """
+        ori_prec = input.dtype
+        input = input.to(self.prec)
+        out = torch.einsum("ij,ij...->j...", self.weight, input)
+        out = out.to(ori_prec)
+        return out
+
+    def serialize(self) -> dict:
+        """Serialize the network to a dict.
+
+        Returns
+        -------
+        dict
+            The serialized network.
+        """
+        return {
+            "@class": "LinearCombination",
+            "@version": 1,
+            "in_features": self.in_features,
+            "const_features": self.const_features,
+            "precision": self.precision,
+            "weight": to_numpy_array(self.weight),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "LinearCombination":
+        """Deserialize the layer from a dict.
+
+        Parameters
+        ----------
+        data : dict
+            The dict to deserialize from.
+        """
+        obj = cls(
+            in_features=data["in_features"],
+            const_features=data["const_features"],
+            precision=data["precision"],
+        )
+        obj.weight = nn.Parameter(data=to_torch_tensor(data["weight"]))
+        return obj
+
+    def check_type_consistency(self) -> None:
+        """Check type consistency"""
+        precision = self.precision
+        if self.weight is not None:
+            assert PRECISION_DICT[self.weight.dtype.name] is PRECISION_DICT[precision]
+
+    def dim_in(self) -> int:
+        """Input dimension"""
+        return self.weight.shape[0]
+
+    def dim_out(self) -> int:
+        """Output dimension"""
+        return self.weight.shape[1]
 
 
 class FeedForward(nn.Module):

@@ -205,6 +205,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             precision=precision,
             seed=child_seed(seed, 1),
             use_rbf=self.repflow_args.use_rbf,
+            use_atomic_moment=self.repflow_args.use_atomic_moment,
             use_torsion=self.repflow_args.use_torsion,
         )
 

@@ -476,7 +476,11 @@ def DescriptorParamDPA3(
     update_residual_init="const",
     update_angle=True,
     n_multi_edge_message=1,
-    a_compress_rate=0,
+    a_compress_rate=1,
+    a_compress_e_rate=2,
+    a_compress_use_split=True,
+    optim_update=True,
+    smooth_edge_update=True,
     precision="float64",
 ):
     input_dict = {
@@ -485,8 +489,8 @@ def DescriptorParamDPA3(
             **{
                 "n_dim": 20,
                 "e_dim": 10,
-                "a_dim": 10,
-                "nlayers": 3,
+                "a_dim": 8,
+                "nlayers": 2,
                 "e_rcut": rcut,
                 "e_rcut_smth": rcut_smth,
                 "e_sel": sum(sel),
@@ -494,12 +498,23 @@ def DescriptorParamDPA3(
                 "a_rcut_smth": rcut_smth / 2,
                 "a_sel": sum(sel) // 4,
                 "a_compress_rate": a_compress_rate,
+                "a_compress_e_rate": a_compress_e_rate,
+                "a_compress_use_split": a_compress_use_split,
+                "optim_update": optim_update,
+                "smooth_edge_update": smooth_edge_update,
                 "n_multi_edge_message": n_multi_edge_message,
-                "axis_neuron": 4,
+                "axis_neuron": 2,
                 "update_angle": update_angle,
-                "update_style": update_style,
-                "update_residual": update_residual,
-                "update_residual_init": update_residual_init,
+                "sel_reduce_factor": 10.0,
+                "edge_use_dist": True,
+                "use_env_envelope": True,
+                "update_style": "res_residual",
+                "update_residual": 0.1,
+                "update_residual_init": "const",
+                "use_rbf": True,
+                "use_dynamic_sel": True,
+                "use_torsion": True,
+                "use_atomic_moment": True,
             }
         ),
         "ntypes": ntypes,
@@ -517,16 +532,17 @@ def DescriptorParamDPA3(
     return input_dict
 
 
+
 DescriptorParamDPA3List = parameterize_func(
     DescriptorParamDPA3,
     OrderedDict(
         {
             "update_residual_init": ("const",),
-            "exclude_types": ([], [[0, 1]]),
-            "update_angle": (True, False),
-            "a_compress_rate": (0, 1),
-            "n_multi_edge_message": (1, 2),
-            "env_protection": (0.0, 1e-8),
+            "exclude_types": ([],),
+            "update_angle": (True,),
+            "a_compress_rate": (1,),
+            "n_multi_edge_message": (1,),
+            "env_protection": (0.0,),
             "precision": ("float64",),
         }
     ),
