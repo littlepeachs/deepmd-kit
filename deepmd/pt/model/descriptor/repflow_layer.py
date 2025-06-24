@@ -4,7 +4,7 @@ from typing import (
     Optional,
     Union,
 )
-
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 
@@ -223,7 +223,6 @@ class RepFlowLayer(torch.nn.Module):
                 max_u=self.rbf_dim,
                 max_v1=self.max_atom_feats_rank,
                 max_v2=max_v,
-                num_average_neigh=50,
                 n_dim=self.n_dim,
                 e_dim=self.e_dim,
                 rbf_dim=self.rbf_dim,
@@ -267,6 +266,11 @@ class RepFlowLayer(torch.nn.Module):
                 )
             else:
                 self.linear_channel_feats = nn.ModuleDict({})
+            
+            self.moment_layer_norm = nn.ModuleDict({
+                str(rank): LayerNorm(self.rbf_dim, eps=1e-5)
+                for rank in range(max_v + 1)
+            })
         else:
             self.atomic_moment_layer = None
 
@@ -1231,6 +1235,16 @@ class RepFlowLayer(torch.nn.Module):
         result_update = (sub_edge_update + sub_node_ext_update + sub_node_update) + bias
         return result_update
 
+    def layer_norm_dim0(self,tensor,fn=None):
+        # 获取张量的形状
+        shape = tensor.shape
+        # 调整维度顺序，将第 0 维移到最后
+        permuted_tensor = tensor.permute(1, *range(2, len(shape)), 0)
+        # 对调整后的张量应用 LayerNorm
+        normalized_tensor = F.layer_norm(permuted_tensor, permuted_tensor.shape[-1:])
+        # 恢复原始的维度顺序
+        return normalized_tensor.permute(-1, *range(len(shape) - 1))
+
     def forward(
         self,
         node_ebd_ext: torch.Tensor,  # nf x nall x n_dim
@@ -1255,6 +1269,7 @@ class RepFlowLayer(torch.nn.Module):
         torsion_mask: Optional[torch.Tensor] = None,
         torsion_index: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         atom_feats_in: Optional[torch.Tensor] = None,
+        edge_diff: Optional[torch.Tensor] = None,
     ):
         """
         Parameters
@@ -1512,24 +1527,49 @@ class RepFlowLayer(torch.nn.Module):
         # update node_ebd
         # TODO: add atomic moment
         start_time = time.time()
-        if self.use_atomic_moment:
+        # neighbor number
+        num_neighbors_per_atom = nlist_mask.sum(dim=-1).float()  # shape: (nb, nloc)
+        avg_num_neighbors = num_neighbors_per_atom.mean(dim=-1)  # shape: (nb,)
+        num_average_neigh = avg_num_neighbors.mean().item()  # 标量值
+        
+        edge_index_real = torch.zeros_like(edge_index)
+        for i in range(nb):
+            start_idx = i * nloc
+            end_idx = (i + 1) * nloc
+            edge_index_mask = (edge_index[:, 0] >= start_idx) & (edge_index[:, 0] < end_idx)
+            edge_index_real[edge_index_mask] = edge_index[edge_index_mask] % nloc + i * nloc
+        
+        if self.use_atomic_moment and edge_index.numel() > 0 and num_average_neigh >= 4 and edge_index_real.max()==nb*nloc-1:
+        
             assert self.atomic_moment_layer is not None
             assert self.hyper_moment_layer is not None
-            edge_index_real = torch.zeros_like(edge_index)
-            for i in range(nb):
-                start_idx = i * nloc
-                end_idx = (i + 1) * nloc
-                edge_index_mask = (edge_index[:, 0] >= start_idx) & (edge_index[:, 0] < end_idx)
-                edge_index_real[edge_index_mask] = edge_index[edge_index_mask] % nloc + i * nloc
-            
+
             
             if atom_feats_in is None:
                 temp_node_ebd = self.atom_feats_in_transform(node_ebd)
-                atom_feats_in = {0: temp_node_ebd.clone().view(-1, temp_node_ebd.shape[-1]).permute(1, 0)}
+                atom_feats_in = {0: temp_node_ebd.clone().view(-1, temp_node_ebd.shape[-1]).permute(1, 0)} 
             
-            am = self.atomic_moment_layer(atom_feats_in,edge_index_real,rbf_ebd,h2)
+            am = self.atomic_moment_layer(atom_feats_in,edge_index_real,rbf_ebd,edge_diff,num_average_neigh,sw)
+            # 检查am字典中是否存在NaN值
+            
             hm = self.hyper_moment_layer(am)
+            # print(torch.max(hm[0]))
+            # print(torch.max(hm[1]))
+            # print(torch.max(hm[2]))
+            # print("----------------")
+            # print(torch.std(hm[0]))
+            # print(torch.std(hm[1]))
+            # print(torch.std(hm[2]))
+            # print("-----------------")
+            # print(torch.max(am[0]))
+            # print(torch.max(am[1]))
+            # print(torch.max(am[2]))
+            # print("-----------------")
 
+            # print(torch.std(am[0]))
+            # print(torch.std(am[1]))
+            # print(torch.std(am[2]))
+            # import pdb; pdb.set_trace()
             for rank, m in hm.items():
                 fn = self.linear_channel_hyper[str(rank)]
                 hm[rank] = fn.forward(m,dims=0)
@@ -1539,13 +1579,19 @@ class RepFlowLayer(torch.nn.Module):
                 for rank in range(max_rank + 1):
                     fn = self.linear_channel_feats[str(rank)]
                     out[rank] = out[rank] + fn.forward(atom_feats_in[rank],dims=0)
+
+            for key,value in out.items():
+                out[key] = self.layer_norm_dim0(value,self.moment_layer_norm[str(key)])
+
             moment_ebd = out[0].permute(1,0).view(nb,nloc,-1)
-            
+
             moment_ebd = self.atom_feats_out_transform(moment_ebd)
+            
             n_update_list.append(moment_ebd)
         # edge self message
         else:
             out = None
+            n_update_list.append(torch.zeros_like(node_ebd))
         end_time = time.time()
         # print(f"atomic moment time: {end_time - start_time}")
         

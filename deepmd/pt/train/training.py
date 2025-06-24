@@ -12,6 +12,7 @@ from typing import (
     Any,
 )
 
+import pickle
 import numpy as np
 import torch
 
@@ -690,16 +691,37 @@ class Trainer:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
+                
+                if self.restart_training:
+                    input_dict = pickle.load(open("debug_input_dict.pkl", "rb"))
+                    label_dict = pickle.load(open("debug_label_dict.pkl", "rb"))
+                try:
+                    model_pred, loss, more_loss = self.wrapper(
+                        **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
+                    )
+                except Exception as e:
+                    self.debug_latest_model = Path(self.save_ckpt + f"-{_step_id}.pt")
+                    self.save_model(self.debug_latest_model, lr=cur_lr, step=_step_id)
+                    with open("debug_input_dict.pkl", "wb") as f:
+                        pickle.dump(input_dict, f)
+                    with open("debug_label_dict.pkl", "wb") as f:
+                        pickle.dump(label_dict, f)
                 loss.backward()
                 if self.gradient_max_norm > 0.0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.wrapper.parameters(),
-                        self.gradient_max_norm,
-                        error_if_nonfinite=True,
-                    )
+                    try:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.wrapper.parameters(),
+                            self.gradient_max_norm,
+                            error_if_nonfinite=True,
+                        )
+                    except Exception as e:
+                        self.debug_latest_model = Path(self.save_ckpt + f"-{_step_id}.pt")
+                        self.save_model(self.debug_latest_model, lr=cur_lr, step=_step_id)
+                        with open("debug_input_dict.pkl", "wb") as f:
+                            pickle.dump(input_dict, f)
+                        with open("debug_label_dict.pkl", "wb") as f:
+                            pickle.dump(label_dict, f)
+                        
                 with torch.device("cpu"):
                     self.optimizer.step()
                 self.scheduler.step()

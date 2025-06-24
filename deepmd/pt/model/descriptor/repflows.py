@@ -818,6 +818,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             sw = sw[nlist_mask]
             # n_edge x 4
             dmatrix = dmatrix[nlist_mask]
+            # n_edge x 3
+            edge_diff = diff[nlist_mask]
 
             if self.edge_use_esen_atom_ebd:
                 assert source_type is not None
@@ -857,18 +859,16 @@ class DescrptBlockRepflows(DescriptorBlock):
         if self.use_torsion and self.use_dynamic_sel:
             # TODO: implement this
             assert self.torsion_embd is not None
-            distance = torch.linalg.norm(diff, dim=-1, keepdim=True)
-            dist = distance[nlist_mask].squeeze(-1)
             n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
             # 创建掩码，过滤掉大于max(n2e_index)的n_ext2e_index
 
 
             extended_mask = n2e_index // nloc
-            extended_mask = extended_mask * nloc *27 + nloc
+            extended_mask = extended_mask * nall + nloc
             
             mask = n_ext2e_index < extended_mask
             j = n_ext2e_index[mask]
-            j = j % (nloc) + j//(nloc * 27) * nloc
+            j = j % (nloc) + j//(nall) * nloc
             i = n2e_index[mask]
             
             # 计算向量差
@@ -1098,7 +1098,6 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            
             node_ebd, edge_ebd, angle_ebd, dihedral_ebd, torsion_ebd,atom_feats_in = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
@@ -1122,6 +1121,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 torsion_mask=torsion_mask,
                 torsion_index=torsion_index,
                 atom_feats_in=atom_feats_in,
+                edge_diff=edge_diff,
             )
 
         if self.use_combined_output:

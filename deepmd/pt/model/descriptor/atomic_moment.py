@@ -45,7 +45,6 @@ class AtomicMoment(nn.Module):
         max_u: int,
         max_v1: int,
         max_v2: int,
-        num_average_neigh: float,
         n_dim: int,
         e_dim: int,
         rbf_dim: int = 32,
@@ -85,7 +84,6 @@ class AtomicMoment(nn.Module):
         self.max_u = max_u
         self.max_v1 = max_v1
         self.max_v2 = max_v2
-        self.num_average_neigh = num_average_neigh
         self.max_chebyshev_degree = max_chebyshev_degree
         self.radial_mlp_hidden_layers = radial_mlp_hidden_layers
         self.r_cut = r_cut
@@ -153,7 +151,9 @@ class AtomicMoment(nn.Module):
         atom_feat: dict[int, Tensor],
         edge_index: Tensor,
         rbf_ebd: Tensor,
-        h2: Tensor,
+        diff: Tensor,
+        num_average_neigh: float,
+        sw: Tensor,
     ) -> dict[int, Tensor]:
         """
 
@@ -174,11 +174,11 @@ class AtomicMoment(nn.Module):
         j_idx = edge_index[:,1]
         
         # radial part, shape (n_edges, n_u)
-        
-        
+        # print(torch.max(atom_feat[0]))
+        # import pdb; pdb.set_trace()
         dyad_tensors = {
             # TODO get_dyadic_tensor cause NAN
-            v: get_dyadic_tensor(h2, rank=v, normalize=False)
+            v: get_dyadic_tensor(diff, rank=v, normalize=True)
             for v in range(self.max_v2 + 1)
         }  # (n_edges, 3, 3, ...), number of 3: v
         
@@ -210,12 +210,15 @@ class AtomicMoment(nn.Module):
 
                     t = shaped_R * torch.einsum(equation, neighbor_ebd, dyad_tensors[v2])
                 
+                t = torch.einsum('ue...,e->ue...', t, sw)
                 # aggregate atoms j (src) to atom i (dst)
                 # shape (n_u, n_atoms, 3, 3, ...), number of 3: rank
                 t = (
                     scatter(t, i_idx, reduce="sum", dim=1)
-                    / self.num_average_neigh**0.5
+                    / (num_average_neigh**0.5)
                 )
+                
+                
                 M_uvp.append(t)
             
             # linear combination of different paths
@@ -227,14 +230,14 @@ class AtomicMoment(nn.Module):
             else:
                 M_uv = M_uvp[0]  # shape (n_u, n_atoms, 3, 3, ...)
                 
-            
             # linear mix of different channels
 
             fn = self.linear_channel[str(v)]
             M_uv = fn.forward(M_uv,dims=0)  # shape (n_u, n_atoms, 3, 3, ...)
             
             M[v] = M_uv
-        
+        # print(torch.max(M[0]))
+        # import pdb; pdb.set_trace()
         return M
 
 
