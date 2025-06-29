@@ -22,6 +22,7 @@ from deepmd.pt.model.descriptor.repformer_layer import (
 from deepmd.pt.model.network.layernorm import (
     LayerNorm,
 )
+from .rmsnorm import RMSLayerNorm
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
@@ -268,7 +269,7 @@ class RepFlowLayer(torch.nn.Module):
                 self.linear_channel_feats = nn.ModuleDict({})
             
             self.moment_layer_norm = nn.ModuleDict({
-                str(rank): LayerNorm(self.rbf_dim, eps=1e-5)
+                str(rank): RMSLayerNorm(self.rbf_dim,rank, eps=1e-5)
                 for rank in range(max_v + 1)
             })
         else:
@@ -1241,7 +1242,8 @@ class RepFlowLayer(torch.nn.Module):
         # 调整维度顺序，将第 0 维移到最后
         permuted_tensor = tensor.permute(1, *range(2, len(shape)), 0)
         # 对调整后的张量应用 LayerNorm
-        normalized_tensor = F.layer_norm(permuted_tensor, permuted_tensor.shape[-1:])
+        normalized_tensor = fn(permuted_tensor)
+        # normalized_tensor = fn(permuted_tensor, permuted_tensor.shape[-1:])
         # 恢复原始的维度顺序
         return normalized_tensor.permute(-1, *range(len(shape) - 1))
 
@@ -1316,7 +1318,6 @@ class RepFlowLayer(torch.nn.Module):
         a_updated : nf x nloc x a_nnei x a_nnei x a_dim
             Updated angle embedding.
         """
-        start_layer_time = time.time()
         nb, nloc, nnei = nlist.shape
         nall = node_ebd_ext.shape[1]
         node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
@@ -1553,23 +1554,7 @@ class RepFlowLayer(torch.nn.Module):
             # 检查am字典中是否存在NaN值
             
             hm = self.hyper_moment_layer(am)
-            # print(torch.max(hm[0]))
-            # print(torch.max(hm[1]))
-            # print(torch.max(hm[2]))
-            # print("----------------")
-            # print(torch.std(hm[0]))
-            # print(torch.std(hm[1]))
-            # print(torch.std(hm[2]))
-            # print("-----------------")
-            # print(torch.max(am[0]))
-            # print(torch.max(am[1]))
-            # print(torch.max(am[2]))
-            # print("-----------------")
 
-            # print(torch.std(am[0]))
-            # print(torch.std(am[1]))
-            # print(torch.std(am[2]))
-            # import pdb; pdb.set_trace()
             for rank, m in hm.items():
                 fn = self.linear_channel_hyper[str(rank)]
                 hm[rank] = fn.forward(m,dims=0)
@@ -1579,7 +1564,8 @@ class RepFlowLayer(torch.nn.Module):
                 for rank in range(max_rank + 1):
                     fn = self.linear_channel_feats[str(rank)]
                     out[rank] = out[rank] + fn.forward(atom_feats_in[rank],dims=0)
-
+            
+            
             for key,value in out.items():
                 out[key] = self.layer_norm_dim0(value,self.moment_layer_norm[str(key)])
 

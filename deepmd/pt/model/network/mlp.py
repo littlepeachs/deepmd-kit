@@ -225,9 +225,9 @@ class MLPLayer(nn.Module):
             if not env.DP_DTYPE_PROMOTION_STRICT:
                 xx = xx.to(self.prec)
             yy = (
-                torch.matmul(xx, self.matrix) + self.bias
+                torch.matmul(xx, self.matrix.to(xx.device)) + self.bias.to(xx.device)
                 if self.bias is not None
-                else torch.matmul(xx, self.matrix)
+                else torch.matmul(xx, self.matrix.to(xx.device))
             )
             yy = self.activate(yy).clone()
             yy = yy * self.idt if self.idt is not None else yy

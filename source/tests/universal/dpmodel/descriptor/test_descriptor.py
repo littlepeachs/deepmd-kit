@@ -513,7 +513,7 @@ def DescriptorParamDPA3(
                 "update_residual_init": "const",
                 "use_rbf": True,
                 "use_dynamic_sel": True,
-                "use_torsion": True,
+                "use_torsion": False,
                 "use_atomic_moment": True,
             }
         ),
