@@ -24,15 +24,16 @@ def extend_input_and_build_neighbor_list(
     box: Optional[torch.Tensor] = None,
 ):
     nframes, nloc = atype.shape[:2]
-    if box is not None:
-        box_gpu = box.to(coord.device, non_blocking=True)
-        coord_normalized = normalize_coord(
-            coord.view(nframes, nloc, 3),
-            box_gpu.reshape(nframes, 3, 3),
-        )
-    else:
-        box_gpu = None
-        coord_normalized = coord.clone()
+    # if box is not None:
+    #     box_gpu = box.to(coord.device, non_blocking=True)
+    #     coord_normalized = normalize_coord(
+    #         coord.view(nframes, nloc, 3),
+    #         box_gpu.reshape(nframes, 3, 3),
+    #     )
+    # else:
+    box_gpu = None
+    coord_normalized = coord.clone()
+    
     extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
         coord_normalized, atype, box_gpu, rcut, box
     )

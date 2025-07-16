@@ -4,6 +4,9 @@ from typing import (
     Optional,
     Union,
 )
+from deepmd.pt.utils.preprocess import (
+    compute_new_weight,compute_envelope,compute_smooth_weight
+)
 
 import torch
 
@@ -59,6 +62,16 @@ from .repflow_layer import (
 from .bessel_layer import (
     BesselBasisLayer,
 )
+
+from .p3m_longrange import (
+    NonPBCAddGrid,
+)
+
+from .radius_utils import (
+    get_distances,radius_determinstic
+)
+
+from torch_scatter import scatter
 
 if not hasattr(torch.ops.deepmd, "border_op"):
 
@@ -153,6 +166,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_rbf: bool = False,
         use_torsion: bool = False,
         use_atomic_moment: bool = False,
+        use_p3m: bool = False,
     ) -> None:
         r"""
         The repflow descriptor block.
@@ -231,6 +245,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             Whether to use torsion update.
         use_atomic_moment : bool, optional
             Whether to use atomic moment for edge update.
+        use_p3m : bool, optional
+            Whether to use P3M for edge update.
         """
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -409,6 +425,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_rbf = use_rbf
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
+        self.use_p3m = use_p3m
         if self.use_rbf:
             self.rbf_dim = 32
             self.bessel_basis = BesselBasisLayer(
@@ -425,7 +442,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.edge_embd = MLPLayer(
                 1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
             )
-            
+        
+        
         for ii in range(nlayers):
             layers.append(
                 RepFlowLayer(
@@ -480,6 +498,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_atomic_moment=self.use_atomic_moment,
                     layer_idx=ii,
                     max_layer_num = nlayers,
+                    use_p3m=self.use_p3m,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -498,7 +517,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                 1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
             )
         else:
-            self.torsion_embd = None       
+            self.torsion_embd = None     
+
+        
 
     def get_rcut(self) -> float:
         """Returns the cut-off radius."""
@@ -594,11 +615,12 @@ class DescrptBlockRepflows(DescriptorBlock):
     def forward(
         self,
         nlist: torch.Tensor,
+        coord: torch.Tensor,
         extended_coord: torch.Tensor,
         extended_atype: torch.Tensor,
         extended_atype_embd: Optional[torch.Tensor] = None,
-        mapping: Optional[torch.Tensor] = None,
         box: Optional[torch.Tensor] = None,
+        mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
     ):
         if comm_dict is None:
@@ -606,6 +628,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             assert extended_atype_embd is not None
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
+        # real_coord = coord.reshape(nframes, nloc,3)
+        real_coord = extended_coord[:,:,:]
         atype = extended_atype[:, :nloc]
         # nb x nloc x nnei
         exclude_mask = self.emask(nlist, extended_atype)
@@ -1035,7 +1059,35 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
 
         atom_feats_in = None
-        
+
+        if self.use_p3m:
+            num_grids = 2
+            expand_size = 2
+            transform = NonPBCAddGrid(expand_size, num_grids)
+            atom_coord, mesh_coord = transform(real_coord, box)
+            num_atoms_per_image = torch.tensor([nloc] * nframes)
+            num_meshs_per_image = torch.tensor([num_grids **3] * nframes)
+            
+            a2m_edge_index,atom_mesh_distance = radius_determinstic(
+                atom_coord,
+                mesh_coord,
+                num_atoms_per_image,
+                num_meshs_per_image,
+                self.e_rcut,
+                max_num_neighbors_threshold=200
+            )
+            mesh_sw = compute_smooth_weight(atom_mesh_distance, self.e_rcut_smth, self.e_rcut)
+            # mesh_sw = torch.ones_like(mesh_sw)
+            m2a_edge_index = a2m_edge_index.flip(0)
+            a_x_j = torch.index_select(node_ebd.reshape(-1, n_dim), 0, a2m_edge_index[0])
+            
+            # m_x = scatter(a_x_j*mesh_sw.unsqueeze(-1), a2m_edge_index[1], dim=0, reduce='mean', dim_size=num_grids **3 * nframes)
+            m_x = scatter(a_x_j, a2m_edge_index[1], dim=0, reduce='mean', dim_size=num_grids **3 * nframes)
+            
+            p3m_info = {"m_x": m_x, "a2m_edge_index": a2m_edge_index, "m2a_edge_index": m2a_edge_index, "atom_mesh_distance": atom_mesh_distance, "mesh_sw": mesh_sw}
+        else:
+            p3m_info = None
+
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim
@@ -1099,7 +1151,10 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            node_ebd, edge_ebd, angle_ebd, dihedral_ebd, torsion_ebd,atom_feats_in = ll.forward(
+                    
+
+
+            node_ebd, edge_ebd, angle_ebd, dihedral_ebd, torsion_ebd,mesh_ebd,atom_feats_in = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
                 h2,
@@ -1123,7 +1178,10 @@ class DescrptBlockRepflows(DescriptorBlock):
                 torsion_index=torsion_index,
                 atom_feats_in=atom_feats_in,
                 edge_diff=edge_diff,
+                p3m_info=p3m_info,
             )
+            if p3m_info is not None:
+                p3m_info['m_x'] = mesh_ebd
 
         if self.use_combined_output:
             concat_list = [node_ebd]

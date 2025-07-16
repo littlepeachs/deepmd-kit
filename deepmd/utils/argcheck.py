@@ -1653,6 +1653,12 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "use_p3m",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "update_dihedral",
             bool,
             optional=True,

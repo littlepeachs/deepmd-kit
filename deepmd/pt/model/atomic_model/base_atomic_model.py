@@ -194,9 +194,11 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
 
     def forward_common_atomic(
         self,
+        coord: torch.Tensor,
         extended_coord: torch.Tensor,
         extended_atype: torch.Tensor,
         nlist: torch.Tensor,
+        box: Optional[torch.Tensor] = None,
         mapping: Optional[torch.Tensor] = None,
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
@@ -244,10 +246,13 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             nlist = torch.where(pair_mask == 1, nlist, -1)
 
         ext_atom_mask = self.make_atom_mask(extended_atype)
+        
         ret_dict = self.forward_atomic(
+            coord,
             extended_coord,
             torch.where(ext_atom_mask, extended_atype, 0),
             nlist,
+            box=box,
             mapping=mapping,
             fparam=fparam,
             aparam=aparam,

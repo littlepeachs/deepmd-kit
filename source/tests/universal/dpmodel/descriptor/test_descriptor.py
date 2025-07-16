@@ -451,7 +451,7 @@ DescriptorParamDPA2List = parameterize_func(
             "repformer_g1_out_conv": (True,),
             "repformer_g1_out_mlp": (True,),
             "smooth": (True, False),
-            "exclude_types": ([], [[0, 1]]),
+            "exclude_types": ([],),
             "precision": ("float64",),
             "add_tebd_to_repinit_out": (True, False),
             "use_econf_tebd": (False,),
@@ -514,7 +514,8 @@ def DescriptorParamDPA3(
                 "use_rbf": True,
                 "use_dynamic_sel": True,
                 "use_torsion": False,
-                "use_atomic_moment": True,
+                "use_atomic_moment": False,
+                "use_p3m": True,
             }
         ),
         "ntypes": ntypes,

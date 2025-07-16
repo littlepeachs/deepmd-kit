@@ -199,9 +199,11 @@ class DPAtomicModel(BaseAtomicModel):
 
     def forward_atomic(
         self,
+        coord: torch.Tensor,
         extended_coord,
         extended_atype,
         nlist,
+        box: Optional[torch.Tensor] = None,
         mapping: Optional[torch.Tensor] = None,
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
@@ -235,9 +237,11 @@ class DPAtomicModel(BaseAtomicModel):
         if self.do_grad_r() or self.do_grad_c():
             extended_coord.requires_grad_(True)
         descriptor, rot_mat, g2, h2, sw = self.descriptor(
+            coord,
             extended_coord,
             extended_atype,
             nlist,
+            box=box,
             mapping=mapping,
             comm_dict=comm_dict,
         )

@@ -95,7 +95,6 @@ class PairExcludeMask(torch.nn.Module):
             dtype=np.int32,
         )
         # (ntypes+1 x ntypes+1)
-        self.type_mask = to_torch_tensor(self.type_mask).view([-1])
         self.no_exclusion = len(self._exclude_types) == 0
 
     def get_exclude_types(self):

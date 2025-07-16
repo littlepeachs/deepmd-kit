@@ -206,6 +206,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             seed=child_seed(seed, 1),
             use_rbf=self.repflow_args.use_rbf,
             use_atomic_moment=self.repflow_args.use_atomic_moment,
+            use_p3m=self.repflow_args.use_p3m,
             use_torsion=self.repflow_args.use_torsion,
         )
 
@@ -481,9 +482,11 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
 
     def forward(
         self,
+        coord: torch.Tensor,
         extended_coord: torch.Tensor,
         extended_atype: torch.Tensor,
         nlist: torch.Tensor,
+        box: Optional[torch.Tensor] = None,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
     ):
@@ -529,10 +532,12 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         # repflows
         node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows(
             nlist,
+            coord,
             extended_coord,
             extended_atype,
             node_ebd_ext,
-            mapping,
+            box=box,
+            mapping=mapping,
             comm_dict=comm_dict,
         )
         if self.concat_output_tebd:

@@ -164,7 +164,8 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
             cc, bb, fp, ap, input_prec = self.input_type_cast(
                 coord, box=box, fparam=fparam, aparam=aparam
             )
-            del coord, box, fparam, aparam
+            
+            del fparam, aparam
             (
                 extended_coord,
                 extended_atype,
@@ -180,15 +181,19 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
                 mixed_types=True,
                 box=bb,
             )
+            
             model_predict_lower = self.forward_common_lower(
+                coord,
                 extended_coord,
                 extended_atype,
                 nlist,
                 mapping,
+                box=box,
                 do_atomic_virial=do_atomic_virial,
                 fparam=fp,
                 aparam=ap,
             )
+            
             model_predict = communicate_extended_output(
                 model_predict_lower,
                 self.model_output_def(),
@@ -233,10 +238,12 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
 
         def forward_common_lower(
             self,
+            coord,
             extended_coord,
             extended_atype,
             nlist,
             mapping: Optional[torch.Tensor] = None,
+            box: Optional[torch.Tensor] = None,
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
             do_atomic_virial: bool = False,
@@ -283,16 +290,20 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
             cc_ext, _, fp, ap, input_prec = self.input_type_cast(
                 extended_coord, fparam=fparam, aparam=aparam
             )
+            
             del extended_coord, fparam, aparam
             atomic_ret = self.atomic_model.forward_common_atomic(
+                coord,
                 cc_ext,
                 extended_atype,
                 nlist,
+                box=box,
                 mapping=mapping,
                 fparam=fp,
                 aparam=ap,
                 comm_dict=comm_dict,
             )
+            
             model_predict = fit_output_to_model_output(
                 atomic_ret,
                 self.atomic_output_def(),

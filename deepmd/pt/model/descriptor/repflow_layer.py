@@ -42,6 +42,9 @@ from deepmd.utils.version import (
 )
 from .atomic_moment import AtomicMoment
 from .hyper_moment import HyperMoment
+from .p3m_longrange import FNO3d
+from .bessel_layer import BesselBasisLayer
+from torch_scatter import scatter
 
 class RepFlowLayer(torch.nn.Module):
     def __init__(
@@ -97,6 +100,7 @@ class RepFlowLayer(torch.nn.Module):
         seed: Optional[Union[int, list[int]]] = None,
         layer_idx: int = 0,
         max_layer_num: int = 0,
+        use_p3m: bool = False,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -118,6 +122,7 @@ class RepFlowLayer(torch.nn.Module):
         self.use_rbf = use_rbf
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
+        self.use_p3m = use_p3m
         self.layer_idx = layer_idx
         self.max_layer_num = max_layer_num
         if a_compress_rate != 0:
@@ -275,6 +280,24 @@ class RepFlowLayer(torch.nn.Module):
         else:
             self.atomic_moment_layer = None
 
+        if self.use_p3m:
+            self.long_mp = FNO3d(
+                    *[2,2,2],
+                    hidden_channels=self.n_dim // 2, 
+                    in_channels=self.n_dim, 
+                    out_channels=self.n_dim, 
+                    n_layers=1,
+                    lifting_channels=self.n_dim // 2,
+                    projection_channels=self.n_dim // 2,
+                    non_linearity=ActivationFn("custom_silu:10.0"),
+                )
+            self.long_mp_2 = MLPLayer(
+                self.n_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 31),
+            )
+
         if self.edge_rbf_dot_message:
             self.rbf_mlp_message = MLPLayer(
                 self.rbf_dim,
@@ -302,6 +325,7 @@ class RepFlowLayer(torch.nn.Module):
         self.a_residual = []
         self.d_residual = []
         self.t_residual = []
+        self.l_residual = []
         self.edge_info_dim = self.n_dim * 2 + self.e_dim
 
         # node self mlp
@@ -665,19 +689,70 @@ class RepFlowLayer(torch.nn.Module):
         else:
             self.angle_message_ffn1 = None
 
-        if self.use_atomic_moment:
+        # if self.use_atomic_moment:
+        #     if self.update_style == "res_residual":
+        #         self.n_residual.append(
+        #             get_residual(
+        #                 n_dim,
+        #                 self.update_residual * self.residual_pref[residual_idx],
+        #                 self.update_residual_init,
+        #                 precision=precision,
+        #                 seed=child_seed(seed, 3),
+        #             )
+        #         )
+        #         residual_idx += 1
+        
+        if self.use_p3m:
             if self.update_style == "res_residual":
                 self.n_residual.append(
                     get_residual(
-                        n_dim,
-                        self.update_residual * self.residual_pref[residual_idx],
-                        self.update_residual_init,
+                        self.n_dim,
+                        self.update_residual,
                         precision=precision,
                         seed=child_seed(seed, 3),
                     )
                 )
-                residual_idx += 1
-
+                self.l_residual.append(
+                    get_residual(
+                        self.n_dim,
+                        self.update_residual,
+                        precision=precision,
+                        seed=child_seed(seed, 3),
+                    )
+                )
+                self.l_residual.append(
+                    get_residual(
+                        self.n_dim,
+                        self.update_residual,
+                        precision=precision,
+                        seed=child_seed(seed, 4),
+                    )
+                )
+            self.a2m_linear = MLPLayer(
+                self.n_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 5),
+            )
+            self.m2a_linear = MLPLayer(
+                self.n_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 6),
+            )
+            self.atom_mesh_rbf = BesselBasisLayer(
+                num_radial=self.rbf_dim,
+                cutoff=self.e_rcut,
+                envelope_exponent=5,
+            )
+            self.atom_mesh_distance_linear = MLPLayer(
+                self.rbf_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 7),
+            )
+            
+            
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
         self.a_residual = nn.ParameterList(self.a_residual)
@@ -1141,7 +1216,6 @@ class RepFlowLayer(torch.nn.Module):
         
         return result_update
 
-
     def optim_edge_update(
         self,
         node_ebd: torch.Tensor,
@@ -1214,6 +1288,7 @@ class RepFlowLayer(torch.nn.Module):
         sub_node_update = torch.matmul(
             node_ebd, matrix[sub_node_idx[0] : sub_node_idx[1]]
         )
+
         # n_edge * node/edge_dim
         sub_node_update = torch.index_select(
             sub_node_update.reshape(nf * nloc, -1), 0, n2e_index
@@ -1272,6 +1347,7 @@ class RepFlowLayer(torch.nn.Module):
         torsion_index: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         atom_feats_in: Optional[torch.Tensor] = None,
         edge_diff: Optional[torch.Tensor] = None,
+        p3m_info: Optional[dict[str, torch.Tensor]] = None,
     ):
         """
         Parameters
@@ -1352,7 +1428,6 @@ class RepFlowLayer(torch.nn.Module):
             edge_ebd = edge_ebd * edge_rbf_ebd
         else:
             edge_ebd = edge_ebd
-
         # handle edge rbf
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             assert rbf_ebd is not None
@@ -1498,6 +1573,7 @@ class RepFlowLayer(torch.nn.Module):
         node_edge_update = (
             (torch.sum(node_edge_update, dim=-2) / self.nnei)
             if not self.use_dynamic_sel
+            
             else (
                 aggregate(
                     node_edge_update,
@@ -1527,7 +1603,6 @@ class RepFlowLayer(torch.nn.Module):
             n_update_list.append(node_edge_update)
         # update node_ebd
         # TODO: add atomic moment
-        start_time = time.time()
         # neighbor number
         num_neighbors_per_atom = nlist_mask.sum(dim=-1).float()  # shape: (nb, nloc)
         avg_num_neighbors = num_neighbors_per_atom.mean(dim=-1)  # shape: (nb,)
@@ -1540,47 +1615,47 @@ class RepFlowLayer(torch.nn.Module):
             edge_index_mask = (edge_index[:, 0] >= start_idx) & (edge_index[:, 0] < end_idx)
             edge_index_real[edge_index_mask] = edge_index[edge_index_mask] % nloc + i * nloc
         
-        if self.use_atomic_moment and edge_index.numel() > 0 and num_average_neigh >= 4 and edge_index_real.max()==nb*nloc-1:
-        
-            assert self.atomic_moment_layer is not None
-            assert self.hyper_moment_layer is not None
+        if self.use_atomic_moment:
+            if edge_index.numel() > 0 and num_average_neigh >= 4 and edge_index_real.max()==nb*nloc-1:
+                assert self.atomic_moment_layer is not None
+                assert self.hyper_moment_layer is not None
 
-            
-            if atom_feats_in is None:
-                temp_node_ebd = self.atom_feats_in_transform(node_ebd)
-                atom_feats_in = {0: temp_node_ebd.clone().view(-1, temp_node_ebd.shape[-1]).permute(1, 0)} 
-            
-            am = self.atomic_moment_layer(atom_feats_in,edge_index_real,rbf_ebd,edge_diff,num_average_neigh,sw)
-            # 检查am字典中是否存在NaN值
-            
-            hm = self.hyper_moment_layer(am)
+                
+                if atom_feats_in is None:
+                    temp_node_ebd = self.atom_feats_in_transform(node_ebd)
+                    atom_feats_in = {0: temp_node_ebd.clone().view(-1, temp_node_ebd.shape[-1]).permute(1, 0)} 
+                
+                am = self.atomic_moment_layer(atom_feats_in,edge_index_real,rbf_ebd,edge_diff,num_average_neigh,sw)
+                # 检查am字典中是否存在NaN值
+                
+                hm = self.hyper_moment_layer(am)
 
-            for rank, m in hm.items():
-                fn = self.linear_channel_hyper[str(rank)]
-                hm[rank] = fn.forward(m,dims=0)
-            out = hm
-            if self.mix_atom_feats_radial_channel:
-                max_rank = min(self.max_atom_feats_rank, self.max_out_rank)
-                for rank in range(max_rank + 1):
-                    fn = self.linear_channel_feats[str(rank)]
-                    out[rank] = out[rank] + fn.forward(atom_feats_in[rank],dims=0)
-            
-            
-            for key,value in out.items():
-                out[key] = self.layer_norm_dim0(value,self.moment_layer_norm[str(key)])
+                for rank, m in hm.items():
+                    fn = self.linear_channel_hyper[str(rank)]
+                    hm[rank] = fn.forward(m,dims=0)
+                out = hm
+                if self.mix_atom_feats_radial_channel:
+                    max_rank = min(self.max_atom_feats_rank, self.max_out_rank)
+                    for rank in range(max_rank + 1):
+                        fn = self.linear_channel_feats[str(rank)]
+                        out[rank] = out[rank] + fn.forward(atom_feats_in[rank],dims=0)
+                
+                
+                for key,value in out.items():
+                    out[key] = self.layer_norm_dim0(value,self.moment_layer_norm[str(key)])
 
-            moment_ebd = out[0].permute(1,0).view(nb,nloc,-1)
+                moment_ebd = out[0].permute(1,0).view(nb,nloc,-1)
 
-            moment_ebd = self.atom_feats_out_transform(moment_ebd)
-            
-            n_update_list.append(moment_ebd)
+                moment_ebd = self.atom_feats_out_transform(moment_ebd)
+                
+                n_update_list.append(moment_ebd)
+            else:
+                out = None
+                n_update_list.append(torch.zeros_like(node_ebd))
         # edge self message
         else:
             out = None
-            n_update_list.append(torch.zeros_like(node_ebd))
-        end_time = time.time()
-        # print(f"atomic moment time: {end_time - start_time}")
-        
+     
         if not self.optim_update:
             assert edge_info is not None
             if not self.use_ffn_edge_edge_message:
@@ -2004,6 +2079,35 @@ class RepFlowLayer(torch.nn.Module):
         else:
             pass
 
+        if p3m_info is not None:
+            mesh_ebd = p3m_info["m_x"]
+            a2m_edge_index = p3m_info["a2m_edge_index"]
+            m2a_edge_index = p3m_info["m2a_edge_index"]
+            atom_mesh_distance = p3m_info["atom_mesh_distance"].unsqueeze(-1)
+            mesh_sw = p3m_info["mesh_sw"]
+            n_am_edge = atom_mesh_distance.shape[0]
+            am_diff_ebd = self.atom_mesh_rbf(atom_mesh_distance)
+            am_diff_ebd = self.atom_mesh_distance_linear(am_diff_ebd).view(n_am_edge, -1)
+            
+            new_mesh_ebd = self.long_mp(mesh_ebd,nb)
+            
+            new_mesh_ebd = self.m2a_linear(new_mesh_ebd)
+            a2m_edge_ebd = torch.index_select(self.a2m_linear(node_ebd).view(nb*nloc, -1), 0, a2m_edge_index[0])
+            m2a_edge_ebd = torch.index_select(new_mesh_ebd, 0, m2a_edge_index[0])
+            
+            # a2m_node_ebd = scatter(a2m_edge_ebd * am_diff_ebd * mesh_sw.unsqueeze(-1),m2a_edge_index[0],dim=0,reduce='sum',dim_size=nb * 2**3).reshape(nb, 2**3, -1) / self.dynamic_e_sel
+            # m2a_node_ebd = scatter(m2a_edge_ebd * am_diff_ebd * mesh_sw.unsqueeze(-1),a2m_edge_index[0],dim=0,reduce='sum',dim_size=nb * nloc).reshape(nb, nloc, -1) / self.dynamic_e_sel
+            
+            a2m_node_ebd = scatter(a2m_edge_ebd,m2a_edge_index[0],dim=0,reduce='sum',dim_size=nb * 2**3).reshape(nb, 2**3, -1) / self.dynamic_e_sel
+            m2a_node_ebd = scatter(m2a_edge_ebd,a2m_edge_index[0],dim=0,reduce='sum',dim_size=nb * nloc).reshape(nb, nloc, -1) / self.dynamic_e_sel
+            
+            l_update_list: list[torch.Tensor] = [mesh_ebd.reshape(nb,-1, self.n_dim), a2m_node_ebd,new_mesh_ebd]
+            for i in range(len(l_update_list)):
+                l_update_list[i] = l_update_list[i].to(dtype=node_ebd.dtype)
+            n_update_list.append(m2a_node_ebd.to(dtype=node_ebd.dtype))
+        else:
+            l_update_list = None
+        
         # update angle_ebd
         n_updated = self.list_update(n_update_list, "node")
         e_updated = self.list_update(e_update_list, "edge")
@@ -2013,10 +2117,13 @@ class RepFlowLayer(torch.nn.Module):
             # t_updated = t_update_list[0]
         else:
             t_updated = None
-        end_layer_time = time.time()
+        if l_update_list is not None:
+            l_updated = self.list_update(l_update_list, "mesh")
+        else:
+            l_updated = None
         # print(f"layer time: {end_layer_time - start_layer_time}")
-        # import pdb; pdb.set_trace()
-        return n_updated, e_updated, a_updated, d_updated, t_updated,out
+        # import pdb;pdb.set_trace()
+        return n_updated, e_updated, a_updated, d_updated, t_updated,l_updated,out
 
     @torch.jit.export
     def list_update_res_avg(
@@ -2061,6 +2168,9 @@ class RepFlowLayer(torch.nn.Module):
             for idx, residual in enumerate(self.t_residual):
                 if idx < nitem:
                     uu = uu + residual * update_list[idx + 1]
+        elif update_name == "mesh":
+            for ii, vv in enumerate(self.l_residual):
+                uu = uu + vv * update_list[ii + 1]
         else:
             raise NotImplementedError
         return uu
