@@ -1061,9 +1061,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         atom_feats_in = None
 
         if self.use_p3m:
-            num_grids = 2
+            num_grids = 3
             expand_size = 2
             transform = NonPBCAddGrid(expand_size, num_grids)
+            
             atom_coord, mesh_coord = transform(real_coord, box)
             num_atoms_per_image = torch.tensor([nloc] * nframes)
             num_meshs_per_image = torch.tensor([num_grids **3] * nframes)
@@ -1081,8 +1082,12 @@ class DescrptBlockRepflows(DescriptorBlock):
             m2a_edge_index = a2m_edge_index.flip(0)
             a_x_j = torch.index_select(node_ebd.reshape(-1, n_dim), 0, a2m_edge_index[0])
             
-            # m_x = scatter(a_x_j*mesh_sw.unsqueeze(-1), a2m_edge_index[1], dim=0, reduce='mean', dim_size=num_grids **3 * nframes)
-            m_x = scatter(a_x_j, a2m_edge_index[1], dim=0, reduce='mean', dim_size=num_grids **3 * nframes)
+            m_x = scatter(a_x_j*mesh_sw.unsqueeze(-1), a2m_edge_index[1], dim=0, reduce='sum', dim_size=num_grids **3 * nframes)/self.dynamic_e_sel
+            
+            # print("mesh_sw: ",mesh_sw.item())
+            # print("node_ebd: ",node_ebd)
+            # print("m_x: ",m_x[:5])
+            # m_x = scatter(a_x_j, a2m_edge_index[1], dim=0, reduce='mean', dim_size=num_grids **3 * nframes)
             
             p3m_info = {"m_x": m_x, "a2m_edge_index": a2m_edge_index, "m2a_edge_index": m2a_edge_index, "atom_mesh_distance": atom_mesh_distance, "mesh_sw": mesh_sw}
         else:

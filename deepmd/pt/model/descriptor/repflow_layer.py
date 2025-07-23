@@ -282,7 +282,7 @@ class RepFlowLayer(torch.nn.Module):
 
         if self.use_p3m:
             self.long_mp = FNO3d(
-                    *[2,2,2],
+                    *[3,3,3],
                     hidden_channels=self.n_dim // 2, 
                     in_channels=self.n_dim, 
                     out_channels=self.n_dim, 
@@ -2095,13 +2095,13 @@ class RepFlowLayer(torch.nn.Module):
             a2m_edge_ebd = torch.index_select(self.a2m_linear(node_ebd).view(nb*nloc, -1), 0, a2m_edge_index[0])
             m2a_edge_ebd = torch.index_select(new_mesh_ebd, 0, m2a_edge_index[0])
             
-            # a2m_node_ebd = scatter(a2m_edge_ebd * am_diff_ebd * mesh_sw.unsqueeze(-1),m2a_edge_index[0],dim=0,reduce='sum',dim_size=nb * 2**3).reshape(nb, 2**3, -1) / self.dynamic_e_sel
-            # m2a_node_ebd = scatter(m2a_edge_ebd * am_diff_ebd * mesh_sw.unsqueeze(-1),a2m_edge_index[0],dim=0,reduce='sum',dim_size=nb * nloc).reshape(nb, nloc, -1) / self.dynamic_e_sel
+            a2m_node_ebd = scatter(a2m_edge_ebd * am_diff_ebd * mesh_sw.unsqueeze(-1),m2a_edge_index[0],dim=0,reduce='sum',dim_size=nb * 3**3).reshape(nb, 3**3, -1) / self.dynamic_e_sel
+            m2a_node_ebd = scatter(m2a_edge_ebd * am_diff_ebd * mesh_sw.unsqueeze(-1),a2m_edge_index[0],dim=0,reduce='sum',dim_size=nb * nloc).reshape(nb, nloc, -1) / self.dynamic_e_sel
             
-            a2m_node_ebd = scatter(a2m_edge_ebd,m2a_edge_index[0],dim=0,reduce='sum',dim_size=nb * 2**3).reshape(nb, 2**3, -1) / self.dynamic_e_sel
-            m2a_node_ebd = scatter(m2a_edge_ebd,a2m_edge_index[0],dim=0,reduce='sum',dim_size=nb * nloc).reshape(nb, nloc, -1) / self.dynamic_e_sel
+            # a2m_node_ebd = scatter(a2m_edge_ebd,m2a_edge_index[0],dim=0,reduce='sum',dim_size=nb * 1**3).reshape(nb, 1**3, -1) / self.dynamic_e_sel
+            # m2a_node_ebd = scatter(m2a_edge_ebd,a2m_edge_index[0],dim=0,reduce='sum',dim_size=nb * nloc).reshape(nb, nloc, -1) / self.dynamic_e_sel
             
-            l_update_list: list[torch.Tensor] = [mesh_ebd.reshape(nb,-1, self.n_dim), a2m_node_ebd,new_mesh_ebd]
+            l_update_list: list[torch.Tensor] = [mesh_ebd.reshape(nb,-1, self.n_dim), a2m_node_ebd,new_mesh_ebd.reshape(nb,-1, self.n_dim)]
             for i in range(len(l_update_list)):
                 l_update_list[i] = l_update_list[i].to(dtype=node_ebd.dtype)
             n_update_list.append(m2a_node_ebd.to(dtype=node_ebd.dtype))

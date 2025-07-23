@@ -7,6 +7,7 @@ import time
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
+from .rmsnorm import RMSLayerNorm
 
 class NonPBCAddGrid(BaseTransform):
     def __init__(self, expand_size: int, num_grids: Union[List[int], int]) -> None:
@@ -18,51 +19,32 @@ class NonPBCAddGrid(BaseTransform):
 
     def __call__(self, atom_pos,box=None):
         if box is None:
-            pos = atom_pos  # Shape: [batch_size, num_nodes, hidden_size]
-            
-            # Center the positions (Shape: [batch_size, num_nodes, hidden_size])
-            pos_centered = pos - pos.mean(dim=1, keepdim=True)
-            
-            # For each batch, perform SVD and get the V matrix (Shape: [batch_size, 3, 3])
-            batch_size = pos_centered.shape[0]
+            device = atom_pos.device
+            dtype = atom_pos.dtype
+            batch_size = atom_pos.shape[0]
 
-            
-            # Apply SVD
-            start_time = time.time()
-            cell = torch.stack([torch.svd(pos_centered[i])[2].t() for i in range(batch_size)], dim=0)
-            end_time = time.time()
-            print(f"SVD 计算时间: {end_time - start_time} 秒")
-            
-            # Rotate the centered positions for each batch using the rotation matrix
-            rotated_pos_centered = torch.matmul(pos_centered, cell.transpose(1, 2))
+            min_coords = torch.min(atom_pos.detach(), dim=1).values
+            max_coords = torch.max(atom_pos.detach(), dim=1).values
 
-            # Calculate the cell lengths for each batch sample (Shape: [batch_size, 3])
-            cell_lengths = rotated_pos_centered.max(dim=1).values - rotated_pos_centered.min(dim=1).values
-            translation = rotated_pos_centered.min(dim=1).values - 1 / 2 * self.expand_size
+            cell_lengths = max_coords - min_coords + self.expand_size
+            new_cell = torch.diag_embed(cell_lengths)
+            origin = min_coords - self.expand_size / 2
+
+            new_pos = atom_pos
+
+            num_grids = self.num_grids
             
-            # Apply translation (Shape: [batch_size, 3])
-            translation = torch.einsum("ij,ijl->il", translation, cell)
-            # Expand cell lengths and create the new cell (Shape: [batch_size, 3, 3])
-            cell_lengths += self.expand_size
-            new_cell = cell * cell_lengths.unsqueeze(1)
+            x_centers = torch.linspace(0.5 / num_grids[0], 1 - 0.5 / num_grids[0], num_grids[0], device=device, dtype=dtype)
+            y_centers = torch.linspace(0.5 / num_grids[1], 1 - 0.5 / num_grids[1], num_grids[1], device=device, dtype=dtype)
+            z_centers = torch.linspace(0.5 / num_grids[2], 1 - 0.5 / num_grids[2], num_grids[2], device=device, dtype=dtype)
             
-            # Calculate new positions (Shape: [batch_size, num_nodes, hidden_size])
-            new_pos = pos_centered - translation.unsqueeze(1)
+            mesh_frac_coords = torch.stack(torch.meshgrid(x_centers, y_centers, z_centers, indexing='ij'), dim=-1)
 
-            # Create grid for the mesh (Shape: [num_grids[0] + 1], [num_grids[1] + 1], [num_grids[2] + 1])
-            x_linespace = torch.linspace(0, 1, self.num_grids[0] + 1, dtype=torch.float32)
-            y_linespace = torch.linspace(0, 1, self.num_grids[1] + 1, dtype=torch.float32)
-            z_linespace = torch.linspace(0, 1, self.num_grids[2] + 1, dtype=torch.float32)
+            mesh_real_coords = torch.einsum("ijkl,nml->nijkm", mesh_frac_coords, new_cell) + origin.view(batch_size, 1, 1, 1, 3)
+            
+            mesh_coord = mesh_real_coords.view(batch_size, -1, 3)
 
-            # Calculate centers of the mesh
-            x_centers = (x_linespace[1:] + x_linespace[:-1]) / 2
-            y_centers = (y_linespace[1:] + y_linespace[:-1]) / 2
-            z_centers = (z_linespace[1:] + z_linespace[:-1]) / 2
-
-            # Create mesh grid: [num_x_centers, num_y_centers, num_z_centers, 3]
-            mesh = torch.stack(torch.meshgrid(x_centers, y_centers, z_centers, indexing='ij'), dim=-1).to(pos.device)
-            # Mesh coordinates: [batch_size, num_x_centers, num_y_centers, num_z_centers, 3]
-            mesh_coord = torch.einsum("ijkl,nlm->nijkm", mesh, new_cell).view(batch_size, -1, 3)
+            return new_pos, mesh_coord
         else:
             batch_size = box.shape[0]
             box = box.reshape(batch_size, 3, 3)
@@ -380,6 +362,7 @@ class FNO(nn.Module):
                 self.hidden_channels,
                 self.out_channels,
             )
+        self.rms_norm = RMSLayerNorm(self.out_channels,rank=0,eps=1e-5)
 
         self.reset_parameters()
 
@@ -396,9 +379,9 @@ class FNO(nn.Module):
         
         for layer_idx in range(self.n_layers):
             x = self.fno_blocks(x, layer_idx)
-        x = x.view(batch_size,self.hidden_channels, -1).transpose(1,2).view(-1,self.hidden_channels)
-
+        x = x.reshape(batch_size,self.hidden_channels, -1).transpose(1,2).reshape(-1,self.hidden_channels)
         x = self.temp_layer_2(x)
+        x = self.rms_norm(x)
         return x
 
     @property
