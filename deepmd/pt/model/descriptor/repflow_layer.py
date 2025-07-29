@@ -101,6 +101,7 @@ class RepFlowLayer(torch.nn.Module):
         layer_idx: int = 0,
         max_layer_num: int = 0,
         use_p3m: bool = False,
+        use_angle_weight: bool = False,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -123,6 +124,7 @@ class RepFlowLayer(torch.nn.Module):
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
         self.use_p3m = use_p3m
+        self.use_angle_weight = use_angle_weight
         self.layer_idx = layer_idx
         self.max_layer_num = max_layer_num
         if a_compress_rate != 0:
@@ -297,6 +299,36 @@ class RepFlowLayer(torch.nn.Module):
                 precision=precision,
                 seed=child_seed(seed, 31),
             )
+
+        if self.use_angle_weight:
+            self.edge_weight_proj_1 = MLPLayer(
+                self.a_dim+self.a_dim,
+                1,
+                precision=precision,
+                seed=child_seed(seed, 31),
+                activation_function="sigmoid",
+            )
+            self.edge_weight_proj_2 = MLPLayer(
+                self.a_dim+self.a_dim,
+                1,
+                precision=precision,
+                seed=child_seed(seed, 31),
+            )
+            self.node_j_mlp = MLPLayer(
+                self.n_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 31),
+            )
+            self.node_k_mlp = MLPLayer(
+                self.n_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 31),
+            )
+            
+            
+            
 
         if self.edge_rbf_dot_message:
             self.rbf_mlp_message = MLPLayer(
@@ -1053,7 +1085,6 @@ class RepFlowLayer(torch.nn.Module):
         sub_node_update = torch.matmul(
             node_ebd, matrix[sub_node_idx[0] : sub_node_idx[1]]
         )
-
         # nf * nloc * a_nnei * angle_dim
         sub_edge_update_ik = torch.matmul(
             edge_ebd, matrix[sub_edge_idx_ik[0] : sub_edge_idx_ik[1]]
@@ -1128,6 +1159,89 @@ class RepFlowLayer(torch.nn.Module):
             sub_angle_update + sub_node_update + sub_edge_update_ik + sub_edge_update_ij
         ) + bias
         return result_update
+
+    def optim_angle_update_weight(
+        self,
+        flat_angle_ebd: torch.Tensor,
+        node_ebd: torch.Tensor,
+        node_ebd_ext: torch.Tensor,
+        flat_edge_ebd: torch.Tensor,
+        n2a_index: torch.Tensor,
+        eij2a_index: torch.Tensor,
+        eik2a_index: torch.Tensor,
+        j2a_index: torch.Tensor,
+        k2a_index: torch.Tensor,
+        feat: str = "edge",
+    ) -> torch.Tensor:
+        nf, nloc, node_dim = node_ebd.shape
+        nall = node_ebd_ext.shape[1]
+        angle_dim = flat_angle_ebd.shape[-1]
+        edge_dim = flat_edge_ebd.shape[-1]
+        sub_angle_idx = (0, angle_dim)
+        sub_node_idx = (angle_dim, angle_dim + node_dim)
+        sub_edge_idx_ik = (angle_dim + node_dim, angle_dim + node_dim + edge_dim)
+        sub_edge_idx_ij = (
+            angle_dim + node_dim + edge_dim,
+            angle_dim + node_dim + 2 * edge_dim,
+        )
+
+        if feat == "edge":
+            matrix, bias = self.edge_angle_linear1.matrix, self.edge_angle_linear1.bias
+        elif feat == "angle":
+            matrix, bias = self.angle_self_linear.matrix, self.angle_self_linear.bias
+        else:
+            raise NotImplementedError
+        assert angle_dim + node_dim + 2 * edge_dim == matrix.size()[0]
+
+        # calculate the edge weight
+        
+
+        # n_angle * angle_dim
+        sub_angle_update = torch.matmul(
+            flat_angle_ebd, matrix[sub_angle_idx[0] : sub_angle_idx[1]]
+        )
+
+        # nf * nloc * angle_dim
+        sub_node_update = torch.matmul(
+            node_ebd, matrix[sub_node_idx[0] : sub_node_idx[1]]
+        )
+        sub_extended_node_update = torch.matmul(
+            node_ebd_ext, matrix[sub_node_idx[0] : sub_node_idx[1]]
+        )
+        # n_angle * angle_dim
+        sub_node_update = torch.index_select(
+            sub_node_update.reshape(nf * nloc, -1), 0, n2a_index
+        )
+        sub_node_j_update = torch.index_select(
+            sub_extended_node_update.reshape(nf * nall, -1), 0, j2a_index
+        )
+        sub_node_k_update = torch.index_select(
+            sub_extended_node_update.reshape(nf * nall, -1), 0, k2a_index
+        )
+
+        # n_edge * angle_dim
+        sub_edge_update_ik = torch.matmul(
+            flat_edge_ebd, matrix[sub_edge_idx_ik[0] : sub_edge_idx_ik[1]]
+        )
+        sub_edge_update_ij = torch.matmul(
+            flat_edge_ebd, matrix[sub_edge_idx_ij[0] : sub_edge_idx_ij[1]]
+        )
+        # n_angle * angle_dim
+        sub_edge_update_ik = torch.index_select(sub_edge_update_ik, 0, eik2a_index)
+        sub_edge_update_ij = torch.index_select(sub_edge_update_ij, 0, eij2a_index)
+
+        edge_feat_1 = torch.cat([sub_node_j_update, sub_edge_update_ij], dim=-1)
+        edge_feat_2 = torch.cat([sub_node_k_update, sub_edge_update_ik], dim=-1)
+        edge_weight_1 = self.edge_weight_proj_1(edge_feat_1)
+        edge_weight_2 = self.edge_weight_proj_2(edge_feat_2)
+        edge_weight = F.softmax(torch.cat([edge_weight_1, edge_weight_2], dim=-1), dim=-1)
+        edge_weight_1, edge_weight_2 = edge_weight.chunk(2, dim=-1)
+        
+        result_update = (
+            sub_angle_update + sub_node_update + edge_weight_1 * sub_edge_update_ik + edge_weight_2 * sub_edge_update_ij
+        ) + bias
+        return result_update
+
 
     def optim_torsion_update(
         self,
@@ -1406,10 +1520,12 @@ class RepFlowLayer(torch.nn.Module):
         del a_nlist  # may be used in the future
 
         n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
-        n2a_index, eij2a_index, eik2a_index = (
+        n2a_index, eij2a_index, eik2a_index, j2a_index, k2a_index = (
             angle_index[:, 0],
             angle_index[:, 1],
             angle_index[:, 2],
+            angle_index[:, 3],
+            angle_index[:, 4],
         )
 
         # nb x nloc x nnei x n_dim [OR] n_edge x n_dim
@@ -1711,13 +1827,16 @@ class RepFlowLayer(torch.nn.Module):
                     assert self.a_compress_n_linear is not None
                     assert self.a_compress_e_linear is not None
                     node_ebd_for_angle = self.a_compress_n_linear(node_ebd)
+                    node_ebd_for_angle_ext = self.a_compress_n_linear(node_ebd_ext)
                     edge_ebd_for_angle = self.a_compress_e_linear(edge_ebd)
                 else:
                     # use the first a_compress_dim dim for node and edge
                     node_ebd_for_angle = node_ebd[:, :, : self.n_a_compress_dim]
+                    node_ebd_for_angle_ext = node_ebd_ext[:, :, : self.n_a_compress_dim]
                     edge_ebd_for_angle = edge_ebd[..., : self.e_a_compress_dim]
             else:
                 node_ebd_for_angle = node_ebd
+                node_ebd_for_angle_ext = node_ebd_ext
                 edge_ebd_for_angle = edge_ebd
 
             if not self.use_dynamic_sel:
@@ -1790,7 +1909,6 @@ class RepFlowLayer(torch.nn.Module):
                         self.edge_angle_linear1(angle_info_ffn)
                     )
             else:
-                
                 edge_angle_update = self.act(
                     self.optim_angle_update(
                         angle_ebd,
@@ -1888,24 +2006,40 @@ class RepFlowLayer(torch.nn.Module):
                     assert angle_info_ffn is not None
                     angle_self_update = self.act(self.angle_self_linear(angle_info_ffn))
             else:
-                angle_self_update = self.act(
-                    self.optim_angle_update(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        "angle",
+                if self.use_angle_weight:
+                    angle_self_update = self.act(
+                        self.optim_angle_update_weight(
+                            angle_ebd,
+                            node_ebd_for_angle,
+                            node_ebd_for_angle_ext,
+                            edge_ebd_for_angle,
+                            n2a_index,
+                            eij2a_index,
+                            eik2a_index,
+                            j2a_index,
+                            k2a_index,
+                            "angle",
+                        )
                     )
-                    if not self.use_dynamic_sel
-                    else self.optim_angle_update_dynamic(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        n2a_index,
-                        eij2a_index,
-                        eik2a_index,
-                        "angle",
+                else:
+                    angle_self_update = self.act(
+                        self.optim_angle_update(
+                            angle_ebd,
+                            node_ebd_for_angle,
+                            edge_ebd_for_angle,
+                            "angle",
+                        )
+                        if not self.use_dynamic_sel
+                        else self.optim_angle_update_dynamic(
+                            angle_ebd,
+                            node_ebd_for_angle,
+                            edge_ebd_for_angle,
+                            n2a_index,
+                            eij2a_index,
+                            eik2a_index,
+                            "angle",
+                        )
                     )
-                )
             a_update_list.append(angle_self_update)
 
 

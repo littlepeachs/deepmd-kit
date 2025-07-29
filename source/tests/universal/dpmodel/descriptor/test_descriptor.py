@@ -515,7 +515,8 @@ def DescriptorParamDPA3(
                 "use_dynamic_sel": True,
                 "use_torsion": False,
                 "use_atomic_moment": False,
-                "use_p3m": True,
+                "use_p3m": False,
+                "use_angle_weight": True,
             }
         ),
         "ntypes": ntypes,

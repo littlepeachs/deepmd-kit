@@ -119,8 +119,22 @@ def get_graph_index(
     # 2. edge graph
     # node(i) to angle(ijk) index_select
     n2a_index = nlist_loc_index.reshape(nf, nloc, 1, 1).expand(-1, -1, a_nnei, a_nnei)
+    
+    j_index = nlist[:, :, :a_nnei].unsqueeze(-2).expand(-1, -1, a_nnei, a_nnei)[a_nlist_mask_3d]
+    k_index = nlist[:, :, :a_nnei].unsqueeze(-1).expand(-1, -1, a_nnei, a_nnei)[a_nlist_mask_3d]
+    
     # n_angle
-    n2a_index = n2a_index[a_nlist_mask_3d]
+    try:
+        n2a_index = n2a_index[a_nlist_mask_3d]
+    except Exception as e:
+        shape0 = a_nlist_mask_3d.shape[0] // 2
+        a_nlist_mask_3d_1 = a_nlist_mask_3d[shape0:]
+        a_nlist_mask_3d_2 = a_nlist_mask_3d[:shape0]
+        n2a_index_1 = n2a_index[shape0:]
+        n2a_index_2 = n2a_index[:shape0]
+        n2a_index_1_temp = n2a_index_1[a_nlist_mask_3d_1]
+        n2a_index_2_temp = n2a_index_2[a_nlist_mask_3d_2]
+        n2a_index = torch.cat([n2a_index_1_temp, n2a_index_2_temp], dim=0)
 
     # edge(ij) to angle(ijk) index_select; angle(ijk) to edge(ij) aggregate
     edge_id = torch.arange(0, n_edge, dtype=nlist.dtype, device=nlist.device)
@@ -131,12 +145,32 @@ def get_graph_index(
     edge_index = edge_index[:, :, :a_nnei]
     edge_index_ij = edge_index.unsqueeze(-1).expand(-1, -1, -1, a_nnei)
     # n_angle
-    eij2a_index = edge_index_ij[a_nlist_mask_3d]
+    try:
+        eij2a_index = edge_index_ij[a_nlist_mask_3d]
+    except Exception as e:
+        shape0 = a_nlist_mask_3d.shape[0] // 2
+        a_nlist_mask_3d_1 = a_nlist_mask_3d[shape0:]
+        a_nlist_mask_3d_2 = a_nlist_mask_3d[:shape0]
+        edge_index_ij_1 = edge_index_ij[shape0:]
+        edge_index_ij_2 = edge_index_ij[:shape0]
+        edge_index_ij_1_temp = edge_index_ij_1[a_nlist_mask_3d_1]
+        edge_index_ij_2_temp = edge_index_ij_2[a_nlist_mask_3d_2]
+        eij2a_index = torch.cat([edge_index_ij_1_temp, edge_index_ij_2_temp], dim=0)
 
     # edge(ik) to angle(ijk) index_select
     edge_index_ik = edge_index.unsqueeze(-2).expand(-1, -1, a_nnei, -1)
     # n_angle
-    eik2a_index = edge_index_ik[a_nlist_mask_3d]
+    try:
+        eik2a_index = edge_index_ik[a_nlist_mask_3d]
+    except Exception as e:
+        shape0 = a_nlist_mask_3d.shape[0] // 2
+        a_nlist_mask_3d_1 = a_nlist_mask_3d[shape0:]
+        a_nlist_mask_3d_2 = a_nlist_mask_3d[:shape0]
+        edge_index_ik_1 = edge_index_ik[shape0:]
+        edge_index_ik_2 = edge_index_ik[:shape0]
+        edge_index_ik_1_temp = edge_index_ik_1[a_nlist_mask_3d_1]
+        edge_index_ik_2_temp = edge_index_ik_2[a_nlist_mask_3d_2]
+        eik2a_index = torch.cat([edge_index_ik_1_temp, edge_index_ik_2_temp], dim=0)
 
     if calculate_dihedral:
         # 3. angle graph
@@ -188,6 +222,8 @@ def get_graph_index(
                 n2a_index.unsqueeze(-1),
                 eij2a_index.unsqueeze(-1),
                 eik2a_index.unsqueeze(-1),
+                j_index.unsqueeze(-1),
+                k_index.unsqueeze(-1),
             ],
             dim=-1,
         ),

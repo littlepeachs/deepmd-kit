@@ -167,6 +167,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_torsion: bool = False,
         use_atomic_moment: bool = False,
         use_p3m: bool = False,
+        use_angle_weight: bool = False,
     ) -> None:
         r"""
         The repflow descriptor block.
@@ -247,6 +248,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             Whether to use atomic moment for edge update.
         use_p3m : bool, optional
             Whether to use P3M for edge update.
+        use_angle_weight : bool, optional
+            Whether to use angle weight for angle update.
         """
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -426,6 +429,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
         self.use_p3m = use_p3m
+        self.use_angle_weight = use_angle_weight
         if self.use_rbf:
             self.rbf_dim = 32
             self.bessel_basis = BesselBasisLayer(
@@ -499,6 +503,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     layer_idx=ii,
                     max_layer_num = nlayers,
                     use_p3m=self.use_p3m,
+                    use_angle_weight=self.use_angle_weight,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -855,9 +860,27 @@ class DescrptBlockRepflows(DescriptorBlock):
             # nb x nloc x a_nnei x a_nnei
             a_nlist_mask = a_nlist_mask_3d
             # n_angle x 1
-            angle_input = angle_input[a_nlist_mask]
+            try:
+                angle_input = angle_input[a_nlist_mask]
             # n_angle
-            a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
+                a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
+            except:
+                shape0 = a_nlist_mask.shape[0] //2
+                a_nlist_mask_1 = a_nlist_mask[:shape0]
+                a_nlist_mask_2 = a_nlist_mask[shape0:]  
+                angle_input_1 = angle_input[:shape0]
+                angle_input_2 = angle_input[shape0:]
+                angle_input_1_temp = angle_input_1[a_nlist_mask_1]
+                angle_input_2_temp = angle_input_2[a_nlist_mask_2]
+                angle_input = torch.cat([angle_input_1_temp, angle_input_2_temp], dim=0)
+                
+                temp_a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])
+                a_sw_1 = temp_a_sw[:shape0]
+                a_sw_2 = temp_a_sw[shape0:]
+                a_sw_1_temp = a_sw_1[a_nlist_mask_1]
+                a_sw_2_temp = a_sw_2[a_nlist_mask_2]
+                a_sw = torch.cat([a_sw_1_temp, a_sw_2_temp], dim=0)
+
             if self.update_dihedral:
                 assert dihedral_input is not None
                 assert d_sw is not None
