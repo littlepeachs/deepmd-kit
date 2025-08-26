@@ -200,6 +200,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
                 mapping,
                 do_atomic_virial=do_atomic_virial,
             )
+            
             model_predict = self.output_type_cast(model_predict, input_prec)
             return model_predict
 
@@ -303,7 +304,6 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
                 aparam=ap,
                 comm_dict=comm_dict,
             )
-            
             model_predict = fit_output_to_model_output(
                 atomic_ret,
                 self.atomic_output_def(),

@@ -207,6 +207,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             use_rbf=self.repflow_args.use_rbf,
             use_atomic_moment=self.repflow_args.use_atomic_moment,
             use_p3m=self.repflow_args.use_p3m,
+            use_les=self.repflow_args.use_les,
             use_angle_weight=self.repflow_args.use_angle_weight,
             use_torsion=self.repflow_args.use_torsion,
         )

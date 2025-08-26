@@ -167,6 +167,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_torsion: bool = False,
         use_atomic_moment: bool = False,
         use_p3m: bool = False,
+        use_les: bool = False,
         use_angle_weight: bool = False,
     ) -> None:
         r"""
@@ -248,6 +249,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             Whether to use atomic moment for edge update.
         use_p3m : bool, optional
             Whether to use P3M for edge update.
+        use_les : bool, optional
+            Whether to use LES for Long-range energy.
         use_angle_weight : bool, optional
             Whether to use angle weight for angle update.
         """
@@ -429,6 +432,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
         self.use_p3m = use_p3m
+        self.use_les = use_les
         self.use_angle_weight = use_angle_weight
         if self.use_rbf:
             self.rbf_dim = 32
@@ -503,6 +507,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     layer_idx=ii,
                     max_layer_num = nlayers,
                     use_p3m=self.use_p3m,
+                    use_les=self.use_les,
                     use_angle_weight=self.use_angle_weight,
                 )
             )
@@ -652,6 +657,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             use_env_envelope=self.use_env_envelope,
             use_new_sw=self.use_new_sw,
         )
+        
         nlist_mask = nlist != -1
         if (
             self.edge_use_esen_rbf

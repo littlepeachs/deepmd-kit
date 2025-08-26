@@ -102,6 +102,7 @@ class RepFlowLayer(torch.nn.Module):
         max_layer_num: int = 0,
         use_p3m: bool = False,
         use_angle_weight: bool = False,
+        use_les: bool = False,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -124,6 +125,7 @@ class RepFlowLayer(torch.nn.Module):
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
         self.use_p3m = use_p3m
+        self.use_les = use_les
         self.use_angle_weight = use_angle_weight
         self.layer_idx = layer_idx
         self.max_layer_num = max_layer_num

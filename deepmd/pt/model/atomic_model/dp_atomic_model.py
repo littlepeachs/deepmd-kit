@@ -16,6 +16,9 @@ from deepmd.pt.model.descriptor.base_descriptor import (
 from deepmd.pt.model.task.base_fitting import (
     BaseFitting,
 )
+from deepmd.pt.model.descriptor.les import (
+    Les,
+)
 from deepmd.utils.path import (
     DPPath,
 )
@@ -63,6 +66,19 @@ class DPAtomicModel(BaseAtomicModel):
         super().init_out_stat()
         self.enable_eval_descriptor_hook = False
         self.eval_descriptor_list = []
+        if self.descriptor.repflow_args.use_les:
+            les_args = {
+                "n_layers": 3,
+                "n_hidden": [64, 32],
+                "add_linear_nn": True,
+                "output_scaling_factor": 0.1,
+                "sigma": 1.0,
+                "dl": 2,
+                "remove_mean": True,
+                "epsilon_factor": 1,
+                "use_atomwise": True,
+            }
+            self.les = Les(les_arguments=les_args)
 
     eval_descriptor_list: list[torch.Tensor]
 
@@ -258,6 +274,26 @@ class DPAtomicModel(BaseAtomicModel):
             fparam=fparam,
             aparam=aparam,
         )
+        if self.descriptor.repflow_args.use_les:
+            flatten_desc = descriptor.reshape(-1, descriptor.shape[-1])
+            batch_size = coord.shape[0]
+            atom_num = coord.shape[1]
+            nloc = atom_num
+            base_indices = torch.arange(batch_size, dtype=torch.int32)
+            base_indices_expanded = base_indices.unsqueeze(1) 
+            batch = base_indices_expanded.expand(-1, atom_num).flatten().to(flatten_desc.device)
+            if box is not None:
+                box = box.reshape(-1, 3, 3).to(flatten_desc.device)
+            les_ret = self.les(
+                desc=flatten_desc,
+                positions=extended_coord[:, :nloc, :].reshape(-1, 3).requires_grad_(True),
+                cell=box,
+                batch=batch,
+                compute_energy=True,
+                compute_bec=True,
+                bec_output_index=1,
+            )
+            fit_ret["E_lr"] = les_ret["E_lr"]
         return fit_ret
 
     def get_out_bias(self) -> torch.Tensor:

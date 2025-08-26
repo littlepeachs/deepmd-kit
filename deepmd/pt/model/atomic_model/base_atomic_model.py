@@ -270,12 +270,13 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             out_shape2 = 1
             for ss in out_shape[2:]:
                 out_shape2 *= ss
+            if kk == "E_lr":
+                continue
             ret_dict[kk] = (
                 ret_dict[kk].reshape([out_shape[0], out_shape[1], out_shape2])
                 * atom_mask[:, :, None]
             ).view(out_shape)
         ret_dict["mask"] = atom_mask
-
         return ret_dict
 
     def forward(

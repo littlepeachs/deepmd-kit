@@ -1659,6 +1659,12 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "use_les",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "use_angle_weight",
             bool,
             optional=True,

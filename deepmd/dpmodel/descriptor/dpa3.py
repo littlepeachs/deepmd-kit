@@ -68,6 +68,7 @@ class RepFlowArgs:
         use_torsion: bool = False,
         use_atomic_moment: bool = False,
         use_p3m: bool = False,
+        use_les: bool = False,
         use_angle_weight: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
@@ -132,6 +133,8 @@ class RepFlowArgs:
             Whether to use atomic moment for edge update.
         use_p3m : bool, optional
             Whether to use P3M for edge update.
+        use_les : bool, optional
+            Whether to use LES for Long-range energy.
         use_angle_weight : bool, optional
             Whether to use angle weight for angle update.
         """
@@ -196,6 +199,7 @@ class RepFlowArgs:
         self.use_torsion = use_torsion
         self.use_atomic_moment = use_atomic_moment
         self.use_p3m = use_p3m
+        self.use_les = use_les
         self.use_angle_weight = use_angle_weight
     def __getitem__(self, key):
         if hasattr(self, key):
@@ -228,6 +232,7 @@ class RepFlowArgs:
             "use_torsion": self.use_torsion,
             "use_atomic_moment": self.use_atomic_moment,
             "use_p3m": self.use_p3m,
+            "use_les": self.use_les,
             "use_angle_weight": self.use_angle_weight,
         }
 

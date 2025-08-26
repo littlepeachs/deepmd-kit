@@ -441,7 +441,6 @@ class GeneralFitting(Fitting):
             xx_zeros = None
         nf, nloc, nd = xx.shape
         net_dim_out = self._net_out_dim()
-
         if nd != self.dim_descrpt:
             raise ValueError(
                 f"get an input descriptor of dim {nd},"
