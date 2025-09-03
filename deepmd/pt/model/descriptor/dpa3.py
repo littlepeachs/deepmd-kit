@@ -126,7 +126,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
 
         """
         super().__init__()
-
+        
         def init_subclass_params(sub_data, sub_class):
             if isinstance(sub_data, dict):
                 return sub_class(**sub_data)
@@ -544,6 +544,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         )
         if self.concat_output_tebd:
             node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)
+        
         return (
             node_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
             rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),

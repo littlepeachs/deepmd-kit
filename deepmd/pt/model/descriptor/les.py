@@ -284,6 +284,15 @@ class Atomwise(nn.Module):
             else:
                 self.linear_nn = None
 
+            les_state = torch.load('/aisi/mnt/data_nas/liwentao/auto_model_test/results/0824-DPA3les-Omol25/les_state.pt')
+            new_les_state = {}
+            for old_key, value in les_state.items():
+                # 去掉前缀，如 'model.Default.atomic_model.les.atomwise.outnet.0.linear.weight'
+                # 变为 'outnet.0.linear.weight'
+                new_key = old_key.replace('model.Default.atomic_model.les.atomwise.', '')
+                new_les_state[new_key] = value
+            self.load_state_dict(new_les_state)
+            
         # predict atomwise contributions
         y = self.outnet(desc)
         if self.add_linear_nn:

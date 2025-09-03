@@ -54,14 +54,15 @@ def prod_env_mat(
     extended_coord,
     nlist,
     atype,
-    mean,
-    stddev,
-    rcut: float,
-    rcut_smth: float,
+    mean=None,
+    stddev=None,
+    rcut: float=6.0,
+    rcut_smth: float=5.3,
     radial_only: bool = False,
     protection: float = 0.0,
     use_env_envelope: bool = False,
     use_new_sw: bool = False,
+    normalize: bool = True,
 ):
     """Generate smooth environment matrix from atom coordinates and other context.
 
@@ -89,7 +90,10 @@ def prod_env_mat(
         use_env_envelope=use_env_envelope,
         use_new_sw=use_new_sw,
     )  # shape [n_atom, dim, 4 or 1]
-    t_avg = mean[atype]  # [n_atom, dim, 4 or 1]
-    t_std = stddev[atype]  # [n_atom, dim, 4 or 1]
-    env_mat_se_a = (_env_mat_se_a - t_avg) / t_std
+    if normalize:
+        t_avg = mean[atype]  # [n_atom, dim, 4 or 1]
+        t_std = stddev[atype]  # [n_atom, dim, 4 or 1]
+        env_mat_se_a = (_env_mat_se_a - t_avg) / t_std
+    else:
+        env_mat_se_a = _env_mat_se_a
     return env_mat_se_a, diff, switch

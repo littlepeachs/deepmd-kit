@@ -83,6 +83,7 @@ def _get_standard_model_components(model_params, ntypes):
     # descriptor
     model_params["descriptor"]["ntypes"] = ntypes
     model_params["descriptor"]["type_map"] = copy.deepcopy(model_params["type_map"])
+    
     descriptor = BaseDescriptor(**model_params["descriptor"])
     # fitting
     fitting_net = model_params.get("fitting_net", {})

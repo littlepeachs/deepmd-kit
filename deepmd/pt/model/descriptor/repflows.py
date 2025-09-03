@@ -545,6 +545,7 @@ class DescrptBlockRepflows(DescriptorBlock):
 
     def get_sel(self) -> list[int]:
         """Returns the number of selected atoms for each type."""
+        
         return self.sel
 
     def get_ntypes(self) -> int:

@@ -132,7 +132,8 @@ class DeepEval(DeepEvalBackend):
             model = get_model(self.input_param).to(DEVICE)
             # model = torch.jit.script(model)
             self.dp = ModelWrapper(model)
-            self.dp.load_state_dict(state_dict)
+            
+            self.dp.load_state_dict(state_dict,strict=False)
         elif str(self.model_path).endswith(".pth"):
             model = torch.jit.load(model_file, map_location=env.DEVICE)
             self.dp = ModelWrapper(model)

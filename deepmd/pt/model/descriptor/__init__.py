@@ -42,6 +42,9 @@ from .se_t_tebd import (
     DescrptBlockSeTTebd,
     DescrptSeTTebd,
 )
+from .eqnorm import (
+    Eqnorm,
+)
 
 __all__ = [
     "BaseDescriptor",
@@ -53,6 +56,7 @@ __all__ = [
     "DescrptDPA1",
     "DescrptDPA2",
     "DescrptDPA3",
+    "Eqnorm",
     "DescrptHybrid",
     "DescrptSeA",
     "DescrptSeAttenV2",
