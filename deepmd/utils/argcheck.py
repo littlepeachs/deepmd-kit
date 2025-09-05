@@ -1428,12 +1428,6 @@ def descrpt_dpa3_args():
         ),
     ]
 
-@descrpt_args_plugin.register("eqnorm", doc=doc_only_pt_supported)
-def descrpt_eqnorm_args():
-    doc_eqnorm = "The arguments used to initialize the eqnorm block."
-    return [
-        Argument("eqnorm", dict, eqnorm_model_args(), doc=doc_eqnorm),
-    ]
 
 # repflow for dpa3
 def dpa3_repflow_args():
@@ -1844,61 +1838,6 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
-    ]
-
-def eqnorm_model_args():
-    """Arguments for the model configuration."""
-
-    doc_dipole = "Calculate dipole or not."
-    doc_polar = "Calculate polar or not."
-    doc_stress = "Calculate stress or not."
-    doc_energy_per_atom = "Calculate metric per atom or not."
-    doc_relative_energy = "Calculate conformer relative energy or not."
-    doc_shift = 'Energy shift mode. Options: "per_species", "per_atom".'
-    doc_scale = 'Energy/force scale mode. Options: "per_species", "per_atom", "force_rms".'
-    doc_shift_trainable = "Whether shift is trainable."
-    doc_scale_trainable = "Whether scale is trainable."
-    doc_grad_mode = 'Gradient mode. Options: "node", "edge".'
-
-    doc_irreps_hidden = "Hidden irreps for the equivariant network."
-    doc_irreps_sh = "Spherical harmonics irreps."
-    doc_num_convs = "Number of convolution/MPNN layers."
-    doc_num_features = "Number of feature channels."
-    doc_r_cutoff = "Radial cutoff distance (Å)."
-    doc_num_basis = "Number of basis functions for radial encoding."
-    doc_invariant_layers = "Number of layers in invariant MLP."
-    doc_invariant_neurons = "Number of neurons in invariant MLP."
-    doc_poly_p = "Polynomial degree p for envelope function."
-    doc_use_ema = "Whether to use exponential moving average (EMA)."
-
-    doc_avg_nbr = "Average number of neighbors (for dataset statistics)."
-    doc_avg_atoms = "Average number of atoms per structure (for dataset statistics)."
-
-    return [
-        Argument("DIPOLE", bool, optional=True, default=False, doc=doc_dipole),
-        Argument("POLAR", bool, optional=True, default=False, doc=doc_polar),
-        Argument("STRESS", bool, optional=True, default=True, doc=doc_stress),
-        Argument("energy_per_atom", bool, optional=True, default=True, doc=doc_energy_per_atom),
-        Argument("relative_energy", bool, optional=True, default=False, doc=doc_relative_energy),
-        Argument("shift", str, optional=True, default="per_species", doc=doc_shift),
-        Argument("scale", str, optional=True, default="force_rms", doc=doc_scale),
-        Argument("shift_trainable", bool, optional=True, default=False, doc=doc_shift_trainable),
-        Argument("scale_trainable", bool, optional=True, default=False, doc=doc_scale_trainable),
-        Argument("grad_mode", str, optional=True, default="edge", doc=doc_grad_mode),
-
-        Argument("irreps_hidden", str, optional=True, default="128x0e+64x1o+32x2e+32x3o", doc=doc_irreps_hidden),
-        Argument("irreps_sh", str, optional=True, default="1x0e+1x1o+1x2e+1x3o", doc=doc_irreps_sh),
-        Argument("num_convs", int, optional=True, default=4, doc=doc_num_convs),
-        Argument("num_features", int, optional=True, default=128, doc=doc_num_features),
-        Argument("r_cutoff", float, optional=True, default=6.0, doc=doc_r_cutoff),
-        Argument("num_basis", int, optional=True, default=8, doc=doc_num_basis),
-        Argument("invariant_layers", int, optional=True, default=2, doc=doc_invariant_layers),
-        Argument("invariant_neurons", int, optional=True, default=64, doc=doc_invariant_neurons),
-        Argument("poly_p", int, optional=True, default=6, doc=doc_poly_p),
-        Argument("use_ema", bool, optional=True, default=True, doc=doc_use_ema),
-
-        Argument("avg_nbr", float, optional=True, default=61.84, doc=doc_avg_nbr),
-        Argument("avg_atoms", float, optional=True, default=31.19, doc=doc_avg_atoms),
     ]
 
 
@@ -2547,6 +2486,20 @@ def standard_model_args() -> Argument:
             ),
         ],
         doc="Standard model, which contains a descriptor and a fitting.",
+    )
+    return ca
+
+@model_args_plugin.register("eqnorm")
+def esen_model_args() -> Argument:
+    ca = Argument(
+        "eqnorm",
+        dict,
+        [
+            Argument(
+                "eqnorm", dict,
+            ),
+        ],
+        doc="Eqnorm model.",
     )
     return ca
 

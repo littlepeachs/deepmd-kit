@@ -1,4 +1,4 @@
-import argparse
+
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 from torch_geometric.data import Data, Batch
 from torch_scatter import scatter, segment_coo, segment_csr
@@ -10,64 +10,37 @@ from e3nn import o3
 from e3nn.o3 import Irreps
 from e3nn.o3 import FullyConnectedTensorProduct, TensorProduct, Linear
 from e3nn.nn import FullyConnectedNet, Gate
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import vesin
-from torch_geometric.nn import radius_graph
+import functools
 
-from deepmd.pt.model.descriptor.env_mat import (
-    prod_env_mat,
+from deepmd.pt.model.atomic_model import (
+    BaseAtomicModel,
 )
-from deepmd.dpmodel.descriptor.eqnorm import EqnormArgs
-from .base_descriptor import (
-    BaseDescriptor,
+from deepmd.pt.model.model.model import (
+    BaseModel,
 )
-from deepmd.pt.model.network.network import (
-    TypeEmbedNet,
-    TypeEmbedNetConsistent,
+import numpy as np
+from .dp_model import (
+    DPModelCommon,
 )
-from deepmd.pt.utils import (
-    env,
+from .make_model import (
+    make_model,
 )
-from deepmd.pt.utils.env import (
-    PRECISION_DICT,
+from deepmd.pt.utils.stat import (
+    compute_output_stats,
 )
-from deepmd.pt.utils.update_sel import (
-    UpdateSel,
-)
-from deepmd.pt.utils.utils import (
-    to_numpy_array,
-)
-from deepmd.utils.data_system import (
-    DeepmdDataSystem,
-)
-from deepmd.utils.finetune import (
-    get_index_between_two_maps,
-    map_pair_exclude_types,
-)
+import copy
 from deepmd.utils.path import (
     DPPath,
 )
-from deepmd.utils.version import (
-    check_version_compatibility,
+from deepmd.dpmodel.output_def import (
+    FittingOutputDef,
+    ModelOutputDef,
+    OutputVariableDef,
 )
-
-from .base_descriptor import (
-    BaseDescriptor,
-)
-from .descriptor import (
-    extend_descrpt_stat,
-)
-from .repflow_layer import (
-    RepFlowLayer,
-)
-from .repflows import (
-    DescrptBlockRepflows,
-)
-from deepmd.pt.model.network.mlp import (
-    MLPLayer,
-)
-from deepmd.dpmodel.utils import EnvMat as DPEnvMat
-from deepmd.pt.utils.env_mat_stat import (
-    EnvMatStatSe,
+from deepmd.pt.utils import (
+    env,
 )
 
 element_dict = {
@@ -81,374 +54,107 @@ element_dict = {
     'Fr':87, 'Ra':88, 'Ac':89, 'Th':90, 'Pa':91, 'U':92, 'Np':93, 'Pu':94, 'Am':95, 'Cm':96, 'Bk':97, 'Cf':98, 'Es':99, 'Fm':100, 'Md':101, 'No':102, 'Lr':103, 'Rf':104, 'Db':105, 'Sg':106, 'Bh':107, 'Hs':108, 'Mt':109, 'Ds':110, 'Rg':111, 'Cn':112, 'Nh':113, 'Fl':114, 'Mc':115, 'Lv':116, 'Ts':117, 'Og':118,
 }
 
-def get_l_to_all_m_expand_index(lmax: int):
-    expand_index = torch.zeros([(lmax + 1) ** 2]).long()
-    for lval in range(lmax + 1):
-        start_idx = lval**2
-        length = 2 * lval + 1
-        expand_index[start_idx : (start_idx + length)] = lval
-    return expand_index
+energy_shift = torch.tensor([[ -3.6671],
+        [ -1.3228],
+        [ -3.4821],
+        [ -4.7372],
+        [ -7.7249],
+        [ -8.4056],
+        [ -7.3601],
+        [ -7.2847],
+        [ -4.8965],
+        [ -0.0296],
+        [ -2.7592],
+        [ -2.8129],
+        [ -4.8468],
+        [ -7.6949],
+        [ -6.9631],
+        [ -4.6726],
+        [ -2.8117],
+        [ -0.0626],
+        [ -2.6177],
+        [ -5.3902],
+        [ -7.8857],
+        [-10.2688],
+        [ -8.6651],
+        [ -9.2331],
+        [ -8.3050],
+        [ -7.0489],
+        [ -5.5771],
+        [ -5.1727],
+        [ -3.2520],
+        [ -1.2902],
+        [ -3.5271],
+        [ -4.7087],
+        [ -3.9764],
+        [ -3.8863],
+        [ -2.5185],
+        [  6.7582],
+        [ -2.5634],
+        [ -4.9376],
+        [-10.1497],
+        [-11.8468],
+        [-12.1389],
+        [ -8.7916],
+        [ -8.7871],
+        [ -7.7809],
+        [ -6.8499],
+        [ -4.8909],
+        [ -2.0635],
+        [ -0.6396],
+        [ -2.7887],
+        [ -3.8187],
+        [ -3.5871],
+        [ -2.8804],
+        [ -1.6356],
+        [  9.8438],
+        [ -2.7655],
+        [ -4.9909],
+        [ -8.9338],
+        [ -8.7354],
+        [ -8.0189],
+        [ -8.2511],
+        [ -7.5917],
+        [ -8.1698],
+        [-13.5947],
+        [-18.5173],
+        [ -7.6474],
+        [ -8.1226],
+        [ -7.6076],
+        [ -6.8502],
+        [ -7.8269],
+        [ -3.5847],
+        [ -7.4553],
+        [-12.7963],
+        [-14.1081],
+        [ -9.3548],
+        [-11.3875],
+        [ -9.6218],
+        [ -7.3245],
+        [ -5.3047],
+        [ -2.3802],
+        [  0.2495],
+        [ -2.3242],
+        [ -3.7299],
+        [ -3.4388],
+        [ -5.0627],
+        [-11.0234],
+        [-12.2584],
+        [-13.8556],
+        [-14.9203],
+        [-15.2824],
+        [-15.2824],
+        [-15.2824],
+        [-15.2824],
+        [-15.2824],
+        [-15.2824],
+        [-15.2824]])
 
-def radius_graph_pbc(
-    data,
-    radius,
-    max_num_neighbors_threshold,
-    enforce_max_neighbors_strictly: bool = False,
-    pbc=[True, True, True],
-):
-    device = data.pos.device
-    data_type = data.pos.dtype
-    batch_size = len(data.natoms)
+energy_scale = torch.tensor(0.8080)
 
-    if hasattr(data, "pbc"):
-        data.pbc = torch.atleast_2d(data.pbc)
-        for i in range(3):
-            if not torch.any(data.pbc[:, i]).item():
-                pbc[i] = False
-            elif torch.all(data.pbc[:, i]).item():
-                pbc[i] = True
-            else:
-                raise RuntimeError(
-                    "Different structures in the batch have different PBC configurations. This is not currently supported."
-                )
+dtype = env.GLOBAL_PT_FLOAT_PRECISION
+device = env.DEVICE
 
-    # position of the atoms
-    atom_pos = data.pos
-
-    # Before computing the pairwise distances between atoms, first create a list of atom indices to compare for the entire batch
-    num_atoms_per_image = data.natoms
-    num_atoms_per_image_sqr = (num_atoms_per_image**2).long()
-
-    # index offset between images
-    index_offset = (
-        torch.cumsum(num_atoms_per_image, dim=0) - num_atoms_per_image
-    )
-
-    index_offset_expand = torch.repeat_interleave(
-        index_offset, num_atoms_per_image_sqr
-    )
-    num_atoms_per_image_expand = torch.repeat_interleave(
-        num_atoms_per_image, num_atoms_per_image_sqr
-    )
-
-    # Compute a tensor containing sequences of numbers that range from 0 to num_atoms_per_image_sqr for each image
-    # that is used to compute indices for the pairs of atoms. This is a very convoluted way to implement
-    # the following (but 10x faster since it removes the for loop)
-    # for batch_idx in range(batch_size):
-    #    batch_count = torch.cat([batch_count, torch.arange(num_atoms_per_image_sqr[batch_idx], device=device)], dim=0)
-    num_atom_pairs = torch.sum(num_atoms_per_image_sqr)
-    index_sqr_offset = (
-        torch.cumsum(num_atoms_per_image_sqr, dim=0) - num_atoms_per_image_sqr
-    )
-    index_sqr_offset = torch.repeat_interleave(
-        index_sqr_offset, num_atoms_per_image_sqr
-    )
-    atom_count_sqr = (
-        torch.arange(num_atom_pairs, device=device) - index_sqr_offset
-    )
-
-    # Compute the indices for the pairs of atoms (using division and mod)
-    # If the systems get too large this apporach could run into numerical precision issues
-    index1 = (
-        torch.div(
-            atom_count_sqr, num_atoms_per_image_expand, rounding_mode="floor"
-        )
-    ) + index_offset_expand
-    index2 = (
-        atom_count_sqr % num_atoms_per_image_expand
-    ) + index_offset_expand
-    # Get the positions for each atom
-    pos1 = torch.index_select(atom_pos, 0, index1)
-    pos2 = torch.index_select(atom_pos, 0, index2)
-
-    # Calculate required number of unit cells in each direction.
-    # Smallest distance between planes separated by a1 is
-    # 1 / ||(a2 x a3) / V||_2, since a2 x a3 is the area of the plane.
-    # Note that the unit cell volume V = a1 * (a2 x a3) and that
-    # (a2 x a3) / V is also the reciprocal primitive vector
-    # (crystallographer's definition).
-    cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
-    cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
-
-    if pbc[0]:
-        inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
-        rep_a1 = torch.ceil(radius * inv_min_dist_a1)
-    else:
-        rep_a1 = data.cell.new_zeros(1)
-
-    if pbc[1]:
-        cross_a3a1 = torch.cross(data.cell[:, 2], data.cell[:, 0], dim=-1)
-        inv_min_dist_a2 = torch.norm(cross_a3a1 / cell_vol, p=2, dim=-1)
-        rep_a2 = torch.ceil(radius * inv_min_dist_a2)
-    else:
-        rep_a2 = data.cell.new_zeros(1)
-
-    if pbc[2]:
-        cross_a1a2 = torch.cross(data.cell[:, 0], data.cell[:, 1], dim=-1)
-        inv_min_dist_a3 = torch.norm(cross_a1a2 / cell_vol, p=2, dim=-1)
-        rep_a3 = torch.ceil(radius * inv_min_dist_a3)
-    else:
-        rep_a3 = data.cell.new_zeros(1)
-
-    # Take the max over all images for uniformity. This is essentially padding.
-    # Note that this can significantly increase the number of computed distances
-    # if the required repetitions are very different between images
-    # (which they usually are). Changing this to sparse (scatter) operations
-    # might be worth the effort if this function becomes a bottleneck.
-    max_rep = [rep_a1.max(), rep_a2.max(), rep_a3.max()]
-
-    # Tensor of unit cells
-    cells_per_dim = [
-        torch.arange(-rep, rep + 1, device=device, dtype=torch.float)
-        for rep in max_rep
-    ]
-    unit_cell = torch.cartesian_prod(*cells_per_dim).to(data_type)
-    num_cells = len(unit_cell)
-    unit_cell_per_atom = unit_cell.view(1, num_cells, 3).repeat(
-        len(index2), 1, 1
-    )
-    unit_cell = torch.transpose(unit_cell, 0, 1)
-    unit_cell_batch = unit_cell.view(1, 3, num_cells).expand(
-        batch_size, -1, -1
-    )
-
-    # Compute the x, y, z positional offsets for each cell in each image
-    data_cell = torch.transpose(data.cell, 1, 2)
-    
-    pbc_offsets = torch.bmm(data_cell, unit_cell_batch)
-    pbc_offsets_per_atom = torch.repeat_interleave(
-        pbc_offsets, num_atoms_per_image_sqr, dim=0
-    )
-
-    # Expand the positions and indices for the 9 cells
-    pos1 = pos1.view(-1, 3, 1).expand(-1, -1, num_cells)
-    pos2 = pos2.view(-1, 3, 1).expand(-1, -1, num_cells)
-    index1 = index1.view(-1, 1).repeat(1, num_cells).view(-1)
-    index2 = index2.view(-1, 1).repeat(1, num_cells).view(-1)
-    # Add the PBC offsets for the second atom
-    pos2 = pos2 + pbc_offsets_per_atom
-
-    # Compute the squared distance between atoms
-    edge_vector = pos2 - pos1
-    atom_distance_sqr = torch.sum((pos1 - pos2) ** 2, dim=1)
-    atom_distance_sqr = atom_distance_sqr.view(-1)
-    
-    # Remove pairs that are too far apart
-    mask_within_radius = torch.le(atom_distance_sqr, radius * radius)
-    # Remove pairs with the same atoms (distance = 0.0)
-    mask_not_same = torch.gt(atom_distance_sqr, 0.0001)
-    mask = torch.logical_and(mask_within_radius, mask_not_same)
-    index1 = torch.masked_select(index1, mask)
-    index2 = torch.masked_select(index2, mask)
-    unit_cell = torch.masked_select(
-        unit_cell_per_atom.view(-1, 3), mask.view(-1, 1).expand(-1, 3)
-    )
-    unit_cell = unit_cell.view(-1, 3)
-    atom_distance_sqr = torch.masked_select(atom_distance_sqr, mask)
-    
-    
-    mask_num_neighbors, num_neighbors_image = get_max_neighbors_mask(
-        natoms=data.natoms,
-        index=index1,
-        atom_distance=atom_distance_sqr,
-        max_num_neighbors_threshold=max_num_neighbors_threshold,
-        enforce_max_strictly=enforce_max_neighbors_strictly,
-    )
-
-    if not torch.all(mask_num_neighbors):
-        # Mask out the atoms to ensure each atom has at most max_num_neighbors_threshold neighbors
-        index1 = torch.masked_select(index1, mask_num_neighbors)
-        index2 = torch.masked_select(index2, mask_num_neighbors)
-        unit_cell = torch.masked_select(
-            unit_cell.view(-1, 3), mask_num_neighbors.view(-1, 1).expand(-1, 3)
-        )
-        unit_cell = unit_cell.view(-1, 3)
-
-    edge_index = torch.stack((index2, index1))
-
-    return edge_index, edge_vector
-
-def get_max_neighbors_mask(
-    natoms,
-    index,
-    atom_distance,
-    max_num_neighbors_threshold,
-    degeneracy_tolerance: float = 0.01,
-    enforce_max_strictly: bool = False,
-):
-    """
-    Give a mask that filters out edges so that each atom has at most
-    `max_num_neighbors_threshold` neighbors.
-    Assumes that `index` is sorted.
-
-    Enforcing the max strictly can force the arbitrary choice between
-    degenerate edges. This can lead to undesired behaviors; for
-    example, bulk formation energies which are not invariant to
-    unit cell choice.
-
-    A degeneracy tolerance can help prevent sudden changes in edge
-    existence from small changes in atom position, for example,
-    rounding errors, slab relaxation, temperature, etc.
-    """
-
-    device = natoms.device
-    num_atoms = natoms.sum()
-
-    # Get number of neighbors
-    # segment_coo assumes sorted index
-    ones = index.new_ones(1).expand_as(index)
-    num_neighbors = segment_coo(ones, index, dim_size=num_atoms)
-    max_num_neighbors = num_neighbors.max()
-    num_neighbors_thresholded = num_neighbors.clamp(
-        max=max_num_neighbors_threshold
-    )
-
-    # Get number of (thresholded) neighbors per image
-    image_indptr = torch.zeros(
-        natoms.shape[0] + 1, device=device, dtype=torch.long
-    )
-    image_indptr[1:] = torch.cumsum(natoms, dim=0)
-    num_neighbors_image = segment_csr(num_neighbors_thresholded, image_indptr)
-
-    # If max_num_neighbors is below the threshold, return early
-    if (
-        max_num_neighbors <= max_num_neighbors_threshold
-        or max_num_neighbors_threshold <= 0
-    ):
-        mask_num_neighbors = torch.tensor(
-            [True], dtype=bool, device=device
-        ).expand_as(index)
-        return mask_num_neighbors, num_neighbors_image
-
-    # Create a tensor of size [num_atoms, max_num_neighbors] to sort the distances of the neighbors.
-    # Fill with infinity so we can easily remove unused distances later.
-    distance_sort = torch.full(
-        [num_atoms * max_num_neighbors], np.inf, device=device
-    )
-
-    # Create an index map to map distances from atom_distance to distance_sort
-    # index_sort_map assumes index to be sorted
-    index_neighbor_offset = torch.cumsum(num_neighbors, dim=0) - num_neighbors
-    index_neighbor_offset_expand = torch.repeat_interleave(
-        index_neighbor_offset, num_neighbors
-    )
-    index_sort_map = (
-        index * max_num_neighbors
-        + torch.arange(len(index), device=device)
-        - index_neighbor_offset_expand
-    )
-    distance_sort.index_copy_(0, index_sort_map, atom_distance)
-    distance_sort = distance_sort.view(num_atoms, max_num_neighbors)
-
-    # Sort neighboring atoms based on distance
-    distance_sort, index_sort = torch.sort(distance_sort, dim=1)
-
-    # Select the max_num_neighbors_threshold neighbors that are closest
-    if enforce_max_strictly:
-        distance_sort = distance_sort[:, :max_num_neighbors_threshold]
-        index_sort = index_sort[:, :max_num_neighbors_threshold]
-        max_num_included = max_num_neighbors_threshold
-
-    else:
-        effective_cutoff = (
-            distance_sort[:, max_num_neighbors_threshold]
-            + degeneracy_tolerance
-        )
-        is_included = torch.le(distance_sort.T, effective_cutoff)
-
-        # Set all undesired edges to infinite length to be removed later
-        distance_sort[~is_included.T] = np.inf
-
-        # Subselect tensors for efficiency
-        num_included_per_atom = torch.sum(is_included, dim=0)
-        max_num_included = torch.max(num_included_per_atom)
-        distance_sort = distance_sort[:, :max_num_included]
-        index_sort = index_sort[:, :max_num_included]
-
-        # Recompute the number of neighbors
-        num_neighbors_thresholded = num_neighbors.clamp(
-            max=num_included_per_atom
-        )
-
-        num_neighbors_image = segment_csr(
-            num_neighbors_thresholded, image_indptr
-        )
-
-    # Offset index_sort so that it indexes into index
-    index_sort = index_sort + index_neighbor_offset.view(-1, 1).expand(
-        -1, max_num_included
-    )
-    # Remove "unused pairs" with infinite distances
-    mask_finite = torch.isfinite(distance_sort)
-    index_sort = torch.masked_select(index_sort, mask_finite)
-
-    # At this point index_sort contains the index into index of the
-    # closest max_num_neighbors_threshold neighbors per atom
-    # Create a mask to remove all pairs not in index_sort
-    mask_num_neighbors = torch.zeros(len(index), device=device, dtype=bool)
-    mask_num_neighbors.index_fill_(0, index_sort, True)
-
-    return mask_num_neighbors, num_neighbors_image
-
-@torch.jit.export
-def get_graph_index(
-    nlist: torch.Tensor,
-    nlist_mask: torch.Tensor,
-    nall: int,
-):
-    """
-    Get the index mapping for edge graph and angle graph, ready in `aggregate` or `index_select`.
-
-    Parameters
-    ----------
-    nlist : nf x nloc x nnei
-        Neighbor list. (padded neis are set to 0)
-    nlist_mask : nf x nloc x nnei
-        Masks of the neighbor list. real nei 1 otherwise 0
-    a_nlist_mask : nf x nloc x a_nnei
-        Masks of the neighbor list for angle. real nei 1 otherwise 0
-    nall
-        The number of extended atoms.
-
-    Returns
-    -------
-    edge_index : n_edge x 2
-        n2e_index : n_edge
-            Broadcast indices from node(i) to edge(ij), or reduction indices from edge(ij) to node(i).
-        n_ext2e_index : n_edge
-            Broadcast indices from extended node(j) to edge(ij).
-    angle_index : n_angle x 3
-        n2a_index : n_angle
-            Broadcast indices from extended node(j) to angle(ijk).
-        eij2a_index : n_angle
-            Broadcast indices from edge(ij) to angle(ijk), or reduction indices from angle(ijk) to edge(ij).
-        eik2a_index : n_angle
-            Broadcast indices from edge(ik) to angle(ijk).
-    dihedral_index : n_dihedral x 2
-        aijk2d_index : n_dihedral
-            Broadcast indices from angle(ijk) to dihedral(ijkl), or reduction indices from dihedral(ijkl) to angle(ijk).
-        aijl2d_index : n_dihedral
-            Broadcast indices from angle(ijl) to dihedral(ijkl).
-    """
-    nf, nloc, nnei = nlist.shape
-
-    # following: get n2e_index, n_ext2e_index, n2a_index, eij2a_index, eik2a_index
-
-    # 1. atom graph
-    # node(i) to edge(ij) index_select; edge(ij) to node aggregate
-    nlist_loc_index = torch.arange(0, nf * nloc, dtype=nlist.dtype, device=nlist.device)
-    # nf x nloc x nnei
-    n2e_index = nlist_loc_index.reshape(nf, nloc, 1).expand(-1, -1, nnei)
-    # n_edge
-    n2e_index = n2e_index[nlist_mask]  # graph node index, atom_graph[:, 0]
-
-    # node_ext(j) to edge(ij) index_select
-    frame_shift = torch.arange(0, nf, dtype=nlist.dtype, device=nlist.device) * nall
-    shifted_nlist = nlist + frame_shift[:, None, None]
-    # n_edge
-    n_ext2e_index = shifted_nlist[nlist_mask]  # graph neighbor index, atom_graph[:, 1]
-
-    return torch.cat([n2e_index.unsqueeze(-1), n_ext2e_index.unsqueeze(-1)], dim=-1)
 
 class EquiformerRMSLayerNorm(nn.Module):
     '''
@@ -778,7 +484,6 @@ class EdgewiseGrad(torch.nn.Module):
                     s31.unsqueeze(-1),
                     s12.unsqueeze(-1),
                 ], dim=-1)  # voigt notation
-
                 # _s = torch.zeros(len(data['pos']), 6, dtype=fij.dtype, device=fij.device)
                 # _s.index_add_(0, data['edge_index'][1], _virial)
                 _s = scatter(_virial, data['edge_index'][1], dim=0, dim_size=len(data['pos']))
@@ -980,11 +685,11 @@ class E3NN(torch.nn.Module):
             # print("hidden", layer_idx, data['node_hiddens'][:, :128].pow(2).mean(dim=-1, keepdim=True).pow(0.5).mean())
             # print("hidden", layer_idx, data['node_hiddens'][:, 128:].pow(2).mean(dim=-1, keepdim=True).pow(0.5).mean())
         
-        # energy = self.output_block(data['output'])
+        energy = self.output_block(data['output'])
 
         # print("otuput", 100, data['output'][:, :128].pow(2).mean(dim=-1, keepdim=True).pow(0.5).mean())
 
-        return data['output']
+        return energy
 
 
 class EquivariantGate(torch.nn.Module):
@@ -1203,50 +908,73 @@ class E3Conv(torch.nn.Module):
         
         return None
 
-@BaseDescriptor.register("eqnorm_descriptor")
-class Eqnorm(BaseDescriptor, torch.nn.Module):
+@BaseModel.register("eqnorm")
+class Eqnorm(BaseModel):
     def __init__(
             self, 
-            ntypes: int,
-            eqnorm: Union[EqnormArgs, dict], 
-            shift: Optional[torch.Tensor] = None, 
-            scale: Optional[torch.Tensor] = None, 
-            type_map: Optional[list[str]] = None,
+            model_params,
+            **kwargs,
             ) -> None:
-        super().__init__()
-        self.ntypes = ntypes
-        self.type_map = type_map
-        self.type_map_index = torch.tensor([element_dict[type] for type in type_map])
-        self.skip_stat = True
-        self.set_davg_zero = True
-        self.hidden_dim = eqnorm["num_features"]
-        self.r_cutoff = eqnorm["r_cutoff"]  # A
-        self.num_types = 94
-        self.shift = shift
-        self.scale = scale
-        self.grad_mode = eqnorm["grad_mode"]
+        
+        super().__init__(**kwargs)
+        self.type_map = model_params["type_map"]
+        self.type_map_index = torch.tensor([element_dict[type] for type in self.type_map])
+        # self.num_types = self.type_map_index.max() + 1
+        self.num_types = 93
+        self.numb_fparam = 0
 
-        if eqnorm["shift_trainable"] and self.shift is not None:
+        ntypes = self.get_ntypes()
+        
+        model_config_copy = copy.deepcopy(model_params["eqnorm"])
+        self.default_fparam = model_config_copy.pop("default_fparam", [0.0, 1.0])
+        
+        # self.max_out_size = 1
+        # self.bias_keys: list[str] = ["energy"]
+        # self.n_out = len(self.bias_keys)
+        # out_bias_data = torch.zeros(
+        #     [self.n_out, ntypes, self.max_out_size], dtype=dtype, device=device
+        # )
+        # out_std_data = torch.ones(
+        #     [self.n_out, ntypes, self.max_out_size], dtype=dtype, device=device
+        # )
+        # self.register_buffer("out_bias", out_bias_data)
+        # self.register_buffer("out_std", out_std_data)
+        # self.register_buffer(
+        #     "default_fparam_tensor",
+        #     torch.tensor(
+        #         np.array(self.default_fparam), dtype=dtype, device=device
+        #     ),
+        # )
+
+        self.hidden_dim = model_params["eqnorm"]["num_features"]
+        self.r_cutoff = model_params["eqnorm"]["r_cutoff"]  # A
+        
+        self.shift = energy_shift
+        self.scale = energy_scale
+
+        self.grad_mode = model_params["eqnorm"]["grad_mode"]
+        
+        if model_params["eqnorm"]["shift_trainable"] and self.shift is not None:
             self.shift = torch.nn.Parameter(self.shift)
-        if eqnorm["scale_trainable"] and self.scale is not None:
+        if model_params["eqnorm"]["scale_trainable"] and self.scale is not None:
             self.scale = torch.nn.Parameter(self.scale)
 
-        self.calc_stress = eqnorm["STRESS"]
-        self.calc_dipole = eqnorm["DIPOLE"]
-        self.calc_polar = eqnorm["POLAR"]
+        self.calc_stress = model_params["eqnorm"]["STRESS"]
+        self.calc_dipole = model_params["eqnorm"]["DIPOLE"]
+        self.calc_polar = model_params["eqnorm"]["POLAR"]
 
         self.e3nn_layer = E3NN(
-            irreps_hidden=eqnorm["irreps_hidden"], 
-            irreps_sh=eqnorm["irreps_sh"],
-            num_conv_layers=eqnorm["num_convs"], 
+            irreps_hidden=model_params["eqnorm"]["irreps_hidden"], 
+            irreps_sh=model_params["eqnorm"]["irreps_sh"],
+            num_conv_layers=model_params["eqnorm"]["num_convs"], 
             num_types=self.num_types, 
-            num_features=eqnorm["num_features"],
+            num_features=model_params["eqnorm"]["num_features"],
             max_radius=self.r_cutoff, 
-            num_basis=eqnorm["num_basis"], 
-            invariant_layers=eqnorm["invariant_layers"],
-            invariant_neurons=eqnorm["invariant_neurons"],
-            poly_p=eqnorm["poly_p"],
-            avg_num_neighbors=eqnorm["avg_nbr"],
+            num_basis=model_params["eqnorm"]["num_basis"], 
+            invariant_layers=model_params["eqnorm"]["invariant_layers"],
+            invariant_neurons=model_params["eqnorm"]["invariant_neurons"],
+            poly_p=model_params["eqnorm"]["poly_p"],
+            avg_num_neighbors=model_params["eqnorm"]["avg_nbr"],
             )
         
         if self.grad_mode == 'edge':
@@ -1255,95 +983,376 @@ class Eqnorm(BaseDescriptor, torch.nn.Module):
             self.force_stress_output = NodewiseGrad(calc_stress=self.calc_stress)
         else:
             raise NotImplementedError(f"grad_mode {self.grad_mode} not implemented.")
+
+        self.calculator = vesin.NeighborList(cutoff=self.r_cutoff, full_list=True, sorted=False)
         
-    def __setitem__(self, key, value) -> None:
-        if key in ("avg", "data_avg", "davg"):
-            self.mean = value
-        elif key in ("std", "data_std", "dstd"):
-            self.stddev = value
+    def get_type_map(self) -> list[str]:
+        """Get the type map."""
+        return self.type_map
+
+    def compute_or_load_stat(
+        self,
+        sampled_func,  # noqa: ANN001
+        stat_file_path: Optional[DPPath] = None,
+    ) -> None:
+        """Compute or load the statistics parameters of the model.
+
+        For example, mean and standard deviation of descriptors or the energy bias of
+        the fitting net. When `sampled` is provided, all the statistics parameters will
+        be calculated (or re-calculated for update), and saved in the
+        `stat_file_path`(s). When `sampled` is not provided, it will check the existence
+        of `stat_file_path`(s) and load the calculated statistics parameters.
+
+        Parameters
+        ----------
+        sampled_func
+            The sampled data frames from different data systems.
+        stat_file_path
+            The path to the statistics files.
+        """
+        if stat_file_path is not None and self.type_map is not None:
+            # descriptors and fitting net with different type_map
+            # should not share the same parameters
+            stat_file_path /= " ".join(self.type_map)
+
+        @functools.lru_cache
+        def wrapped_sampler():
+            sampled = sampled_func()
+            return sampled
+
+        self.compute_or_load_out_stat(wrapped_sampler, stat_file_path)
+
+    def compute_or_load_out_stat(
+        self,
+        merged: Union[Callable[[], list[dict]], list[dict]],
+        stat_file_path: Optional[DPPath] = None,
+    ) -> None:
+        """
+        Compute the output statistics (e.g. energy bias) for the fitting net from packed data.
+
+        Parameters
+        ----------
+        merged : Union[Callable[[], list[dict]], list[dict]]
+            - list[dict]: A list of data samples from various data systems.
+                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
+                originating from the `i`-th data system.
+            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
+                only when needed. Since the sampling process can be slow and memory-intensive,
+                the lazy function helps by only sampling once.
+        stat_file_path : Optional[DPPath]
+            The path to the stat file.
+
+        """
+        self.change_out_bias(
+            merged,
+            stat_file_path=stat_file_path,
+            bias_adjust_mode="set-by-statistic",
+        )
+
+    def change_out_bias(
+        self,
+        sample_merged,
+        stat_file_path: Optional[DPPath] = None,
+        bias_adjust_mode="change-by-statistic",
+    ) -> None:
+        """Change the output bias according to the input data and the pretrained model.
+
+        Parameters
+        ----------
+        sample_merged : Union[Callable[[], list[dict]], list[dict]]
+            - list[dict]: A list of data samples from various data systems.
+                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
+                originating from the `i`-th data system.
+            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
+                only when needed. Since the sampling process can be slow and memory-intensive,
+                the lazy function helps by only sampling once.
+        bias_adjust_mode : str
+            The mode for changing output bias : ['change-by-statistic', 'set-by-statistic']
+            'change-by-statistic' : perform predictions on labels of target dataset,
+                    and do least square on the errors to obtain the target shift as bias.
+            'set-by-statistic' : directly use the statistic output bias in the target dataset.
+        stat_file_path : Optional[DPPath]
+            The path to the stat file.
+        """
+        if bias_adjust_mode == "set-by-statistic":
+            bias_out, std_out = compute_output_stats(
+                sample_merged,
+                len(self.type_map),
+                keys=['energy'],
+                stat_file_path=stat_file_path,
+                stats_distinguish_types=True,
+                intensive=False,
+            )
+            self._store_out_stat(bias_out, std_out)
         else:
-            raise KeyError(key)
+            raise RuntimeError("Unknown bias_adjust_mode mode: " + bias_adjust_mode)
 
-    def __getitem__(self, key):
-        if key in ("avg", "data_avg", "davg"):
-            return self.mean
-        elif key in ("std", "data_std", "dstd"):
-            return self.stddev
-        else:
-            raise KeyError(key)
+    def _store_out_stat(
+        self,
+        out_bias: dict[str, torch.Tensor],
+        out_std: dict[str, torch.Tensor],
+        add: bool = False,
+    ) -> None:
+        pass
+
+    def _varsize(
+        self,
+        shape: list[int],
+    ) -> int:
+        output_size = 1
+        len_shape = len(shape)
+        for i in range(len_shape):
+            output_size *= shape[i]
+        return output_size
+
+    def _get_bias_index(
+        self,
+        kk: str,
+    ) -> int:
+        res: list[int] = []
+        for i, e in enumerate(self.bias_keys):
+            if e == kk:
+                res.append(i)
+        assert len(res) == 1
+        return res[0]
 
 
+    @torch.jit.export
+    def fitting_output_def(self) -> FittingOutputDef:
+        """Get the output def of developer implemented atomic models."""
+        return FittingOutputDef(
+            [
+                OutputVariableDef(
+                    name="energy",
+                    shape=[1],
+                    reducible=True,
+                    r_differentiable=True,
+                    c_differentiable=True,
+                ),
+            ],
+        )
+
+    @torch.jit.export
+    def get_rcut(self) -> float:
+        """Get the cut-off radius."""
+        return self.r_cutoff
+
+    @torch.jit.export
+    def get_type_map(self) -> list[str]:
+        """Get the type map."""
+        return self.type_map
+
+    @torch.jit.export
+    def get_sel(self) -> list[int]:
+        """Return the number of selected atoms for each type."""
+        return [self.sel]
+
+    @torch.jit.export
+    def get_dim_fparam(self) -> int:
+        """Get the number (dimension) of frame parameters of this atomic model."""
+        return self.numb_fparam
+
+    @torch.jit.export
+    def get_dim_aparam(self) -> int:
+        """Get the number (dimension) of atomic parameters of this atomic model."""
+        return 0
+
+    @torch.jit.export
+    def get_sel_type(self) -> list[int]:
+        """Get the selected atom types of this model.
+
+        Only atoms with selected atom types have atomic contribution
+        to the result of the model.
+        If returning an empty list, all atom types are selected.
+        """
+        return []
+
+    @torch.jit.export
+    def is_aparam_nall(self) -> bool:
+        """Check whether the shape of atomic parameters is (nframes, nall, ndim).
+
+        If False, the shape is (nframes, nloc, ndim).
+        """
+        return False
+
+    @torch.jit.export
+    def mixed_types(self) -> bool:
+        """Return whether the model is in mixed-types mode.
+
+        If true, the model
+        1. assumes total number of atoms aligned across frames;
+        2. uses a neighbor list that does not distinguish different atomic types.
+        If false, the model
+        1. assumes total number of atoms of each atom type aligned across frames;
+        2. uses a neighbor list that distinguishes different atomic types.
+        """
+        return True
+
+    @torch.jit.export
+    def has_message_passing(self) -> bool:
+        """Return whether the descriptor has message passing."""
+        return False
+
+    def has_default_fparam(self) -> bool:
+        return True
+
+    def get_default_fparam(self) -> Optional[torch.Tensor]:
+        self.default_fparam_tensor = torch.tensor([0.0,1.0])
+        return self.default_fparam_tensor
+
+    @torch.jit.export
     def forward(
-            self, 
-            coord: torch.Tensor,
-            extended_coord: torch.Tensor,
-            extended_atype: torch.Tensor,
-            nlist: torch.Tensor,
-            box: Optional[torch.Tensor] = None,
-            mapping: Optional[torch.Tensor] = None,
-            comm_dict: Optional[dict[str, torch.Tensor]] = None,
-            data: dict[str, torch.Tensor] = None, 
-            training: bool = True,  # determine whether to create graph for autograd
-            ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None, None]:
-        device = extended_coord.device
-        extended_coord = extended_coord.to(torch.float32)
-        nframes, nloc, nnei = nlist.shape
-        nall = extended_coord.view(nframes, -1).shape[1] // 3
-        e_sel = 1200
-        coord = extended_coord[:,:nloc,:]
-        atype = extended_atype[:, :nloc]
-        # nb x nloc x nnei x 4, nb x nloc x nnei x 3, nb x nloc x nnei x 1
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        box: Optional[torch.Tensor] = None,
+        fparam: Optional[torch.Tensor] = None,
+        aparam: Optional[torch.Tensor] = None,
+        do_atomic_virial: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        nframes, nloc, ndim = coord.shape
+        device = coord.device
+        data_batch = []
         
-        dmatrix, diff, sw = prod_env_mat(
-            extended_coord,
-            nlist,
-            atype,
-            mean=None,
-            stddev=None,
-            rcut=6.0,
-            rcut_smth=5.3,
-            normalize=False,
-        )
-        edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
-        
-        nlist_mask = nlist != -1
-        
-        edge_index = get_graph_index(
-            nlist,
-            nlist_mask,
-            nall,
-        )
-        
-        edge_diff = diff[nlist_mask]
-        edge_input = edge_input[nlist_mask]
-        # n_edge x 3
-        h2 = h2[nlist_mask]
-        # n_edge
-        sw = sw[nlist_mask]
-        # n_edge x 4
-        dmatrix = dmatrix[nlist_mask]
+        box = box.reshape(-1, 3, 3)
 
-        edge_index = edge_index.transpose(0, 1)
-        edge_index[1] = edge_index[1] % nloc
-        batch = torch.repeat_interleave(torch.arange(nframes, device=device), nloc)
-        data = {
-            'pos': coord.reshape(-1, 3),
-            'edge_index': edge_index,
-            'edge_vec': edge_diff,
-            'atomic_numbers': self.type_map_index[atype.cpu().view(-1)].to(device),
-            'batch': batch,
-        }
+        for i in range(nframes):
+            idx_i, idx_j, shifts = self.calculator.compute(
+                points=coord[i].cpu().numpy(), 
+                box=box[i].cpu().numpy(), 
+                periodic=True, 
+                quantities="ijS"
+                )
+            idx_i, idx_j = idx_i.astype(np.int64), idx_j.astype(np.int64)
         
-        energy = self.e3nn_layer(data).reshape(nframes, nloc, -1)
+            idx_i, idx_j, shifts = torch.tensor(idx_i).long(), torch.tensor(idx_j).long(), torch.tensor(shifts).long()
+
+            data = Data(
+                x=None, y=None, pos=torch.tensor(coord[i]).float(),  # A
+                edge_index=torch.vstack([idx_i, idx_j]).long(),
+                atomic_numbers=self.type_map_index[atype[i].cpu()]-1,
+                shifts=shifts,  # for pbc, D = pos_j - pos_i + shifts @ cell or D = pos_i - pos_j - shifts @ cell
+                cell=torch.tensor(box[i].unsqueeze(0)).float(),  # for pbc, A
+            )
+            
+            data_batch.append(data)
+        data = Batch.from_data_list(data_batch).to(device).to_dict()
+        
+        data['pos'] = data['pos'].requires_grad_(True)
+
+        if self.calc_stress and self.grad_mode == 'node':
+            data['displacement'] = torch.zeros((3, 3), dtype=data['pos'].dtype, device=data['pos'].device)
+            data['displacement'] = data['displacement'].view(-1, 3, 3).expand(data['batch'][-1] + 1, 3, 3)  # (N_batch, 3, 3)
+            data['displacement'] = data['displacement'].requires_grad_(True)
+            data['symmetric_displacement'] = 0.5 * (data['displacement'] + data['displacement'].transpose(-1, -2))
+            data['pos'] = data['pos'] + torch.bmm(
+                data['pos'].unsqueeze(-2), data['symmetric_displacement'][data['batch']]
+            ).squeeze(-2)
+            data['cell'] = data['cell'] + torch.bmm(data['cell'], data['symmetric_displacement'])
+
+        # calc edge vectors depending on periodicity
+        if 'shifts' in data and 'cell' in data:
+            pbc_shift = torch.einsum("ni,nij->nj", data['shifts'].float(), data['cell'][data['batch']][data['edge_index'][0]])
+            data['edge_vec'] = data['pos'][data['edge_index'][1]] - data['pos'][data['edge_index'][0]] + pbc_shift
+        else:
+            data['edge_vec'] = data['pos'][data['edge_index'][1]] - data['pos'][data['edge_index'][0]]
         
 
-        return energy, None, None, None, None
+        energy = self.e3nn_layer(data)
+        
+        if self.scale is not None:
+            self.scale = self.scale.to(device)
+            if self.scale.dim() == 0:
+                energy = energy * self.scale
+            else:
+                energy = energy * self.scale[data['atomic_numbers']]
+        if self.shift is not None:
+            self.shift = self.shift.to(device)
+            if self.shift.dim() == 0:
+                energy = energy + self.shift
+            else:
+                energy = energy + self.shift[data['atomic_numbers']]
+        # reduced_energy = torch.zeros(data['batch'][-1] + 1, 1, device=energy.device, dtype=energy.dtype)
+        # reduced_energy.index_add_(0, data['batch'], energy)
+        # energy = reduced_energy
+        energy = scatter(energy, data['batch'], dim=0, dim_size=data['batch'][-1] + 1).squeeze(-1)
+        
+        forces, stress = self.force_stress_output(energy, data, training=True)
 
+        if self.calc_dipole:
+            dipole = None
+        else:
+            dipole = None
+        
+        if self.calc_polar:
+            polar = None
+        else:
+            polar = None
+
+        virial = torch.zeros((nframes, 3,3), dtype=energy.dtype, device=energy.device)
+        
+        for i in range(nframes):
+            s_xx, s_yy, s_zz, s_yz, s_zx, s_xy = stress[i].unbind(dim=-1)
+            virial[i] = torch.stack([
+                    torch.stack([s_xx, s_xy, s_zx], dim=-1),
+                    torch.stack([s_xy, s_yy, s_yz], dim=-1),
+                    torch.stack([s_zx, s_yz, s_zz], dim=-1)], dim=-2)
+        
+        model_predict = {}
+        model_predict["energy"] = energy
+        model_predict["force"] = forces.view(nframes, nloc, 3)
+        model_predict["virial"] = virial.view(nframes, 9)
+        return model_predict
+
+    @torch.jit.export
+    def forward_lower(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: Optional[torch.Tensor] = None,
+        fparam: Optional[torch.Tensor] = None,
+        aparam: Optional[torch.Tensor] = None,
+        do_atomic_virial: bool = False,
+        comm_dict: Optional[dict[str, torch.Tensor]] = None,
+    ) -> dict[str, torch.Tensor]:
+        raise NotImplementedError
+
+    def forward_lower_common(
+        self,
+        nloc: int,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: Optional[torch.Tensor] = None,
+        fparam: Optional[torch.Tensor] = None,
+        aparam: Optional[torch.Tensor] = None,
+        do_atomic_virial: bool = False,  # noqa: ARG002
+        comm_dict: Optional[dict[str, torch.Tensor]] = None,
+    ) -> dict[str, torch.Tensor]:
+        raise NotImplementedError
+
+    def serialize(self) -> dict:
+        raise NotImplementedError
+
+    @classmethod
+    def deserialize(cls, data: dict):
+        raise NotImplementedError
+
+    @torch.jit.export
+    def get_nnei(self) -> int:
+        """Return the total number of selected neighboring atoms in cut-off radius."""
+        raise NotImplementedError
+
+    @torch.jit.export
+    def get_nsel(self) -> int:
+        """Return the total number of selected neighboring atoms in cut-off radius."""
+        raise NotImplementedError
 
     @classmethod
     def update_sel(
         cls,
-        train_data: DeepmdDataSystem,
+        train_data,
         type_map: Optional[list[str]],
         local_jdata: dict,
     ) -> tuple[dict, Optional[float]]:
@@ -1352,7 +1361,7 @@ class Eqnorm(BaseDescriptor, torch.nn.Module):
         Parameters
         ----------
         train_data : DeepmdDataSystem
-            data used to do neighbor statistics
+            data used to do neighbor statictics
         type_map : list[str], optional
             The name of each type of atoms
         local_jdata : dict
@@ -1365,294 +1374,17 @@ class Eqnorm(BaseDescriptor, torch.nn.Module):
         float
             The minimum distance between two atoms
         """
-        local_jdata_cpy = local_jdata.copy()
-        update_sel = UpdateSel()
-        min_nbor_dist, repflow_e_sel = update_sel.update_one_sel(
-            train_data,
-            type_map,
-            local_jdata_cpy["repflow"]["e_rcut"],
-            local_jdata_cpy["repflow"]["e_sel"],
-            True,
-        )
-        local_jdata_cpy["repflow"]["e_sel"] = repflow_e_sel[0]
+        raise NotImplementedError
 
-        min_nbor_dist, repflow_a_sel = update_sel.update_one_sel(
-            train_data,
-            type_map,
-            local_jdata_cpy["repflow"]["a_rcut"],
-            local_jdata_cpy["repflow"]["a_sel"],
-            True,
-        )
-        local_jdata_cpy["repflow"]["a_sel"] = repflow_a_sel[0]
+    @torch.jit.export
+    def model_output_type(self) -> list[str]:
+        """Get the output type for the model."""
+        return ["energy"]
 
-        return local_jdata_cpy, min_nbor_dist
+    def translated_output_def(self):
+        """Get the translated output def for the model."""
+        raise NotImplementedError
 
-    def enable_compression(
-        self,
-        min_nbor_dist: float,
-        table_extrapolate: float = 5,
-        table_stride_1: float = 0.01,
-        table_stride_2: float = 0.1,
-        check_frequency: int = -1,
-    ) -> None:
-        """Receive the statistics (distance, max_nbor_size and env_mat_range) of the training data.
-
-        Parameters
-        ----------
-        min_nbor_dist
-            The nearest distance between atoms
-        table_extrapolate
-            The scale of model extrapolation
-        table_stride_1
-            The uniform stride of the first table
-        table_stride_2
-            The uniform stride of the second table
-        check_frequency
-            The overflow check frequency
-        """
-        raise NotImplementedError("Compression is unsupported for DPA3.")
-
-    def get_rcut(self) -> float:
-        """Returns the cut-off radius."""
-        return self.r_cutoff
-
-    def get_rcut_smth(self) -> float:
-        """Returns the radius where the neighbor information starts to smoothly decay to 0."""
-        return self.rcut_smth
-
-    def get_nsel(self) -> int:
-        """Returns the number of selected atoms in the cut-off radius."""
-        return sum(self.sel)
-
-    def get_sel(self) -> list[int]:
-        """Returns the number of selected atoms for each type."""
-        return [1200]
-
-    def get_ntypes(self) -> int:
-        """Returns the number of element types."""
-        return self.ntypes
-
-    def get_type_map(self) -> list[str]:
-        """Get the name to each type of atoms."""
-        return self.type_map
-
-    def get_dim_out(self) -> int:
-        """Returns the output dimension of this descriptor."""
-        return self.hidden_dim
-
-    def get_dim_emb(self) -> int:
-        """Returns the embedding dimension of this descriptor."""
-        return self.hidden_dim
-
-
-    def mixed_types(self) -> bool:
-        """If true, the descriptor
-        1. assumes total number of atoms aligned across frames;
-        2. requires a neighbor list that does not distinguish different atomic types.
-
-        If false, the descriptor
-        1. assumes total number of atoms of each atom type aligned across frames;
-        2. requires a neighbor list that distinguishes different atomic types.
-
-        """
-        return True
-
-    def has_message_passing(self) -> bool:
-        """Returns whether the descriptor has message passing."""
-        return self.repflows.has_message_passing()
-
-    def need_sorted_nlist_for_lower(self) -> bool:
-        """Returns whether the descriptor needs sorted nlist when using `forward_lower`."""
-        return True
-
-    def get_env_protection(self) -> float:
-        """Returns the protection of building environment matrix."""
-        return self.repflows.get_env_protection()
-
-    def share_params(self, base_class, shared_level, resume=False) -> None:
-        """
-        Share the parameters of self to the base_class with shared_level during multitask training.
-        If not start from checkpoint (resume is False),
-        some separated parameters (e.g. mean and stddev) will be re-calculated across different classes.
-        """
-        assert (
-            self.__class__ == base_class.__class__
-        ), "Only descriptors of the same type can share params!"
-        # For DPA3 descriptors, the user-defined share-level
-        # shared_level: 0
-        # share all parameters in type_embedding, repflow
-        if shared_level == 0:
-            self._modules["type_embedding"] = base_class._modules["type_embedding"]
-            self.repflows.share_params(base_class.repflows, 0, resume=resume)
-        # shared_level: 1
-        # share all parameters in type_embedding
-        elif shared_level == 1:
-            self._modules["type_embedding"] = base_class._modules["type_embedding"]
-        # Other shared levels
-        else:
-            raise NotImplementedError
-
-    def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat=None
-    ) -> None:
-        """Change the type related params to new ones, according to `type_map` and the original one in the model.
-        If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
-        """
-        assert (
-            self.type_map is not None
-        ), "'type_map' must be defined when performing type changing!"
-        remap_index, has_new_type = get_index_between_two_maps(self.type_map, type_map)
-        self.type_map = type_map
-        self.type_embedding.change_type_map(type_map=type_map)
-        self.exclude_types = map_pair_exclude_types(self.exclude_types, remap_index)
-        self.ntypes = len(type_map)
-        repflow = self.repflows
-        if has_new_type:
-            # the avg and std of new types need to be updated
-            extend_descrpt_stat(
-                repflow,
-                type_map,
-                des_with_stat=model_with_new_type_stat.repflows
-                if model_with_new_type_stat is not None
-                else None,
-            )
-        repflow.ntypes = self.ntypes
-        repflow.reinit_exclude(self.exclude_types)
-        repflow["davg"] = repflow["davg"][remap_index]
-        repflow["dstd"] = repflow["dstd"][remap_index]
-
-    @property
-    def dim_out(self):
-        return self.get_dim_out()
-
-    @property
-    def dim_emb(self):
-        """Returns the embedding dimension g2."""
-        return self.get_dim_emb()
-
-    def compute_input_stats(
-        self,
-        merged: Union[Callable[[], list[dict]], list[dict]],
-        path: Optional[DPPath] = None,
-    ) -> None:
-        """
-        Compute the input statistics (e.g. mean and stddev) for the descriptors from packed data.
-
-        Parameters
-        ----------
-        merged : Union[Callable[[], list[dict]], list[dict]]
-            - list[dict]: A list of data samples from various data systems.
-                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
-                originating from the `i`-th data system.
-            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
-                only when needed. Since the sampling process can be slow and memory-intensive,
-                the lazy function helps by only sampling once.
-        path : Optional[DPPath]
-            The path to the stat file.
-
-        """
-        if self.skip_stat and self.set_davg_zero:
-            return
-        env_mat_stat = EnvMatStatSe(self)
-        if path is not None:
-            path = path / env_mat_stat.get_hash()
-        if path is None or not path.is_dir():
-            if callable(merged):
-                # only get data for once
-                sampled = merged()
-            else:
-                sampled = merged
-        else:
-            sampled = []
-        env_mat_stat.load_or_compute_stats(sampled, path)
-        self.stats = env_mat_stat.stats
-        mean, stddev = env_mat_stat()
-        if not self.set_davg_zero:
-            self.mean.copy_(
-                torch.tensor(mean, device=env.DEVICE, dtype=self.mean.dtype)
-            )
-        self.stddev.copy_(
-            torch.tensor(stddev, device=env.DEVICE, dtype=self.stddev.dtype)
-        )
-
-    def set_stat_mean_and_stddev(
-        self,
-        mean: list[torch.Tensor],
-        stddev: list[torch.Tensor],
-    ) -> None:
-        pass
-
-    def get_stat_mean_and_stddev(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Get mean and stddev for descriptor."""
-        mean_list = [self.repflows.mean]
-        stddev_list = [self.repflows.stddev]
-        return mean_list, stddev_list
-
-    def serialize(self) -> dict:
-        repflows = self.repflows
-        data = {
-            "@class": "Descriptor",
-            "type": "dpa3",
-            "@version": 1,
-            "ntypes": self.ntypes,
-            "repflow_args": self.repflow_args.serialize(),
-            "concat_output_tebd": self.concat_output_tebd,
-            "activation_function": self.activation_function,
-            "precision": self.precision,
-            "exclude_types": self.exclude_types,
-            "env_protection": self.env_protection,
-            "trainable": self.trainable,
-            "use_econf_tebd": self.use_econf_tebd,
-            "use_tebd_bias": self.use_tebd_bias,
-            "type_map": self.type_map,
-            "type_embedding": self.type_embedding.embedding.serialize(),
-        }
-        repflow_variable = {
-            "edge_embd": repflows.edge_embd.serialize(),
-            "angle_embd": repflows.angle_embd.serialize(),
-            "repflow_layers": [layer.serialize() for layer in repflows.layers],
-            "env_mat": DPEnvMat(repflows.rcut, repflows.rcut_smth).serialize(),
-            "@variables": {
-                "davg": to_numpy_array(repflows["davg"]),
-                "dstd": to_numpy_array(repflows["dstd"]),
-            },
-        }
-        data.update(
-            {
-                "repflow_variable": repflow_variable,
-            }
-        )
-        return data
-
-    @classmethod
-    def deserialize(cls, data: dict) -> "Eqnorm":
-        data = data.copy()
-        version = data.pop("@version")
-        check_version_compatibility(version, 1, 1)
-        data.pop("@class")
-        data.pop("type")
-        repflow_variable = data.pop("repflow_variable").copy()
-        type_embedding = data.pop("type_embedding")
-        data["repflow"] = EqnormArgs(**data.pop("repflow_args"))
-        obj = cls(**data)
-        obj.type_embedding.embedding = TypeEmbedNetConsistent.deserialize(
-            type_embedding
-        )
-
-        def t_cvt(xx):
-            return torch.tensor(xx, dtype=obj.repflows.prec, device=env.DEVICE)
-
-        # deserialize repflow
-        statistic_repflows = repflow_variable.pop("@variables")
-        env_mat = repflow_variable.pop("env_mat")
-        repflow_layers = repflow_variable.pop("repflow_layers")
-        obj.repflows.edge_embd = MLPLayer.deserialize(repflow_variable.pop("edge_embd"))
-        obj.repflows.angle_embd = MLPLayer.deserialize(
-            repflow_variable.pop("angle_embd")
-        )
-        obj.repflows["davg"] = t_cvt(statistic_repflows["davg"])
-        obj.repflows["dstd"] = t_cvt(statistic_repflows["dstd"])
-        obj.repflows.layers = torch.nn.ModuleList(
-            [RepFlowLayer.deserialize(layer) for layer in repflow_layers]
-        )
-        return obj
+    def model_output_def(self):
+        """Get the output def for the model."""
+        raise NotImplementedError
