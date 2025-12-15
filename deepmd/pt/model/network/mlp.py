@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-import math
 from typing import (
+    Any,
     ClassVar,
     Optional,
     Union,
@@ -9,6 +9,7 @@ from typing import (
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from deepmd.pt.utils import (
     env,
@@ -26,12 +27,9 @@ from deepmd.dpmodel.utils import (
     make_multilayer_network,
 )
 from deepmd.pt.model.network.init import (
-    _calculate_fan_in_and_fan_out,
     kaiming_normal_,
-    kaiming_uniform_,
     normal_,
     trunc_normal_,
-    uniform_,
     xavier_uniform_,
 )
 from deepmd.pt.utils.env import (
@@ -44,12 +42,9 @@ from deepmd.pt.utils.utils import (
     to_numpy_array,
     to_torch_tensor,
 )
-from deepmd.utils.version import (
-    check_version_compatibility,
-)
 
 
-def empty_t(shape, precision):
+def empty_t(shape: tuple[int, ...], precision: torch.dtype) -> torch.Tensor:
     return torch.empty(shape, dtype=precision, device=device)
 
 
@@ -78,8 +73,8 @@ class Identity(nn.Module):
 class MLPLayer(nn.Module):
     def __init__(
         self,
-        num_in,
-        num_out,
+        num_in: int,
+        num_out: int,
         bias: bool = True,
         use_timestep: bool = False,
         activation_function: Optional[str] = None,
@@ -89,8 +84,10 @@ class MLPLayer(nn.Module):
         precision: str = DEFAULT_PRECISION,
         init: str = "default",
         seed: Optional[Union[int, list[int]]] = None,
+        trainable: bool = True,
     ) -> None:
         super().__init__()
+        self.trainable = trainable
         # only use_timestep when skip connection is established.
         self.use_timestep = use_timestep and (
             num_out == num_in or num_out == num_in * 2
@@ -115,8 +112,6 @@ class MLPLayer(nn.Module):
             self.idt = None
         self.resnet = resnet
         if init == "default":
-            init = env.MLP_INIT
-        if init == "default":
             self._default_normal_init(
                 bavg=bavg, stddev=stddev, generator=random_generator
             )
@@ -130,8 +125,6 @@ class MLPLayer(nn.Module):
             self._zero_init(self.use_bias)
         elif init == "kaiming_normal":
             self._normal_init(generator=random_generator)
-        elif init == "kaiming_uniform":
-            self._kaiming_uniform_init(generator=random_generator)
         elif init == "final":
             self._zero_init(False)
         else:
@@ -140,7 +133,7 @@ class MLPLayer(nn.Module):
     def check_type_consistency(self) -> None:
         precision = self.precision
 
-        def check_var(var) -> None:
+        def check_var(var: Optional[torch.Tensor]) -> None:
             if var is not None:
                 # assertion "float64" == "double" would fail
                 assert PRECISION_DICT[var.dtype.name] is PRECISION_DICT[precision]
@@ -172,7 +165,7 @@ class MLPLayer(nn.Module):
             normal_(self.idt.data, mean=0.1, std=0.001, generator=generator)
 
     def _trunc_normal_init(
-        self, scale=1.0, generator: Optional[torch.Generator] = None
+        self, scale: float = 1.0, generator: Optional[torch.Generator] = None
     ) -> None:
         # Constant from scipy.stats.truncnorm.std(a=-2, b=2, loc=0., scale=1.)
         TRUNCATED_NORMAL_STDDEV_FACTOR = 0.87962566103423978
@@ -184,7 +177,7 @@ class MLPLayer(nn.Module):
     def _glorot_uniform_init(self, generator: Optional[torch.Generator] = None) -> None:
         xavier_uniform_(self.matrix, gain=1, generator=generator)
 
-    def _zero_init(self, use_bias=True) -> None:
+    def _zero_init(self, use_bias: bool = True) -> None:
         with torch.no_grad():
             self.matrix.fill_(0.0)
             if use_bias and self.bias is not None:
@@ -193,15 +186,6 @@ class MLPLayer(nn.Module):
 
     def _normal_init(self, generator: Optional[torch.Generator] = None) -> None:
         kaiming_normal_(self.matrix, nonlinearity="linear", generator=generator)
-
-    def _kaiming_uniform_init(
-        self, generator: Optional[torch.Generator] = None
-    ) -> None:
-        kaiming_uniform_(self.matrix, a=math.sqrt(5), generator=generator)
-        if self.bias is not None:
-            fan_in, _ = _calculate_fan_in_and_fan_out(self.matrix)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            uniform_(self.bias, -bound, bound)
 
     def forward(
         self,
@@ -222,18 +206,14 @@ class MLPLayer(nn.Module):
         ori_prec = xx.dtype
         if not env.DP_DTYPE_PROMOTION_STRICT:
             xx = xx.to(self.prec)
-        yy = (
-            torch.matmul(xx, self.matrix) + self.bias
-            if self.bias is not None
-            else torch.matmul(xx, self.matrix)
-        )
-        yy = self.activate(yy).clone()
+        yy = F.linear(xx, self.matrix.t(), self.bias)
+        yy = self.activate(yy)
         yy = yy * self.idt if self.idt is not None else yy
         if self.resnet:
             if xx.shape[-1] == yy.shape[-1]:
-                yy += xx
+                yy = yy + xx
             elif 2 * xx.shape[-1] == yy.shape[-1]:
-                yy += torch.concat([xx, xx], dim=-1)
+                yy = yy + torch.concat([xx, xx], dim=-1)
             else:
                 yy = yy
         if not env.DP_DTYPE_PROMOTION_STRICT:
@@ -256,6 +236,7 @@ class MLPLayer(nn.Module):
             activation_function=self.activate_name,
             resnet=self.resnet,
             precision=self.precision,
+            trainable=self.trainable,
         )
         nl.w, nl.b, nl.idt = (
             to_numpy_array(self.matrix),
@@ -282,10 +263,11 @@ class MLPLayer(nn.Module):
             activation_function=nl["activation_function"],
             resnet=nl["resnet"],
             precision=nl["precision"],
+            trainable=nl["trainable"],
         )
         prec = PRECISION_DICT[obj.precision]
 
-        def check_load_param(ss):
+        def check_load_param(ss: str) -> Optional[nn.Parameter]:
             return (
                 nn.Parameter(data=to_torch_tensor(nl[ss]))
                 if nl[ss] is not None
@@ -298,88 +280,11 @@ class MLPLayer(nn.Module):
         return obj
 
 
-class FeedForward(nn.Module):
-    """
-    A feed forward network with two linear layers and an activation function.
-    No dropout, no gate and no residual connection.
-    """
-
-    def __init__(
-        self,
-        num_in: int,
-        num_out: int,
-        hidden_dim: int,
-        activation_function: Optional[str] = None,
-        bias: bool = False,
-    ) -> None:
-        super().__init__()
-        self.num_in = num_in
-        self.num_out = num_out
-        self.hidden_dim = hidden_dim
-        self.activation_function = activation_function
-        self.bias = bias
-        self.w1 = MLPLayer(
-            num_in=num_in,
-            num_out=hidden_dim,
-            bias=bias,
-        )
-        self.act = ActivationFn(activation_function)
-        self.w2 = MLPLayer(
-            num_in=hidden_dim,
-            num_out=num_out,
-            bias=bias,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(self.act(self.w1(x)))
-
-    def serialize(self) -> dict:
-        """Serialize the networks to a dict.
-
-        Returns
-        -------
-        dict
-            The serialized networks.
-        """
-        data = {
-            "@class": "FeedForward",
-            "@version": 1,
-            "num_in": self.num_in,
-            "num_out": self.num_out,
-            "hidden_dim": self.hidden_dim,
-            "activation_function": self.activation_function,
-            "bias": self.bias,
-            "w1": self.w1.serialize(),
-            "w2": self.w2.serialize(),
-        }
-        return data
-
-    @classmethod
-    def deserialize(cls, data: dict) -> "FeedForward":
-        """Deserialize the networks from a dict.
-
-        Parameters
-        ----------
-        data : dict
-            The dict to deserialize from.
-        """
-        data = data.copy()
-        check_version_compatibility(data.pop("@version"), 1, 1)
-        data.pop("@class")
-        w1 = data.pop("w1")
-        w2 = data.pop("w2")
-
-        obj = cls(**data)
-        obj.w1 = MLPLayer.deserialize(w1)
-        obj.w2 = MLPLayer.deserialize(w2)
-        return obj
-
-
 MLP_ = make_multilayer_network(MLPLayer, nn.Module)
 
 
 class MLP(MLP_):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.layers = torch.nn.ModuleList(self.layers)
 
@@ -400,7 +305,7 @@ class NetworkCollection(DPNetworkCollection, nn.Module):
         "fitting_network": FittingNet,
     }
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         # init both two base classes
         DPNetworkCollection.__init__(self, *args, **kwargs)
         nn.Module.__init__(self)

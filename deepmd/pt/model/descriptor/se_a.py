@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import itertools
 from typing import (
+    Any,
     Callable,
     ClassVar,
     Optional,
@@ -23,7 +24,7 @@ from deepmd.pt.utils import (
 )
 from deepmd.pt.utils.env import (
     PRECISION_DICT,
-    RESERVED_PRECISON_DICT,
+    RESERVED_PRECISION_DICT,
 )
 from deepmd.pt.utils.env_mat_stat import (
     EnvMatStatSe,
@@ -93,11 +94,11 @@ if not hasattr(torch.ops.deepmd, "tabulate_fusion_se_a"):
 class DescrptSeA(BaseDescriptor, torch.nn.Module):
     def __init__(
         self,
-        rcut,
-        rcut_smth,
-        sel,
-        neuron=[25, 50, 100],
-        axis_neuron=16,
+        rcut: float,
+        rcut_smth: float,
+        sel: Union[list[int], int],
+        neuron: list[int] = [25, 50, 100],
+        axis_neuron: int = 16,
         set_davg_zero: bool = False,
         activation_function: str = "tanh",
         precision: str = "float64",
@@ -110,7 +111,7 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         ntypes: Optional[int] = None,  # to be compat with input
         type_map: Optional[list[str]] = None,
         # not implemented
-        spin=None,
+        spin: Optional[Any] = None,
     ) -> None:
         del ntypes
         if spin is not None:
@@ -168,7 +169,7 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         """Returns the output dimension."""
         return self.sea.get_dim_emb()
 
-    def mixed_types(self):
+    def mixed_types(self) -> bool:
         """Returns if the descriptor requires a neighbor list that distinguish different
         atomic types or not.
         """
@@ -186,15 +187,17 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         """Returns the protection of building environment matrix."""
         return self.sea.get_env_protection()
 
-    def share_params(self, base_class, shared_level, resume=False) -> None:
+    def share_params(
+        self, base_class: Any, shared_level: int, resume: bool = False
+    ) -> None:
         """
         Share the parameters of self to the base_class with shared_level during multitask training.
         If not start from checkpoint (resume is False),
         some separated parameters (e.g. mean and stddev) will be re-calculated across different classes.
         """
-        assert (
-            self.__class__ == base_class.__class__
-        ), "Only descriptors of the same type can share params!"
+        assert self.__class__ == base_class.__class__, (
+            "Only descriptors of the same type can share params!"
+        )
         # For SeA descriptors, the user-defined share-level
         # shared_level: 0
         # share all parameters in sea
@@ -205,12 +208,12 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
             raise NotImplementedError
 
     @property
-    def dim_out(self):
+    def dim_out(self) -> int:
         """Returns the output dimension of this descriptor."""
         return self.sea.dim_out
 
     def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat=None
+        self, type_map: list[str], model_with_new_type_stat: Optional[Any] = None
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
@@ -225,7 +228,7 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         self,
         merged: Union[Callable[[], list[dict]], list[dict]],
         path: Optional[DPPath] = None,
-    ):
+    ) -> None:
         """
         Compute the input statistics (e.g. mean and stddev) for the descriptors from packed data.
 
@@ -305,7 +308,13 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
-    ):
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """Compute the descriptor.
 
         Parameters
@@ -345,10 +354,12 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         )
         return (
             g1.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+            if rot_mat is not None
+            else None,
             None,
             None,
-            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if sw is not None else None,
         )
 
     def set_stat_mean_and_stddev(
@@ -379,9 +390,11 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
             "set_davg_zero": obj.set_davg_zero,
             "activation_function": obj.activation_function,
             # make deterministic
-            "precision": RESERVED_PRECISON_DICT[obj.prec],
+            "precision": RESERVED_PRECISION_DICT[obj.prec],
             "embeddings": obj.filter_layers.serialize(),
-            "env_mat": DPEnvMat(obj.rcut, obj.rcut_smth).serialize(),
+            "env_mat": DPEnvMat(
+                obj.rcut, obj.rcut_smth, obj.env_protection
+            ).serialize(),
             "exclude_types": obj.exclude_types,
             "env_protection": obj.env_protection,
             "@variables": {
@@ -406,7 +419,7 @@ class DescrptSeA(BaseDescriptor, torch.nn.Module):
         env_mat = data.pop("env_mat")
         obj = cls(**data)
 
-        def t_cvt(xx):
+        def t_cvt(xx: Any) -> torch.Tensor:
             return torch.tensor(xx, dtype=obj.sea.prec, device=env.DEVICE)
 
         obj.sea["davg"] = t_cvt(variables["davg"])
@@ -453,11 +466,11 @@ class DescrptBlockSeA(DescriptorBlock):
 
     def __init__(
         self,
-        rcut,
-        rcut_smth,
-        sel,
-        neuron=[25, 50, 100],
-        axis_neuron=16,
+        rcut: float,
+        rcut_smth: float,
+        sel: Union[int, list[int]],
+        neuron: list[int] = [25, 50, 100],
+        axis_neuron: int = 16,
         set_davg_zero: bool = False,
         activation_function: str = "tanh",
         precision: str = "float64",
@@ -467,7 +480,7 @@ class DescrptBlockSeA(DescriptorBlock):
         type_one_side: bool = True,
         trainable: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Construct an embedding net of type `se_a`.
 
@@ -523,6 +536,7 @@ class DescrptBlockSeA(DescriptorBlock):
                 precision=self.precision,
                 resnet_dt=self.resnet_dt,
                 seed=child_seed(self.seed, ii),
+                trainable=trainable,
             )
         self.filter_layers = filter_layers
         self.stats = None
@@ -599,7 +613,7 @@ class DescrptBlockSeA(DescriptorBlock):
         return self.env_protection
 
     @property
-    def dim_out(self):
+    def dim_out(self) -> int:
         """Returns the output dimension of this descriptor."""
         return self.filter_neuron[-1] * self.axis_neuron
 
@@ -608,7 +622,7 @@ class DescrptBlockSeA(DescriptorBlock):
         """Returns the atomic input dimension of this descriptor."""
         return 0
 
-    def __setitem__(self, key, value) -> None:
+    def __setitem__(self, key: str, value: torch.Tensor) -> None:
         if key in ("avg", "data_avg", "davg"):
             self.mean = value
         elif key in ("std", "data_std", "dstd"):
@@ -616,7 +630,7 @@ class DescrptBlockSeA(DescriptorBlock):
         else:
             raise KeyError(key)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> torch.Tensor:
         if key in ("avg", "data_avg", "davg"):
             return self.mean
         elif key in ("std", "data_std", "dstd"):
@@ -726,7 +740,13 @@ class DescrptBlockSeA(DescriptorBlock):
         extended_atype_embd: Optional[torch.Tensor] = None,
         mapping: Optional[torch.Tensor] = None,
         type_embedding: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """Calculate decoded embedding for each atom.
 
         Args:

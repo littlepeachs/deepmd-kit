@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 from typing import (
+    Any,
     Callable,
     Optional,
     Union,
@@ -63,6 +64,45 @@ from .repflows import (
 
 @BaseDescriptor.register("dpa3")
 class DescrptDPA3(BaseDescriptor, torch.nn.Module):
+    r"""The DPA3 descriptor[1]_.
+
+    Parameters
+    ----------
+    repflow : Union[RepFlowArgs, dict]
+        The arguments used to initialize the repflow block, see docstr in `RepFlowArgs` for details information.
+    concat_output_tebd : bool, optional
+        Whether to concat type embedding at the output of the descriptor.
+    activation_function : str, optional
+        The activation function in the embedding net.
+    precision : str, optional
+        The precision of the embedding net parameters.
+    exclude_types : list[list[int]], optional
+        The excluded pairs of types which have no interaction with each other.
+        For example, `[[0, 1]]` means no interaction between type 0 and type 1.
+    env_protection : float, optional
+        Protection parameter to prevent division by zero errors during environment matrix calculations.
+        For example, when using paddings, there may be zero distances of neighbors, which may make division by zero error during environment matrix calculations without protection.
+    trainable : bool, optional
+        If the parameters are trainable.
+    seed : int, optional
+        Random seed for parameter initialization.
+    use_econf_tebd : bool, Optional
+        Whether to use electronic configuration type embedding.
+    use_tebd_bias : bool, Optional
+        Whether to use bias in the type embedding layer.
+    use_loc_mapping : bool, Optional
+        Whether to use local atom index mapping in training or non-parallel inference.
+        When True, local indexing and mapping are applied to neighbor lists and embeddings during descriptor computation.
+    type_map : list[str], Optional
+        A list of strings. Give the name to each type of atoms.
+
+    References
+    ----------
+    .. [1] Zhang, D., Peng, A., Cai, C. et al. Graph neural
+       network model for the era of large atomistic models.
+       arXiv preprint arXiv:2506.01686 (2025).
+    """
+
     def __init__(
         self,
         ntypes: int,
@@ -78,56 +118,12 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         seed: Optional[Union[int, list[int]]] = None,
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
-        use_torch_embed: bool = False,
+        use_loc_mapping: bool = True,
         type_map: Optional[list[str]] = None,
     ) -> None:
-        r"""The DPA-3 descriptor.
-
-        Parameters
-        ----------
-        repflow : Union[RepFlowArgs, dict]
-            The arguments used to initialize the repflow block, see docstr in `RepFlowArgs` for details information.
-        concat_output_tebd : bool, optional
-            Whether to concat type embedding at the output of the descriptor.
-        activation_function : str, optional
-            The activation function in the embedding net.
-        precision : str, optional
-            The precision of the embedding net parameters.
-        exclude_types : list[list[int]], optional
-            The excluded pairs of types which have no interaction with each other.
-            For example, `[[0, 1]]` means no interaction between type 0 and type 1.
-        env_protection : float, optional
-            Protection parameter to prevent division by zero errors during environment matrix calculations.
-            For example, when using paddings, there may be zero distances of neighbors, which may make division by zero error during environment matrix calculations without protection.
-        trainable : bool, optional
-            If the parameters are trainable.
-        seed : int, optional
-            Random seed for parameter initialization.
-        use_econf_tebd : bool, Optional
-            Whether to use electronic configuration type embedding.
-        use_tebd_bias : bool, Optional
-            Whether to use bias in the type embedding layer.
-        type_map : list[str], Optional
-            A list of strings. Give the name to each type of atoms.
-
-        Returns
-        -------
-        descriptor:         torch.Tensor
-            the descriptor of shape nb x nloc x n_dim.
-            invariant single-atom representation.
-        g2:                 torch.Tensor
-            invariant pair-atom representation.
-        h2:                 torch.Tensor
-            equivariant pair-atom representation.
-        rot_mat:            torch.Tensor
-            rotation matrix for equivariant fittings
-        sw:                 torch.Tensor
-            The switch function for decaying inverse distance.
-
-        """
         super().__init__()
 
-        def init_subclass_params(sub_data, sub_class):
+        def init_subclass_params(sub_data: Any, sub_class: Any) -> Any:
             if isinstance(sub_data, dict):
                 return sub_class(**sub_data)
             elif isinstance(sub_data, sub_class):
@@ -162,77 +158,51 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             update_style=self.repflow_args.update_style,
             update_residual=self.repflow_args.update_residual,
             update_residual_init=self.repflow_args.update_residual_init,
+            fix_stat_std=self.repflow_args.fix_stat_std,
             optim_update=self.repflow_args.optim_update,
-            skip_stat=self.repflow_args.skip_stat,
-            smooth_angle_init=self.repflow_args.smooth_angle_init,
-            angle_init_use_sin=self.repflow_args.angle_init_use_sin,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
-            angle_multi_freq=self.repflow_args.angle_multi_freq,
+            edge_init_use_dist=self.repflow_args.edge_init_use_dist,
+            use_exp_switch=self.repflow_args.use_exp_switch,
             use_dynamic_sel=self.repflow_args.use_dynamic_sel,
             sel_reduce_factor=self.repflow_args.sel_reduce_factor,
-            use_env_envelope=self.repflow_args.use_env_envelope,
-            use_new_sw=self.repflow_args.use_new_sw,
-            update_dihedral=self.repflow_args.update_dihedral,
-            d_dim=self.repflow_args.d_dim,
-            d_sel=self.repflow_args.d_sel,
-            d_rcut=self.repflow_args.d_rcut,
-            d_rcut_smth=self.repflow_args.d_rcut_smth,
-            use_ffn_node_edge_message=self.repflow_args.use_ffn_node_edge_message,
-            use_ffn_edge_edge_message=self.repflow_args.use_ffn_edge_edge_message,
-            use_ffn_edge_angle_message=self.repflow_args.use_ffn_edge_angle_message,
-            use_ffn_angle_angle_message=self.repflow_args.use_ffn_angle_angle_message,
-            ffn_hidden_dim=self.repflow_args.ffn_hidden_dim,
-            edge_use_concat_rbf=self.repflow_args.edge_use_concat_rbf,
-            edge_use_rbf=self.repflow_args.edge_use_rbf,
-            edge_use_dist=self.repflow_args.edge_use_dist,
-            embed_use_bias=self.repflow_args.embed_use_bias,
-            edge_use_attn=self.repflow_args.edge_use_attn,
-            edge_attn_hidden=self.repflow_args.edge_attn_hidden,
-            edge_attn_head=self.repflow_args.edge_attn_head,
-            edge_attn_use_ln=self.repflow_args.edge_attn_use_ln,
-            edge_rbf_dot_self=self.repflow_args.edge_rbf_dot_self,
-            edge_rbf_dot_message=self.repflow_args.edge_rbf_dot_message,
-            edge_use_esen_rbf=self.repflow_args.edge_use_esen_rbf,
-            edge_use_esen_atom_ebd=self.repflow_args.edge_use_esen_atom_ebd,
-            edge_use_esen_env=self.repflow_args.edge_use_esen_env,
-            residual_pref=self.repflow_args.residual_pref,
-            tebd_use_act=self.repflow_args.tebd_use_act,
-            message_use_self_concat=self.repflow_args.message_use_self_concat,
-            use_combined_output=self.repflow_args.use_combined_output,
+            use_loc_mapping=use_loc_mapping,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
             seed=child_seed(seed, 1),
+            trainable=trainable,
         )
 
         self.use_econf_tebd = use_econf_tebd
+        self.use_loc_mapping = use_loc_mapping
         self.use_tebd_bias = use_tebd_bias
-        self.use_torch_embed = use_torch_embed
         self.type_map = type_map
         self.tebd_dim = self.repflow_args.n_dim
+        self.type_embedding = TypeEmbedNet(
+            ntypes,
+            self.tebd_dim,
+            precision=precision,
+            seed=child_seed(seed, 2),
+            use_econf_tebd=self.use_econf_tebd,
+            use_tebd_bias=use_tebd_bias,
+            type_map=type_map,
+            trainable=trainable,
+        )
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision
         self.prec = PRECISION_DICT[self.precision]
-        if self.use_torch_embed:
-            self.type_embedding = torch.nn.Embedding(
-                ntypes, self.tebd_dim, device=env.DEVICE, dtype=self.prec
-            )
-        else:
-            self.type_embedding = TypeEmbedNet(
-                ntypes,
-                self.tebd_dim,
-                precision=precision,
-                seed=child_seed(seed, 2),
-                use_econf_tebd=self.use_econf_tebd,
-                use_tebd_bias=use_tebd_bias,
-                type_map=type_map,
-            )
         self.exclude_types = exclude_types
         self.env_protection = env_protection
         self.trainable = trainable
 
-        assert self.repflows.e_rcut >= self.repflows.a_rcut
-        assert self.repflows.e_sel >= self.repflows.a_sel
+        assert self.repflows.e_rcut >= self.repflows.a_rcut, (
+            f"Edge radial cutoff (e_rcut: {self.repflows.e_rcut}) "
+            f"must be greater than or equal to angular cutoff (a_rcut: {self.repflows.a_rcut})!"
+        )
+        assert self.repflows.e_sel >= self.repflows.a_sel, (
+            f"Edge sel number (e_sel: {self.repflows.e_sel}) "
+            f"must be greater than or equal to angular sel (a_sel: {self.repflows.a_sel})!"
+        )
 
         self.rcut = self.repflows.get_rcut()
         self.rcut_smth = self.repflows.get_rcut_smth()
@@ -303,15 +273,17 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         """Returns the protection of building environment matrix."""
         return self.repflows.get_env_protection()
 
-    def share_params(self, base_class, shared_level, resume=False) -> None:
+    def share_params(
+        self, base_class: Any, shared_level: int, resume: bool = False
+    ) -> None:
         """
         Share the parameters of self to the base_class with shared_level during multitask training.
         If not start from checkpoint (resume is False),
         some separated parameters (e.g. mean and stddev) will be re-calculated across different classes.
         """
-        assert (
-            self.__class__ == base_class.__class__
-        ), "Only descriptors of the same type can share params!"
+        assert self.__class__ == base_class.__class__, (
+            "Only descriptors of the same type can share params!"
+        )
         # For DPA3 descriptors, the user-defined share-level
         # shared_level: 0
         # share all parameters in type_embedding, repflow
@@ -327,14 +299,14 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             raise NotImplementedError
 
     def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat=None
+        self, type_map: list[str], model_with_new_type_stat: Optional[Any] = None
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
         """
-        assert (
-            self.type_map is not None
-        ), "'type_map' must be defined when performing type changing!"
+        assert self.type_map is not None, (
+            "'type_map' must be defined when performing type changing!"
+        )
         remap_index, has_new_type = get_index_between_two_maps(self.type_map, type_map)
         self.type_map = type_map
         self.type_embedding.change_type_map(type_map=type_map)
@@ -356,11 +328,11 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         repflow["dstd"] = repflow["dstd"][remap_index]
 
     @property
-    def dim_out(self):
+    def dim_out(self) -> int:
         return self.get_dim_out()
 
     @property
-    def dim_emb(self):
+    def dim_emb(self) -> int:
         """Returns the embedding dimension g2."""
         return self.get_dim_emb()
 
@@ -411,7 +383,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         data = {
             "@class": "Descriptor",
             "type": "dpa3",
-            "@version": 1,
+            "@version": 2,
             "ntypes": self.ntypes,
             "repflow_args": self.repflow_args.serialize(),
             "concat_output_tebd": self.concat_output_tebd,
@@ -422,6 +394,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             "trainable": self.trainable,
             "use_econf_tebd": self.use_econf_tebd,
             "use_tebd_bias": self.use_tebd_bias,
+            "use_loc_mapping": self.use_loc_mapping,
             "type_map": self.type_map,
             "type_embedding": self.type_embedding.embedding.serialize(),
         }
@@ -446,7 +419,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
     def deserialize(cls, data: dict) -> "DescrptDPA3":
         data = data.copy()
         version = data.pop("@version")
-        check_version_compatibility(version, 1, 1)
+        check_version_compatibility(version, 2, 1)
         data.pop("@class")
         data.pop("type")
         repflow_variable = data.pop("repflow_variable").copy()
@@ -457,7 +430,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             type_embedding
         )
 
-        def t_cvt(xx):
+        def t_cvt(xx: Any) -> torch.Tensor:
             return torch.tensor(xx, dtype=obj.repflows.prec, device=env.DEVICE)
 
         # deserialize repflow
@@ -482,7 +455,14 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
-    ):
+        debug_dict: Optional[dict] = None,
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """Compute the descriptor.
 
         Parameters
@@ -515,12 +495,16 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             The smooth switch function. shape: nf x nloc x nnei
 
         """
+        parallel_mode = comm_dict is not None
         # cast the input to internal precsion
         extended_coord = extended_coord.to(dtype=self.prec)
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
 
-        node_ebd_ext = self.type_embedding(extended_atype)
+        if not parallel_mode and self.use_loc_mapping:
+            node_ebd_ext = self.type_embedding(extended_atype[:, :nloc])
+        else:
+            node_ebd_ext = self.type_embedding(extended_atype)
         node_ebd_inp = node_ebd_ext[:, :nloc, :]
         # repflows
         node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows(
@@ -530,15 +514,20 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext,
             mapping,
             comm_dict=comm_dict,
+            debug_dict=debug_dict,
         )
         if self.concat_output_tebd:
             node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)
         return (
             node_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            edge_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+            if rot_mat is not None
+            else None,
+            edge_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+            if edge_ebd is not None
+            else None,
+            h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if h2 is not None else None,
+            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if sw is not None else None,
         )
 
     @classmethod

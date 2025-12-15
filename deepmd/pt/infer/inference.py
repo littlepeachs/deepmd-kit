@@ -3,6 +3,10 @@ import logging
 from copy import (
     deepcopy,
 )
+from typing import (
+    Optional,
+    Union,
+)
 
 import torch
 
@@ -25,8 +29,8 @@ log = logging.getLogger(__name__)
 class Tester:
     def __init__(
         self,
-        model_ckpt,
-        head=None,
+        model_ckpt: Union[str, torch.nn.Module],
+        head: Optional[str] = None,
     ) -> None:
         """Construct a DeePMD tester.
 
@@ -55,6 +59,9 @@ class Tester:
                     ] = state_dict[item].clone()
             state_dict = state_dict_head
 
+        model_params.pop(
+            "hessian_mode", None
+        )  # wrapper Hessian to Energy model due to JIT limit
         self.model_params = deepcopy(model_params)
         self.model = get_model(model_params).to(DEVICE)
 

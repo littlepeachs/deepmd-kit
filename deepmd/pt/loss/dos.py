@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+from typing import (
+    Any,
+)
 
 import torch
 
@@ -26,8 +29,8 @@ class DOSLoss(TaskLoss):
         limit_pref_ados: float = 0.0,
         start_pref_acdf: float = 0.0,
         limit_pref_acdf: float = 0.0,
-        inference=False,
-        **kwargs,
+        inference: bool = False,
+        **kwargs: Any,
     ) -> None:
         r"""Construct a loss for local and global tensors.
 
@@ -79,11 +82,21 @@ class DOSLoss(TaskLoss):
         self.has_ados = (start_pref_ados != 0.0 and limit_pref_ados != 0.0) or inference
         self.has_acdf = (start_pref_acdf != 0.0 and limit_pref_acdf != 0.0) or inference
 
-        assert (
-            self.has_dos or self.has_cdf or self.has_ados or self.has_acdf
-        ), AssertionError("Can not assian zero weight both to `pref` and `pref_atomic`")
+        assert self.has_dos or self.has_cdf or self.has_ados or self.has_acdf, (
+            AssertionError(
+                "Can not assian zero weight both to `pref` and `pref_atomic`"
+            )
+        )
 
-    def forward(self, input_dict, model, label, natoms, learning_rate=0.0, mae=False):
+    def forward(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        model: torch.nn.Module,
+        label: dict[str, torch.Tensor],
+        natoms: int,
+        learning_rate: float = 0.0,
+        mae: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
         """Return loss on local and global tensors.
 
         Parameters

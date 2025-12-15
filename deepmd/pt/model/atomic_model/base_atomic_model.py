@@ -49,6 +49,41 @@ device = env.DEVICE
 BaseAtomicModel_ = make_base_atomic_model(torch.Tensor)
 
 
+## Debug
+from typing import Tuple, List
+def filter_tensors_with_grad(tensors: Tuple[torch.Tensor, ...]) -> Tuple[Tuple[torch.Tensor, ...], List[bool]]:
+    """
+        过滤不支持计算梯度的中间激活值和为None的Tensor
+    Args:
+        Tuple[Tensor], 输入中间的激活值
+    Returns:
+        Tuple[Tensor], 输出中间激活值可以计算梯度的部分，
+
+    """
+    
+    mask = [(t is not None) and (t.requires_grad) for t in tensors]
+    filtered = tuple(t for t, m in zip(tensors, mask) if m)
+    return filtered, mask
+
+def filter_tensor_with_mask(grad_outputs: Optional[Union[torch.Tensor, Tuple[Optional[torch.Tensor], ...]]],
+                            mask: List[bool]) -> Optional[Tuple[Optional[torch.Tensor], ...]]:
+    """
+
+    提取与filtered_inputs对应的grad_outputs子集
+    提取mask[i]==True的tensor[i]
+    
+    Args:
+        grad_outputs：需要过滤的Tuple[Tensor]
+        mask： 根据mask来进行选择，如果为True则选择
+    """
+    if grad_outputs is None:
+        return None
+    if isinstance(grad_outputs, torch.Tensor):
+        return grad_outputs  # 单个Tensor不需要mask
+    filtered = tuple(go for go, m in zip(grad_outputs, mask) if m)
+    return filtered
+## Debug
+
 class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
     """The base of atomic model.
 
@@ -79,6 +114,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         pair_exclude_types: list[tuple[int, int]] = [],
         rcond: Optional[float] = None,
         preset_out_bias: Optional[dict[str, np.ndarray]] = None,
+        data_stat_protect: float = 1e-2,
     ) -> None:
         torch.nn.Module.__init__(self)
         BaseAtomicModel_.__init__(self)
@@ -87,6 +123,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         self.reinit_pair_exclude(pair_exclude_types)
         self.rcond = rcond
         self.preset_out_bias = preset_out_bias
+        self.data_stat_protect = data_stat_protect
 
     def init_out_stat(self) -> None:
         """Initialize the output bias."""
@@ -104,7 +141,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
     def set_out_bias(self, out_bias: torch.Tensor) -> None:
         self.out_bias = out_bias
 
-    def __setitem__(self, key, value) -> None:
+    def __setitem__(self, key: str, value: torch.Tensor) -> None:
         if key in ["out_bias"]:
             self.out_bias = value
         elif key in ["out_std"]:
@@ -112,7 +149,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         else:
             raise KeyError(key)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> torch.Tensor:
         if key in ["out_bias"]:
             return self.out_bias
         elif key in ["out_std"]:
@@ -131,6 +168,10 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
 
     def get_intensive(self) -> bool:
         """Whether the fitting property is intensive."""
+        return False
+
+    def has_default_fparam(self) -> bool:
+        """Check if the model has default frame parameters."""
         return False
 
     def reinit_atom_exclude(
@@ -244,6 +285,8 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             nlist = torch.where(pair_mask == 1, nlist, -1)
 
         ext_atom_mask = self.make_atom_mask(extended_atype)
+
+        debug_dict = {}
         ret_dict = self.forward_atomic(
             extended_coord,
             torch.where(ext_atom_mask, extended_atype, 0),
@@ -252,8 +295,25 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             fparam=fparam,
             aparam=aparam,
             comm_dict=comm_dict,
+            debug_dict=debug_dict,
         )
         ret_dict = self.apply_out_stat(ret_dict, atype)
+
+        ## Debug
+        energy = ret_dict['energy'].sum(1)
+        grad_outputs = torch.ones_like(energy)
+        energy_grad = torch.autograd.grad(energy, extended_coord, grad_outputs=grad_outputs, create_graph=True, retain_graph=True)
+        
+        if isinstance(debug_dict[9], dict):
+            debug_tensors = tuple(debug_dict[9].values())
+        else:
+            debug_tensors = debug_dict[9]
+        filtered_inputs, mask = filter_tensors_with_grad(debug_tensors)
+        
+        energy_grad_stage3 = torch.autograd.grad(energy, filtered_inputs,grad_outputs=grad_outputs, create_graph=True, retain_graph=True)
+        energy_grad_stage012 = torch.autograd.grad(filtered_inputs, extended_coord,grad_outputs=energy_grad_stage3, create_graph=True, retain_graph=True)
+        import pdb; pdb.set_trace()
+        ## Debug
 
         # nf x nloc
         atom_mask = ext_atom_mask[:, :nloc].to(torch.int32)
@@ -294,7 +354,9 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         )
 
     def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat=None
+        self,
+        type_map: list[str],
+        model_with_new_type_stat: Optional["BaseAtomicModel"] = None,
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
@@ -361,21 +423,25 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         self,
         merged: Union[Callable[[], list[dict]], list[dict]],
         stat_file_path: Optional[DPPath] = None,
+        compute_or_load_out_stat: bool = True,
     ) -> NoReturn:
         """
-        Compute the output statistics (e.g. energy bias) for the fitting net from packed data.
+        Compute or load the statistics parameters of the model,
+        such as mean and standard deviation of descriptors or the energy bias of the fitting net.
+        When `sampled` is provided, all the statistics parameters will be calculated (or re-calculated for update),
+        and saved in the `stat_file_path`(s).
+        When `sampled` is not provided, it will check the existence of `stat_file_path`(s)
+        and load the calculated statistics parameters.
 
         Parameters
         ----------
-        merged : Union[Callable[[], list[dict]], list[dict]]
-            - list[dict]: A list of data samples from various data systems.
-                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
-                originating from the `i`-th data system.
-            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
-                only when needed. Since the sampling process can be slow and memory-intensive,
-                the lazy function helps by only sampling once.
-        stat_file_path : Optional[DPPath]
-            The path to the stat file.
+        merged
+            The lazy sampled function to get data frames from different data systems.
+        stat_file_path
+            The dictionary of paths to the statistics files.
+        compute_or_load_out_stat : bool
+            Whether to compute the output statistics.
+            If False, it will only compute the input statistics (e.g. mean and standard deviation of descriptors).
 
         """
         raise NotImplementedError
@@ -411,7 +477,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         self,
         ret: dict[str, torch.Tensor],
         atype: torch.Tensor,
-    ):
+    ) -> dict[str, torch.Tensor]:
         """Apply the stat to each atomic output.
         The developer may override the method to define how the bias is applied
         to the atomic output of the model.
@@ -432,9 +498,9 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
 
     def change_out_bias(
         self,
-        sample_merged,
+        sample_merged: Union[Callable[[], list[dict]], list[dict]],
         stat_file_path: Optional[DPPath] = None,
-        bias_adjust_mode="change-by-statistic",
+        bias_adjust_mode: str = "change-by-statistic",
     ) -> None:
         """Change the output bias according to the input data and the pretrained model.
 
@@ -481,10 +547,34 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         else:
             raise RuntimeError("Unknown bias_adjust_mode mode: " + bias_adjust_mode)
 
+    def compute_fitting_input_stat(
+        self,
+        sample_merged: Union[Callable[[], list[dict]], list[dict]],
+    ) -> None:
+        """Compute the input statistics (e.g. mean and stddev) for the atomic model from packed data.
+
+        Parameters
+        ----------
+        sample_merged : Union[Callable[[], list[dict]], list[dict]]
+            - list[dict]: A list of data samples from various data systems.
+                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
+                originating from the `i`-th data system.
+            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
+                only when needed. Since the sampling process can be slow and memory-intensive,
+                the lazy function helps by only sampling once.
+        """
+        pass
+
     def _get_forward_wrapper_func(self) -> Callable[..., torch.Tensor]:
         """Get a forward wrapper of the atomic model for output bias calculation."""
 
-        def model_forward(coord, atype, box, fparam=None, aparam=None):
+        def model_forward(
+            coord: torch.Tensor,
+            atype: torch.Tensor,
+            box: Optional[torch.Tensor],
+            fparam: Optional[torch.Tensor] = None,
+            aparam: Optional[torch.Tensor] = None,
+        ) -> dict[str, torch.Tensor]:
             with (
                 torch.no_grad()
             ):  # it's essential for pure torch forward function to use auto_batchsize
@@ -513,13 +603,13 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
 
         return model_forward
 
-    def _default_bias(self):
+    def _default_bias(self) -> torch.Tensor:
         ntypes = self.get_ntypes()
         return torch.zeros(
             [self.n_out, ntypes, self.max_out_size], dtype=dtype, device=device
         )
 
-    def _default_std(self):
+    def _default_std(self) -> torch.Tensor:
         ntypes = self.get_ntypes()
         return torch.ones(
             [self.n_out, ntypes, self.max_out_size], dtype=dtype, device=device

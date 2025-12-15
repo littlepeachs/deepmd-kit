@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import logging
+import multiprocessing
 import os
 
 import numpy as np
@@ -21,7 +23,16 @@ try:
     ncpus = len(os.sched_getaffinity(0))
 except AttributeError:
     ncpus = os.cpu_count()
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", min(8, ncpus)))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", min(4, ncpus)))
+if multiprocessing.get_start_method() != "fork":
+    # spawn or forkserver does not support NUM_WORKERS > 0 for DataLoader
+    log = logging.getLogger(__name__)
+    log.warning(
+        "NUM_WORKERS > 0 is not supported with spawn or forkserver start method. "
+        "Setting NUM_WORKERS to 0."
+    )
+    NUM_WORKERS = 0
+
 # Make sure DDP uses correct device if applicable
 LOCAL_RANK = os.environ.get("LOCAL_RANK")
 LOCAL_RANK = int(0 if LOCAL_RANK is None else LOCAL_RANK)
@@ -32,9 +43,9 @@ else:
     DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
 
 JIT = False
-MLP_INIT = os.environ.get("MLP_INIT", "default")
 CACHE_PER_SYS = 5  # keep at most so many sets per sys in memory
 ENERGY_BIAS_TRAINABLE = True
+CUSTOM_OP_USE_JIT = False
 
 PRECISION_DICT = {
     "float16": torch.float16,
@@ -55,7 +66,7 @@ GLOBAL_PT_ENER_FLOAT_PRECISION = PRECISION_DICT[
 PRECISION_DICT["default"] = GLOBAL_PT_FLOAT_PRECISION
 assert VALID_PRECISION.issubset(PRECISION_DICT.keys())
 # cannot automatically generated
-RESERVED_PRECISON_DICT = {
+RESERVED_PRECISION_DICT = {
     torch.float16: "float16",
     torch.float32: "float32",
     torch.float64: "float64",
@@ -64,7 +75,7 @@ RESERVED_PRECISON_DICT = {
     torch.bfloat16: "bfloat16",
     torch.bool: "bool",
 }
-assert set(PRECISION_DICT.values()) == set(RESERVED_PRECISON_DICT.keys())
+assert set(PRECISION_DICT.values()) == set(RESERVED_PRECISION_DICT.keys())
 DEFAULT_PRECISION = "float64"
 
 # throw warnings if threads not set
@@ -77,6 +88,7 @@ if intra_nthreads > 0:
 
 __all__ = [
     "CACHE_PER_SYS",
+    "CUSTOM_OP_USE_JIT",
     "DEFAULT_PRECISION",
     "DEVICE",
     "ENERGY_BIAS_TRAINABLE",
@@ -88,6 +100,6 @@ __all__ = [
     "LOCAL_RANK",
     "NUM_WORKERS",
     "PRECISION_DICT",
-    "RESERVED_PRECISON_DICT",
+    "RESERVED_PRECISION_DICT",
     "SAMPLER_RECORD",
 ]

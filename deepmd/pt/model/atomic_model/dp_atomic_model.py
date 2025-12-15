@@ -2,7 +2,10 @@
 import functools
 import logging
 from typing import (
+    Any,
+    Callable,
     Optional,
+    Union,
 )
 
 import torch
@@ -47,10 +50,10 @@ class DPAtomicModel(BaseAtomicModel):
 
     def __init__(
         self,
-        descriptor,
-        fitting,
+        descriptor: BaseDescriptor,
+        fitting: BaseFitting,
         type_map: list[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(type_map, **kwargs)
         ntypes = len(type_map)
@@ -62,18 +65,33 @@ class DPAtomicModel(BaseAtomicModel):
         self.fitting_net = fitting
         super().init_out_stat()
         self.enable_eval_descriptor_hook = False
+        self.enable_eval_fitting_last_layer_hook = False
         self.eval_descriptor_list = []
+        self.eval_fitting_last_layer_list = []
 
     eval_descriptor_list: list[torch.Tensor]
+    eval_fitting_last_layer_list: list[torch.Tensor]
 
     def set_eval_descriptor_hook(self, enable: bool) -> None:
         """Set the hook for evaluating descriptor and clear the cache for descriptor list."""
         self.enable_eval_descriptor_hook = enable
-        self.eval_descriptor_list = []
+        # = [] does not work; See #4533
+        self.eval_descriptor_list.clear()
 
     def eval_descriptor(self) -> torch.Tensor:
         """Evaluate the descriptor."""
         return torch.concat(self.eval_descriptor_list)
+
+    def set_eval_fitting_last_layer_hook(self, enable: bool) -> None:
+        """Set the hook for evaluating fitting last layer output and clear the cache for fitting last layer output list."""
+        self.enable_eval_fitting_last_layer_hook = enable
+        self.fitting_net.set_return_middle_output(enable)
+        # = [] does not work; See #4533
+        self.eval_fitting_last_layer_list.clear()
+
+    def eval_fitting_last_layer(self) -> torch.Tensor:
+        """Evaluate the fitting last layer output."""
+        return torch.concat(self.eval_fitting_last_layer_list)
 
     @torch.jit.export
     def fitting_output_def(self) -> FittingOutputDef:
@@ -93,7 +111,7 @@ class DPAtomicModel(BaseAtomicModel):
         """Get the neighbor selection."""
         return self.sel
 
-    def set_case_embd(self, case_idx: int):
+    def set_case_embd(self, case_idx: int) -> None:
         """
         Set the case embedding of this atomic model by the given case_idx,
         typically concatenated with the output of the descriptor and fed into the fitting net.
@@ -113,7 +131,9 @@ class DPAtomicModel(BaseAtomicModel):
         return self.descriptor.mixed_types()
 
     def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat=None
+        self,
+        type_map: list[str],
+        model_with_new_type_stat: Optional["DPAtomicModel"] = None,
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
@@ -154,7 +174,7 @@ class DPAtomicModel(BaseAtomicModel):
         return dd
 
     @classmethod
-    def deserialize(cls, data) -> "DPAtomicModel":
+    def deserialize(cls, data: dict) -> "DPAtomicModel":
         data = data.copy()
         check_version_compatibility(data.pop("@version", 1), 2, 1)
         data.pop("@class", None)
@@ -199,13 +219,14 @@ class DPAtomicModel(BaseAtomicModel):
 
     def forward_atomic(
         self,
-        extended_coord,
-        extended_atype,
-        nlist,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        debug_dict: Optional[dict] = None,
     ) -> dict[str, torch.Tensor]:
         """Return atomic prediction.
 
@@ -240,10 +261,11 @@ class DPAtomicModel(BaseAtomicModel):
             nlist,
             mapping=mapping,
             comm_dict=comm_dict,
+            debug_dict=debug_dict,
         )
         assert descriptor is not None
         if self.enable_eval_descriptor_hook:
-            self.eval_descriptor_list.append(descriptor)
+            self.eval_descriptor_list.append(descriptor.detach())
         # energy, force
         fit_ret = self.fitting_net(
             descriptor,
@@ -254,6 +276,14 @@ class DPAtomicModel(BaseAtomicModel):
             fparam=fparam,
             aparam=aparam,
         )
+        if self.enable_eval_fitting_last_layer_hook:
+            assert "middle_output" in fit_ret, (
+                "eval_fitting_last_layer not supported for this fitting net!"
+            )
+            self.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
+            )
+        
         return fit_ret
 
     def get_out_bias(self) -> torch.Tensor:
@@ -261,8 +291,9 @@ class DPAtomicModel(BaseAtomicModel):
 
     def compute_or_load_stat(
         self,
-        sampled_func,
+        sampled_func: Callable[[], list[dict]],
         stat_file_path: Optional[DPPath] = None,
+        compute_or_load_out_stat: bool = True,
     ) -> None:
         """
         Compute or load the statistics parameters of the model,
@@ -278,6 +309,9 @@ class DPAtomicModel(BaseAtomicModel):
             The lazy sampled function to get data frames from different data systems.
         stat_file_path
             The dictionary of paths to the statistics files.
+        compute_or_load_out_stat : bool
+            Whether to compute the output statistics.
+            If False, it will only compute the input statistics (e.g. mean and standard deviation of descriptors).
         """
         if stat_file_path is not None and self.type_map is not None:
             # descriptors and fitting net with different type_map
@@ -285,7 +319,7 @@ class DPAtomicModel(BaseAtomicModel):
             stat_file_path /= " ".join(self.type_map)
 
         @functools.lru_cache
-        def wrapped_sampler():
+        def wrapped_sampler() -> list[dict]:
             sampled = sampled_func()
             if self.pair_excl is not None:
                 pair_exclude_types = self.pair_excl.get_exclude_types()
@@ -295,14 +329,57 @@ class DPAtomicModel(BaseAtomicModel):
                 atom_exclude_types = self.atom_excl.get_exclude_types()
                 for sample in sampled:
                     sample["atom_exclude_types"] = list(atom_exclude_types)
+            if (
+                "find_fparam" not in sampled[0]
+                and "fparam" not in sampled[0]
+                and self.has_default_fparam()
+            ):
+                default_fparam = self.get_default_fparam()
+                for sample in sampled:
+                    nframe = sample["atype"].shape[0]
+                    sample["fparam"] = default_fparam.repeat(nframe, 1)
             return sampled
 
         self.descriptor.compute_input_stats(wrapped_sampler, stat_file_path)
-        self.compute_or_load_out_stat(wrapped_sampler, stat_file_path)
+        self.compute_fitting_input_stat(wrapped_sampler, stat_file_path)
+        if compute_or_load_out_stat:
+            self.compute_or_load_out_stat(wrapped_sampler, stat_file_path)
+
+    def compute_fitting_input_stat(
+        self,
+        sample_merged: Union[Callable[[], list[dict]], list[dict]],
+        stat_file_path: Optional[DPPath] = None,
+    ) -> None:
+        """Compute the input statistics (e.g. mean and stddev) for the fittings from packed data.
+
+        Parameters
+        ----------
+        sample_merged : Union[Callable[[], list[dict]], list[dict]]
+            - list[dict]: A list of data samples from various data systems.
+                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
+                originating from the `i`-th data system.
+            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
+                only when needed. Since the sampling process can be slow and memory-intensive,
+                the lazy function helps by only sampling once.
+        stat_file_path : Optional[DPPath]
+            The dictionary of paths to the statistics files.
+        """
+        self.fitting_net.compute_input_stats(
+            sample_merged,
+            protection=self.data_stat_protect,
+            stat_file_path=stat_file_path,
+        )
 
     def get_dim_fparam(self) -> int:
         """Get the number (dimension) of frame parameters of this atomic model."""
         return self.fitting_net.get_dim_fparam()
+
+    def has_default_fparam(self) -> bool:
+        """Check if the model has default frame parameters."""
+        return self.fitting_net.has_default_fparam()
+
+    def get_default_fparam(self) -> Optional[torch.Tensor]:
+        return self.fitting_net.get_default_fparam()
 
     def get_dim_aparam(self) -> int:
         """Get the number (dimension) of atomic parameters of this atomic model."""
