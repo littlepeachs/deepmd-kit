@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import os
 from typing import (
     Any,
+    Optional,
 )
-
+import pickle
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from deepmd.pt.loss.loss import (
@@ -21,7 +24,16 @@ from deepmd.utils.data import (
 from deepmd.utils.version import (
     check_version_compatibility,
 )
+from deepmd.pt.model.model.transform_output import (
+    fit_output_to_model_output,
+)
 
+from deepmd.pt.utils.nlist import (
+    extend_input_and_build_neighbor_list,
+    nlist_distinguish_types,
+)
+
+from typing import Tuple, List, Union
 
 def custom_huber_loss(
     predictions: torch.Tensor, targets: torch.Tensor, delta: float = 1.0
@@ -33,6 +45,76 @@ def custom_huber_loss(
     loss = torch.where(abs_error <= delta, quadratic_loss, linear_loss)
     return torch.mean(loss)
 
+def communicate_extended_output_simple(
+    model_ret: dict[str, torch.Tensor],
+    mapping: torch.Tensor,  # shape: (n_frames, n_all_atoms)
+    do_atomic_virial: bool = False,
+) -> dict[str, torch.Tensor]:
+    """
+    Transform the output of the model network defined on local and ghost (extended)
+    atoms to local atoms without using ModelOutputDef.
+    """
+    new_ret = {}
+    
+    # 获取本地原子数 (根据mapping的最大索引推断，mapping索引范围是 0 到 nloc-1)
+    # 注意：这里假设mapping中包含所有本地原子的索引
+    n_loc = int(mapping.max().item()) + 1
+
+    for key, tensor in model_ret.items():
+        # 1. 基础量直接拷贝 (如 energy, mask, energy_redu)
+        # 忽略掉已经存在的 global virial redu (稍后会重新计算)
+        if not key.endswith(('_derv_r', '_derv_c', '_derv_c_redu')):
+            new_ret[key] = tensor
+            continue
+
+        # 2. 处理力/坐标导数 (Force: _derv_r) -> shape usually (B, N, 3)
+        if key.endswith('_derv_r'):
+            # 准备输出张量 (B, n_loc, 3)
+            out_shape = list(tensor.shape)
+            out_shape[1] = n_loc 
+            
+            # 扩展 mapping 维度以匹配 tensor: (B, N_all) -> (B, N_all, 3)
+            # 相当于原代码的 view + expand/tile
+            map_expanded = mapping.unsqueeze(-1).expand_as(tensor)
+            
+            out_tensor = torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
+            
+            # 执行 scatter_reduce (求和: 将 ghost 原子的力累加到 local 原子)
+            new_ret[key] = torch.scatter_reduce(
+                out_tensor,
+                dim=1,
+                index=map_expanded,
+                src=tensor,
+                reduce="sum"
+            )
+
+        # 3. 处理维里/晶胞导数 (Virial: _derv_c) -> shape usually (B, N, 9)
+        elif key.endswith('_derv_c') and not key.endswith('_derv_c_redu'):
+            out_shape = list(tensor.shape)
+            out_shape[1] = n_loc
+            
+            # 扩展 mapping: (B, N_all) -> (B, N_all, 9)
+            map_expanded = mapping.unsqueeze(-1).expand_as(tensor)
+            
+            out_tensor = torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
+            
+            # 累加 atomic virial
+            atomic_virial = torch.scatter_reduce(
+                out_tensor,
+                dim=1,
+                index=map_expanded,
+                src=tensor,
+                reduce="sum"
+            )
+            
+            if do_atomic_virial:
+                new_ret[key] = atomic_virial
+            
+            # 重新计算 Global Virial (sum over atoms)
+            # 原代码逻辑：new_ret[kk_derv_c + "_redu"] = torch.sum(...)
+            new_ret[key + '_redu'] = torch.sum(atomic_virial, dim=1)
+
+    return new_ret
 
 class EnergyStdLoss(TaskLoss):
     def __init__(
@@ -48,7 +130,7 @@ class EnergyStdLoss(TaskLoss):
         limit_pref_ae: float = 0.0,
         start_pref_pf: float = 0.0,
         limit_pref_pf: float = 0.0,
-        relative_f: float | None = None,
+        relative_f: Optional[float] = None,
         enable_atom_ener_coeff: bool = False,
         start_pref_gf: float = 0.0,
         limit_pref_gf: float = 0.0,
@@ -151,6 +233,483 @@ class EnergyStdLoss(TaskLoss):
                 "Huber loss is not implemented for force with atom_pref, generalized force and relative force. "
             )
 
+        self.pipe_buffers = {
+            'inputs': [],  # [feas, graph_bg_ag]
+            'outputs': [],  # [feas, graph_bg_ag] or preadiction : dict[str, Tensor]
+            'forces':[], # in first stage， computing the force，
+            'stress':[], # in first stage， computing the force，
+            'energy':[], # in first stage, computing the energy
+            'dE_dinputs': [None,None,None,None], # tuple[dE_dfeas], FW1 output   FW1 send
+            'dL_doutputs': [], # BW0 recv
+            'dL_dinputs': [], # BW0 send
+            'dE_doutputs': [None,None,None,None], # FW1 recv 
+            'dL_dE_dinputs': [], # BW1 recv
+            'dL_dE_doutputs': [], # BW1 send
+            'loss_f': [],  # loss from batch input
+            'loss_e': [],  # loss from batch input
+            'loss_v': [],  # loss from batch input
+            'loss_m': [],  # loss from batch input
+            'data':[],
+            'batched_graph': [], 
+            'targets': [],
+        }
+
+        self.global_atom_num = 0
+        self.stage_id = 0
+        self.num_stages = 4
+        self.pref_e = 0
+
+    def filter_tensors_with_grad(self, tensors: Tuple[torch.Tensor, ...]) -> Tuple[Tuple[torch.Tensor, ...], List[bool]]:
+        """
+            过滤不支持计算梯度的中间激活值和为None的Tensor
+        Args:
+            Tuple[Tensor], 输入中间的激活值
+        Returns:
+            Tuple[Tensor], 输出中间激活值可以计算梯度的部分，
+
+        """
+        
+        mask = [(t is not None) and (t.requires_grad) for t in tensors]
+        filtered = tuple(t for t, m in zip(tensors, mask) if m)
+        return filtered, mask
+
+    def filter_tensor_with_mask(self, grad_outputs: Optional[Union[torch.Tensor, Tuple[Optional[torch.Tensor], ...]]],
+                                mask: List[bool]) -> Optional[Tuple[Optional[torch.Tensor], ...]]:
+        """
+
+        提取与filtered_inputs对应的grad_outputs子集
+        提取mask[i]==True的tensor[i]
+        
+        Args:
+            grad_outputs：需要过滤的Tuple[Tensor]
+            mask： 根据mask来进行选择，如果为True则选择
+        """
+        if grad_outputs is None:
+            return None
+        if isinstance(grad_outputs, torch.Tensor):
+            return grad_outputs  # 单个Tensor不需要mask
+        filtered = tuple(go for go, m in zip(grad_outputs, mask) if m)
+        return filtered
+
+    def restore_tensor_with_none(self, grads: Tuple[torch.Tensor, ...], mask: List[bool]) -> Tuple[Optional[torch.Tensor], ...]:
+            """
+            将mask != True的使用None填充。
+            输入 tensor(len=5)，mask(len=7， 5个True)
+            输出tuple[tensor] (len=7， 使用None填充了mask=False的相应位置。)
+            """
+            grad_iter = iter(grads)
+            return tuple(next(grad_iter) if m else None for m in mask)
+    
+    
+    def safe_autograd_grad(self,
+            outputs: torch.Tensor,
+            inputs: Tuple[torch.Tensor, ...],
+            grad_outputs: Optional[Union[torch.Tensor, Tuple[Optional[torch.Tensor], ...]]] = None,
+            retain_graph: bool = False,
+            create_graph: bool = False,
+            allow_unused: bool = False
+        ) -> Tuple[Optional[torch.Tensor], ...]:
+            """
+            安全地计算梯度，输入的output，input，grad_output，必须是同样的len，然后根据input的情况
+            限制：必须要输入的三个tuple tensor len是一样的，只有FW1 的model intermediate 使用
+            Args:
+                outputs (torch.Tensor): _description_ 待着梯度为none
+                inputs (Tuple[torch.Tensor, ...]): _description_
+                grad_outputs (Optional[Union[torch.Tensor, Tuple[Optional[torch.Tensor], ...]]], optional): _description_. Defaults to None.
+                retain_graph (bool, optional): _description_. Defaults to False.
+                create_graph (bool, optional): _description_. Defaults to False.
+                allow_unused (bool, optional): _description_. Defaults to False.
+
+            Returns:
+                Tuple[Optional[torch.Tensor], ...]: _description_
+            """
+            filtered_inputs, mask = self.filter_tensors_with_grad(inputs)
+            if not filtered_inputs:
+                return tuple(None for _ in inputs)
+            
+            filtered_grad_outputs = self.filter_tensor_with_mask(grad_outputs, mask)
+            grads = torch.autograd.grad(
+                outputs, filtered_inputs,
+                grad_outputs=filtered_grad_outputs,
+                retain_graph=retain_graph,
+                create_graph=create_graph,
+                allow_unused=allow_unused
+            )
+            return self.restore_tensor_with_none(grads, mask)
+
+    def _forward_pass_0(self, model,buffer_id, micro_batch_id):
+        if self.stage_id == 0:
+            data = self.pipe_buffers['data'][buffer_id] 
+            coord = data['coord']
+            atype = data['atype']
+            box = data['box']
+            do_atomic_virial = data['do_atomic_virial']
+            fparam = data['fparam']
+            aparam = data['aparam']
+            cc, bb, fp, ap, input_prec = model.input_type_cast(
+                coord, box=box, fparam=fparam, aparam=aparam
+            )         
+            
+            (
+                extended_coord,
+                extended_atype,
+                mapping,
+                nlist,
+            ) = extend_input_and_build_neighbor_list(
+                cc,
+                atype,
+                model.get_rcut(),
+                model.get_sel(),
+                # types will be distinguished in the lower interface,
+                # so it doesn't need to be distinguished here
+                mixed_types=True,
+                box=bb,
+            )
+            nframes, nall = extended_atype.shape[:2]
+            extended_coord = extended_coord.view(nframes, -1, 3)
+            nlist = model.format_nlist(
+                extended_coord, extended_atype, nlist, extra_nlist_sort=False
+            )
+            extended_coord, _, fp, ap, input_prec = model.input_type_cast(
+                extended_coord, fparam=fparam, aparam=aparam
+            )
+            
+            _, nloc, _ = nlist.shape
+            atype = extended_atype[:, :nloc]
+
+            if model.atomic_model.pair_excl is not None:
+                pair_mask = model.atomic_model.pair_excl(nlist, extended_atype)
+                # exclude neighbors in the nlist
+                nlist = torch.where(pair_mask == 1, nlist, -1)
+
+            ext_atom_mask = model.atomic_model.make_atom_mask(extended_atype)
+
+            nframes, nloc, nnei = nlist.shape
+            atype = extended_atype[:, :nloc]
+            if model.atomic_model.do_grad_r() or model.atomic_model.do_grad_c():
+                extended_coord.requires_grad_(True)
+
+            comm_dict = None
+            parallel_mode = comm_dict is not None
+            # cast the input to internal precsion
+            extended_coord = extended_coord.to(dtype=model.atomic_model.descriptor.prec)
+            nframes, nloc, nnei = nlist.shape
+            nall = extended_coord.view(nframes, -1).shape[1] // 3
+
+            if not parallel_mode and model.atomic_model.descriptor.use_loc_mapping:
+                node_ebd_ext = model.atomic_model.descriptor.type_embedding(extended_atype[:, :nloc])
+            else:
+                node_ebd_ext = model.atomic_model.descriptor.type_embedding(extended_atype)
+            node_ebd_inp = node_ebd_ext[:, :nloc, :]
+
+            
+            middle_output, batch_graph = model.atomic_model.descriptor.repflows(
+                nlist,
+                extended_coord,
+                extended_atype,
+                node_ebd_ext,
+                mapping,
+                comm_dict=comm_dict,
+                stage_size = 3,
+                stage_index = self.stage_id,
+            )
+            
+            self.pipe_buffers['inputs'].append(data)
+            
+            batch_graph['mapping'] = mapping
+            self.pipe_buffers['batched_graph'].append(batch_graph)
+            
+            self.pipe_buffers['outputs'].append(middle_output)
+
+            self.pipe_buffers['inputs'].append(middle_output)
+            
+
+        elif self.stage_id != self.num_stages - 1:
+            
+            inputs = self.pipe_buffers['inputs'][buffer_id]
+            batch_graph = self.pipe_buffers['batched_graph'][0]
+            # logging.info(f"inputs {inputs}")
+            middle_output, batch_graph = model.atomic_model.descriptor.repflows(
+                nlist=batch_graph['nlist'],
+                extended_coord=batch_graph['extended_coord'],
+                extended_atype=batch_graph['extended_atype'],
+                stage_size = 3,
+                stage_index = self.stage_id,
+                middle_output = inputs,
+                )
+            
+            # self.pipe_buffers['batched_graph'][buffer_id] = batch_graph
+            self.pipe_buffers['outputs'].append(middle_output)
+            self.pipe_buffers['inputs'].append(middle_output)
+            
+            # logging.info(f"outputs {outputs}")
+
+        elif self.stage_id == self.num_stages - 1:
+            
+            inputs = self.pipe_buffers['inputs'][buffer_id]
+            batch_graph = self.pipe_buffers['batched_graph'][0]
+            extended_atype = batch_graph['extended_atype']
+            node_ebd, edge_ebd, h2, rot_mat,_ = model.atomic_model.descriptor.repflows(
+                nlist=batch_graph['nlist'],
+                extended_coord=batch_graph['extended_coord'],
+                extended_atype=batch_graph['extended_atype'],
+                stage_size = 3,
+                stage_index = self.stage_id,
+                middle_output = inputs,
+                )
+            
+            _,nloc, _ = inputs['nlist'].shape
+            atype = extended_atype[:, :nloc]
+            fit_ret = model.atomic_model.fitting_net(
+                node_ebd,
+                atype,
+                gr=rot_mat,
+                g2=edge_ebd,
+                h2=h2,
+                fparam=None,
+                aparam=None,
+            )   
+            
+
+            ret_dict = model.atomic_model.apply_out_stat(fit_ret, atype)
+
+            # nf x nloc
+            ext_atom_mask = model.atomic_model.make_atom_mask(extended_atype)
+            atom_mask = ext_atom_mask[:, :nloc].to(torch.int32)
+            if model.atomic_model.atom_excl is not None:
+                atom_mask *= model.atomic_model.atom_excl(atype)
+
+            for kk in ret_dict.keys():
+                out_shape = ret_dict[kk].shape
+                out_shape2 = 1
+                for ss in out_shape[2:]:
+                    out_shape2 *= ss
+                ret_dict[kk] = (
+                    ret_dict[kk].reshape([out_shape[0], out_shape[1], out_shape2])
+                    * atom_mask[:, :, None]
+                ).view(out_shape)
+            ret_dict["mask"] = atom_mask
+
+            ret_dict['energy_redu'] = ret_dict['energy'].squeeze(-1).sum(dim=-1, keepdim=True)
+
+            # model_predict = fit_output_to_model_output(
+            #     ret_dict,
+            #     model.atomic_output_def(),
+            #     batch_graph['extended_coord'],
+            #     do_atomic_virial=False,
+            #     create_graph=model.training,
+            #     mask=ret_dict["mask"] if "mask" in ret_dict else None,
+            # )
+            # model_predict = model.output_type_cast(model_predict, 'float32')
+            
+            self.pipe_buffers['outputs'].append(ret_dict)
+            E = ret_dict['energy_redu']
+            self.pipe_buffers['energy'].append(E)
+
+            target_energy = self.pipe_buffers['targets'][0]['energy']
+       
+            loss_e = torch.mean(torch.square(E - target_energy))
+            loss_e = self.pref_e * loss_e/ nloc
+            
+            # logging.info(f'loss_e {loss_e}')
+            self.pipe_buffers['loss_e'].append(loss_e)
+            
+     
+    def _forward_pass_1(self, buffer_id, micro_batch_id):
+        if self.stage_id == self.num_stages - 1:
+            E = self.pipe_buffers['energy'][0]
+            # logging.info(f"============= E {E}")
+            
+            # Convert dict of tensors to tuple of tensors
+            input_dict = self.pipe_buffers['inputs'][buffer_id]
+            if isinstance(input_dict, dict):
+                input_tensors = tuple(input_dict.values())
+            else:
+                input_tensors = input_dict
+            
+            filtered_inputs, mask = self.filter_tensors_with_grad(input_tensors)
+            # logging.info(f"============= mask {mask}")
+            # logging.info(f"============= self.pipe_buffers['inputs'][buffer_id] {self.pipe_buffers['inputs'][buffer_id]}")
+            # logging.info(f"============= filtered_inputs {filtered_inputs}")
+
+            grad_outputs = torch.ones_like(E)
+            
+            dE_dfeas = self.safe_autograd_grad(E, filtered_inputs, grad_outputs=grad_outputs, create_graph=True, retain_graph=True)
+            
+            self.pipe_buffers['dE_dinputs'][buffer_id] = self.restore_tensor_with_none(dE_dfeas, mask)
+            
+            self.pipe_buffers['dE_doutputs'][buffer_id-1] = self.pipe_buffers['dE_dinputs'][buffer_id]
+            
+
+        elif self.stage_id != 0:
+            
+            filtered_dE_doutputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dE_doutputs'][buffer_id])
+
+            output_dict = self.pipe_buffers['outputs'][buffer_id]
+            if isinstance(output_dict, dict):
+                output_tensors = tuple(output_dict.values())
+            else:
+                output_tensors = output_dict
+            
+            outputs = self.filter_tensor_with_mask(output_tensors, mask)
+
+                        
+            input_dict = self.pipe_buffers['inputs'][buffer_id]
+            if isinstance(input_dict, dict):
+                input_tensors = tuple(input_dict.values())
+            else:
+                input_tensors = input_dict
+
+            filtered_input_feas = self.filter_tensor_with_mask(input_tensors, mask) # x messsage
+            
+            dE_dfeas = self.safe_autograd_grad(outputs, filtered_input_feas, grad_outputs=filtered_dE_doutputs, create_graph=True, retain_graph=True)
+            
+
+            self.pipe_buffers['dE_dinputs'][buffer_id] = self.restore_tensor_with_none(dE_dfeas, mask)
+            self.pipe_buffers['dE_doutputs'][buffer_id-1] = self.pipe_buffers['dE_dinputs'][buffer_id]
+            
+
+        elif self.stage_id == 0:
+            
+            filtered_dE_doutputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dE_doutputs'][buffer_id])
+            
+            output_dict = self.pipe_buffers['outputs'][buffer_id]
+            if isinstance(output_dict, dict):
+                output_tensors = tuple(output_dict.values())
+            else:
+                output_tensors = output_dict
+            outputs = self.filter_tensor_with_mask(output_tensors, mask)
+            
+            # logging.info(f"mask {mask} filtered_dE_doutputs { filtered_dE_doutputs}, ")
+            # logging.info(f"outputs {outputs} ")
+            
+            batched_graph = self.pipe_buffers['batched_graph'][buffer_id]
+            # atoms_per_graph = torch.bincount(batched_graph.atom_owners)
+            # atoms_per_graph_list = atoms_per_graph.tolist() 
+            
+            grad = (
+                torch.autograd.grad(outputs, batched_graph['extended_coord'], grad_outputs=filtered_dE_doutputs, create_graph=True, retain_graph=True)
+            )
+            extended_force = -1 * grad[0]
+
+
+            mapping = batched_graph['mapping']
+            extended_virial = torch.einsum('...ij,...ik->...ikj', extended_force, batched_graph['extended_coord'])
+            extended_virial = extended_virial.view(list(extended_virial.shape[:-2]) + [9])
+            ret_dict = {
+                'energy_derv_r': extended_force,
+                'energy_derv_c': extended_virial,
+            }
+
+            ret_dict = communicate_extended_output_simple(ret_dict, mapping, do_atomic_virial=False)
+           
+            force = ret_dict['energy_derv_r']
+            virial = ret_dict['energy_derv_c_redu']
+            
+            # TODO: 这里其实是f+s
+            loss = torch.mean(torch.square(force - self.pipe_buffers['targets'][buffer_id]['force']))
+            loss_f = self.pref_f * loss
+            loss = torch.mean(torch.square(virial - self.pipe_buffers['targets'][buffer_id]['virial']))
+            loss_v = self.pref_v * loss / self.global_atom_num
+            
+            self.pipe_buffers['loss_f'].append(loss_f)
+            self.pipe_buffers['loss_v'].append(loss_v)
+            import pdb; pdb.set_trace()
+
+    # mask 记录了中间的有效的feature，方便进行梯度的传递。因为传递有的是图的信息，标量，不涉及导数
+    # mask = [True, True, True, False, True, True, False]  
+    def _backward_pass_1(self, buffer_id, micro_batch_id):
+        if self.stage_id == 0:
+            loss_f = self.pipe_buffers['loss_f'][buffer_id]
+            torch.autograd.backward(loss_f / self.global_atom_num, retain_graph=True)
+            dE_doutputs = self.pipe_buffers['dE_doutputs'][buffer_id] #FW1 的 inputs，求一下梯度
+            dL_dE_doutputs = tuple([t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in dE_doutputs]) # 有的dE_doutputs是none，none type没有梯度
+            self.pipe_buffers['dL_dE_doutputs'][buffer_id] = dL_dE_doutputs
+            
+            self.pipe_buffers['dE_doutputs'][buffer_id] = None
+            self.pipe_buffers['dL_dE_dinputs'][buffer_id] = None
+            self.pipe_buffers['dE_dinputs'][buffer_id] = None
+            
+            
+        elif self.stage_id != self.num_stages - 1:
+            dL_dE_dinputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dL_dE_dinputs'][buffer_id]) #  output grad
+            dE_dinputs = self.filter_tensor_with_mask(self.pipe_buffers['dE_dinputs'][buffer_id], mask) # output
+            torch.autograd.backward(dE_dinputs, grad_tensors=dL_dE_dinputs, retain_graph=True)
+
+            
+            dE_doutputs = self.pipe_buffers['dE_doutputs'][buffer_id]
+            self.pipe_buffers['dE_doutputs'][buffer_id] = None
+            self.pipe_buffers['dL_dE_dinputs'][buffer_id] = None
+            self.pipe_buffers['dE_dinputs'][buffer_id] = None
+            dL_dE_doutputs = tuple(t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in dE_doutputs)
+            self.pipe_buffers['dL_dE_doutputs'][buffer_id] = dL_dE_doutputs
+            
+        elif self.stage_id == self.num_stages - 1:
+            loss_e = self.pipe_buffers['loss_e'][buffer_id]
+            dL_dE_dinputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dL_dE_dinputs'][buffer_id]) #  output grad
+            dE_dinputs = self.filter_tensor_with_mask(self.pipe_buffers['dE_dinputs'][buffer_id], mask) # output
+            torch.autograd.backward(dE_dinputs, grad_tensors=dL_dE_dinputs, retain_graph=True)
+            torch.autograd.backward(loss_e/self.global_energy_size, retain_graph=False)
+            # print(f"BW1 loss_e{loss_e}, self.global_energy_size {self.global_energy_size},loss_e/self.global_energy_size {loss_e/self.global_energy_size}")
+            dL_dinputs = tuple(t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in self.pipe_buffers['inputs'][buffer_id])
+            self.pipe_buffers['dL_dinputs'][buffer_id] = dL_dinputs
+            
+            self.pipe_buffers['inputs'][buffer_id] = None
+            self.pipe_buffers['dE_doutputs'][buffer_id] = None
+            self.pipe_buffers['dL_dE_dinputs'][buffer_id] = None
+            self.pipe_buffers['dE_dinputs'][buffer_id] = None
+            
+    
+    def _backward_pass_0(self, buffer_id, micro_batch_id):
+        
+        # assert self.stage_id != self.num_stages - 1
+        if self.stage_id == self.num_stages - 1:
+            # TODO 注意 there is the loss_e.backward() but now is in the BW1 (_backward_pass_1)
+            pass
+        else:
+            dL_doutputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dL_doutputs'][buffer_id])
+            outputs = self.filter_tensor_with_mask(self.pipe_buffers['outputs'][buffer_id], mask) # output
+            torch.autograd.backward(outputs, grad_tensors=dL_doutputs, retain_graph=False)
+            if self.stage_id != 0:
+                dL_dinputs = tuple([t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in self.pipe_buffers['inputs'][buffer_id]])
+                self.pipe_buffers['dL_dinputs'][buffer_id] = dL_dinputs
+            elif self.stage_id == 0:
+                self._clear_pipe_buffers(buffer_id, micro_batch_id)
+
+    def forward_pp(self,
+                input_dict: dict[str, torch.Tensor],
+                model: torch.nn.Module,
+                label: dict[str, torch.Tensor],
+                natoms: int,
+                learning_rate: float,
+                mae: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
+        coef = learning_rate / self.starter_learning_rate
+        self.pref_e = self.limit_pref_e + (self.start_pref_e - self.limit_pref_e) * coef
+        self.pref_f = self.limit_pref_f + (self.start_pref_f - self.limit_pref_f) * coef
+        self.pref_v = self.limit_pref_v + (self.start_pref_v - self.limit_pref_v) * coef
+
+        self.pipe_buffers['data'].append(input_dict)
+        self.global_atom_num = input_dict['atype'].shape[1]
+        
+        self.pipe_buffers['targets'].append(label)
+        self.stage_id = 0
+        self._forward_pass_0(model, 0, 0)
+        self.stage_id = 1
+        self._forward_pass_0(model,1, 0)
+        self.stage_id = 2
+        self._forward_pass_0(model,2, 0)
+        self.stage_id = 3
+        self._forward_pass_0(model,3, 0)
+        self._forward_pass_1(3,0)
+        self.stage_id = 2
+        self._forward_pass_1(2,0)
+        self.stage_id = 1
+        self._forward_pass_1(1,0)
+        self.stage_id = 0
+        self._forward_pass_1(0,0)
+        # 目前完成前向能力与受力计算，backward部分和模型无关
+
     def forward(
         self,
         input_dict: dict[str, torch.Tensor],
@@ -182,7 +741,7 @@ class EnergyStdLoss(TaskLoss):
         more_loss: dict[str, torch.Tensor]
             Other losses for display.
         """
-        model_pred = model(**input_dict)
+        model_pred = model(**input_dict)       
         coef = learning_rate / self.starter_learning_rate
         pref_e = self.limit_pref_e + (self.start_pref_e - self.limit_pref_e) * coef
         pref_f = self.limit_pref_f + (self.start_pref_f - self.limit_pref_f) * coef
@@ -214,6 +773,7 @@ class EnergyStdLoss(TaskLoss):
                 energy_pred = torch.sum(atom_ener_coeff * atom_ener_pred, dim=1)
             find_energy = label.get("find_energy", 0.0)
             pref_e = pref_e * find_energy
+            
             if not self.use_l1_all:
                 l2_ener_loss = torch.mean(torch.square(energy_pred - energy_label))
                 if not self.inference:
@@ -221,6 +781,7 @@ class EnergyStdLoss(TaskLoss):
                         l2_ener_loss.detach(), find_energy
                     )
                 if not self.use_huber:
+                    
                     loss += atom_norm * (pref_e * l2_ener_loss)
                 else:
                     l_huber_loss = custom_huber_loss(
@@ -349,7 +910,7 @@ class EnergyStdLoss(TaskLoss):
                 more_loss["rmse_gf"] = self.display_if_exist(
                     rmse_gf.detach(), find_drdq
                 )
-
+        
         if self.has_v and "virial" in model_pred and "virial" in label:
             find_virial = label.get("find_virial", 0.0)
             pref_v = pref_v * find_virial
@@ -373,7 +934,7 @@ class EnergyStdLoss(TaskLoss):
             if mae:
                 mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
                 more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
-
+        import pdb; pdb.set_trace()
         if self.has_ae and "atom_energy" in model_pred and "atom_ener" in label:
             atom_ener = model_pred["atom_energy"]
             atom_ener_label = label["atom_ener"]

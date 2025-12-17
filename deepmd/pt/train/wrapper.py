@@ -2,6 +2,8 @@
 import logging
 from typing import (
     Any,
+    Optional,
+    Union,
 )
 
 import torch
@@ -16,10 +18,10 @@ log = logging.getLogger(__name__)
 class ModelWrapper(torch.nn.Module):
     def __init__(
         self,
-        model: torch.nn.Module | dict,
-        loss: torch.nn.Module | dict = None,
-        model_params: dict[str, Any] | None = None,
-        shared_links: dict[str, Any] | None = None,
+        model: Union[torch.nn.Module, dict],
+        loss: Union[torch.nn.Module, dict] = None,
+        model_params: Optional[dict[str, Any]] = None,
+        shared_links: Optional[dict[str, Any]] = None,
     ) -> None:
         """Construct a DeePMD model wrapper.
 
@@ -153,15 +155,15 @@ class ModelWrapper(torch.nn.Module):
         self,
         coord: torch.Tensor,
         atype: torch.Tensor,
-        spin: torch.Tensor | None = None,
-        box: torch.Tensor | None = None,
-        cur_lr: torch.Tensor | None = None,
-        label: torch.Tensor | None = None,
-        task_key: torch.Tensor | None = None,
+        spin: Optional[torch.Tensor] = None,
+        box: Optional[torch.Tensor] = None,
+        cur_lr: Optional[torch.Tensor] = None,
+        label: Optional[torch.Tensor] = None,
+        task_key: Optional[torch.Tensor] = None,
         inference_only: bool = False,
         do_atomic_virial: bool = False,
-        fparam: torch.Tensor | None = None,
-        aparam: torch.Tensor | None = None,
+        fparam: Optional[torch.Tensor] = None,
+        aparam: Optional[torch.Tensor] = None,
     ) -> tuple[Any, Any, Any]:
         if not self.multi_task:
             task_key = "Default"
@@ -188,7 +190,8 @@ class ModelWrapper(torch.nn.Module):
             return model_pred, None, None
         else:
             natoms = atype.shape[-1]
-            model_pred, loss, more_loss = self.loss[task_key](
+            # pipeline parallel forward pass, replace the forward function
+            model_pred, loss, more_loss = self.loss[task_key].forward_pp(
                 input_dict,
                 self.model[task_key],
                 label,

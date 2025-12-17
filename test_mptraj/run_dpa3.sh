@@ -1,0 +1,1 @@
+dp --pt train input_dpa3.json --skip-neighbor-stat

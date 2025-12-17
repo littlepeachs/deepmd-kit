@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-from collections.abc import (
-    Callable,
-)
+import pickle
 from typing import (
     Any,
+    Callable,
+    Optional,
+    Union,
 )
-
+import numpy as np
 import torch
 
 from deepmd.dpmodel.utils.seed import (
@@ -221,7 +222,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         sel_reduce_factor: float = 10.0,
         use_loc_mapping: bool = True,
         optim_update: bool = True,
-        seed: int | list[int] | None = None,
+        seed: Optional[Union[int, list[int]]] = None,
         trainable: bool = True,
     ) -> None:
         super().__init__()
@@ -431,152 +432,149 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.exclude_types = exclude_types
         self.emask = PairExcludeMask(self.ntypes, exclude_types=exclude_types)
 
+
     def forward(
         self,
         nlist: torch.Tensor,
         extended_coord: torch.Tensor,
         extended_atype: torch.Tensor,
-        extended_atype_embd: torch.Tensor | None = None,
-        mapping: torch.Tensor | None = None,
-        comm_dict: dict[str, torch.Tensor] | None = None,
+        extended_atype_embd: Optional[torch.Tensor] = None,
+        mapping: Optional[torch.Tensor] = None,
+        comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        stage_size: Optional[int] = None,
+        stage_index: Optional[int] = None,
+        middle_output: Optional[dict] = None,
     ) -> tuple[
         torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
     ]:
-        parallel_mode = comm_dict is not None
-        if not parallel_mode:
-            assert mapping is not None
+
         nframes, nloc, nnei = nlist.shape
-        nall = extended_coord.view(nframes, -1).shape[1] // 3
-        atype = extended_atype[:, :nloc]
-        # nb x nloc x nnei
-        exclude_mask = self.emask(nlist, extended_atype)
-        nlist = torch.where(exclude_mask != 0, nlist, -1)
-        # nb x nloc x nnei x 4, nb x nloc x nnei x 3, nb x nloc x nnei x 1
-        dmatrix, diff, sw = prod_env_mat(
-            extended_coord,
-            nlist,
-            atype,
-            self.mean,
-            self.stddev,
-            self.e_rcut,
-            self.e_rcut_smth,
-            protection=self.env_protection,
-            use_exp_switch=self.use_exp_switch,
-        )
-        nlist_mask = nlist != -1
-        sw = torch.squeeze(sw, -1)
-        # beyond the cutoff sw should be 0.0
-        sw = sw.masked_fill(~nlist_mask, 0.0)
-
-        # get angle nlist (maybe smaller)
-        a_dist_mask = (torch.linalg.norm(diff, dim=-1) < self.a_rcut)[
-            :, :, : self.a_sel
-        ]
-        a_nlist = nlist[:, :, : self.a_sel]
-        a_nlist = torch.where(a_dist_mask, a_nlist, -1)
-        _, a_diff, a_sw = prod_env_mat(
-            extended_coord,
-            a_nlist,
-            atype,
-            self.mean[:, : self.a_sel],
-            self.stddev[:, : self.a_sel],
-            self.a_rcut,
-            self.a_rcut_smth,
-            protection=self.env_protection,
-            use_exp_switch=self.use_exp_switch,
-        )
-        a_nlist_mask = a_nlist != -1
-        a_sw = torch.squeeze(a_sw, -1)
-        # beyond the cutoff sw should be 0.0
-        a_sw = a_sw.masked_fill(~a_nlist_mask, 0.0)
-        # set all padding positions to index of 0
-        # if the a neighbor is real or not is indicated by nlist_mask
-        nlist[nlist == -1] = 0
-        a_nlist[a_nlist == -1] = 0
-
-        # get node embedding
-        # [nframes, nloc, tebd_dim]
-        assert extended_atype_embd is not None
-        atype_embd = extended_atype_embd[:, :nloc, :]
-        assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
-        assert isinstance(atype_embd, torch.Tensor)  # for jit
-        node_ebd = self.act(atype_embd)
-        n_dim = node_ebd.shape[-1]
-
-        # get edge and angle embedding input
-        # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
-        edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
-        if self.edge_init_use_dist:
-            # nb x nloc x nnei x 1
-            edge_input = torch.linalg.norm(diff, dim=-1, keepdim=True)
-
-        # nf x nloc x a_nnei x 3
-        normalized_diff_i = a_diff / (
-            torch.linalg.norm(a_diff, dim=-1, keepdim=True) + 1e-6
-        )
-        # nf x nloc x 3 x a_nnei
-        normalized_diff_j = torch.transpose(normalized_diff_i, 2, 3)
-        # nf x nloc x a_nnei x a_nnei
-        # 1 - 1e-6 for torch.acos stability
-        cosine_ij = torch.matmul(normalized_diff_i, normalized_diff_j) * (1 - 1e-6)
-        angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
-
-        if not parallel_mode and self.use_loc_mapping:
-            assert mapping is not None
-            # convert nlist from nall to nloc index
-            nlist = torch.gather(
-                mapping,
-                1,
-                index=nlist.reshape(nframes, -1),
-            ).reshape(nlist.shape)
-        if self.use_dynamic_sel:
-            # get graph index
-            edge_index, angle_index = get_graph_index(
+        parallel_mode = comm_dict is not None
+        if stage_index == 0 or stage_index is None:
+            if not parallel_mode:
+                assert mapping is not None
+            nall = extended_coord.view(nframes, -1).shape[1] // 3
+            atype = extended_atype[:, :nloc]
+            # nb x nloc x nnei
+            exclude_mask = self.emask(nlist, extended_atype)
+            nlist = torch.where(exclude_mask != 0, nlist, -1)
+            # nb x nloc x nnei x 4, nb x nloc x nnei x 3, nb x nloc x nnei x 1
+            dmatrix, diff, sw = prod_env_mat(
+                extended_coord,
                 nlist,
-                nlist_mask,
-                a_nlist_mask,
-                nall,
-                use_loc_mapping=self.use_loc_mapping,
+                atype,
+                self.mean,
+                self.stddev,
+                self.e_rcut,
+                self.e_rcut_smth,
+                protection=self.env_protection,
+                use_exp_switch=self.use_exp_switch,
             )
-            # flat all the tensors
-            # n_edge x 1
-            edge_input = edge_input[nlist_mask]
-            # n_edge x 3
-            h2 = h2[nlist_mask]
-            # n_edge x 1
-            sw = sw[nlist_mask]
-            # nb x nloc x a_nnei x a_nnei
-            a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
-            # n_angle x 1
-            angle_input = angle_input[a_nlist_mask]
-            # n_angle x 1
-            a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
-        else:
-            # avoid jit assertion
-            edge_index = torch.zeros([2, 1], device=nlist.device, dtype=nlist.dtype)
-            angle_index = torch.zeros([3, 1], device=nlist.device, dtype=nlist.dtype)
-        # get edge and angle embedding
-        # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
-        if not self.edge_init_use_dist:
-            edge_ebd = self.act(self.edge_embd(edge_input))
-        else:
-            edge_ebd = self.edge_embd(edge_input)
-        # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
-        angle_ebd = self.angle_embd(angle_input)
+            nlist_mask = nlist != -1
+            sw = torch.squeeze(sw, -1)
+            # beyond the cutoff sw should be 0.0
+            sw = sw.masked_fill(~nlist_mask, 0.0)
 
-        # nb x nall x n_dim
-        if not parallel_mode:
-            assert mapping is not None
-            mapping = (
-                mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
+            # get angle nlist (maybe smaller)
+            a_dist_mask = (torch.linalg.norm(diff, dim=-1) < self.a_rcut)[
+                :, :, : self.a_sel
+            ]
+            a_nlist = nlist[:, :, : self.a_sel]
+            a_nlist = torch.where(a_dist_mask, a_nlist, -1)
+            _, a_diff, a_sw = prod_env_mat(
+                extended_coord,
+                a_nlist,
+                atype,
+                self.mean[:, : self.a_sel],
+                self.stddev[:, : self.a_sel],
+                self.a_rcut,
+                self.a_rcut_smth,
+                protection=self.env_protection,
+                use_exp_switch=self.use_exp_switch,
             )
-        for idx, ll in enumerate(self.layers):
-            # node_ebd:     nb x nloc x n_dim
-            # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parallel_mode
+            a_nlist_mask = a_nlist != -1
+            a_sw = torch.squeeze(a_sw, -1)
+            # beyond the cutoff sw should be 0.0
+            a_sw = a_sw.masked_fill(~a_nlist_mask, 0.0)
+            # set all padding positions to index of 0
+            # if the a neighbor is real or not is indicated by nlist_mask
+            nlist[nlist == -1] = 0
+            a_nlist[a_nlist == -1] = 0
+
+            # get node embedding
+            # [nframes, nloc, tebd_dim]
+            assert extended_atype_embd is not None
+            atype_embd = extended_atype_embd[:, :nloc, :]
+            assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
+            assert isinstance(atype_embd, torch.Tensor)  # for jit
+            node_ebd = self.act(atype_embd)
+            n_dim = node_ebd.shape[-1]
+
+            # get edge and angle embedding input
+            # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
+            edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
+            if self.edge_init_use_dist:
+                # nb x nloc x nnei x 1
+                edge_input = torch.linalg.norm(diff, dim=-1, keepdim=True)
+
+            # nf x nloc x a_nnei x 3
+            normalized_diff_i = a_diff / (
+                torch.linalg.norm(a_diff, dim=-1, keepdim=True) + 1e-6
+            )
+            # nf x nloc x 3 x a_nnei
+            normalized_diff_j = torch.transpose(normalized_diff_i, 2, 3)
+            # nf x nloc x a_nnei x a_nnei
+            # 1 - 1e-6 for torch.acos stability
+            cosine_ij = torch.matmul(normalized_diff_i, normalized_diff_j) * (1 - 1e-6)
+            angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
+
+            if not parallel_mode and self.use_loc_mapping:
+                assert mapping is not None
+                # convert nlist from nall to nloc index
+                nlist = torch.gather(
+                    mapping,
+                    1,
+                    index=nlist.reshape(nframes, -1),
+                ).reshape(nlist.shape)
+            if self.use_dynamic_sel:
+                # get graph index
+                edge_index, angle_index = get_graph_index(
+                    nlist,
+                    nlist_mask,
+                    a_nlist_mask,
+                    nall,
+                    use_loc_mapping=self.use_loc_mapping,
+                )
+                # flat all the tensors
+                # n_edge x 1
+                edge_input = edge_input[nlist_mask]
+                # n_edge x 3
+                h2 = h2[nlist_mask]
+                # n_edge x 1
+                sw = sw[nlist_mask]
+                # nb x nloc x a_nnei x a_nnei
+                a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
+                # n_angle x 1
+                angle_input = angle_input[a_nlist_mask]
+                # n_angle x 1
+                a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
+            else:
+                # avoid jit assertion
+                edge_index = torch.zeros([2, 1], device=nlist.device, dtype=nlist.dtype)
+                angle_index = torch.zeros([3, 1], device=nlist.device, dtype=nlist.dtype)
+            # get edge and angle embedding
+            # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
+            if not self.edge_init_use_dist:
+                edge_ebd = self.act(self.edge_embd(edge_input))
+            else:
+                edge_ebd = self.edge_embd(edge_input)
+            # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
+            angle_ebd = self.angle_embd(angle_input)
+
             if not parallel_mode:
                 assert mapping is not None
                 node_ebd_ext = (
@@ -584,103 +582,142 @@ class DescrptBlockRepflows(DescriptorBlock):
                     if not self.use_loc_mapping
                     else node_ebd
                 )
-            else:
-                assert comm_dict is not None
-                has_spin = "has_spin" in comm_dict
-                if not has_spin:
-                    n_padding = nall - nloc
-                    node_ebd = torch.nn.functional.pad(
-                        node_ebd.squeeze(0), (0, 0, 0, n_padding), value=0.0
-                    )
-                    real_nloc = nloc
-                    real_nall = nall
-                else:
-                    # for spin
-                    real_nloc = nloc // 2
-                    real_nall = nall // 2
-                    real_n_padding = real_nall - real_nloc
-                    node_ebd_real, node_ebd_virtual = torch.split(
-                        node_ebd, [real_nloc, real_nloc], dim=1
-                    )
-                    # mix_node_ebd: nb x real_nloc x (n_dim * 2)
-                    mix_node_ebd = torch.cat([node_ebd_real, node_ebd_virtual], dim=2)
-                    # nb x real_nall x (n_dim * 2)
-                    node_ebd = torch.nn.functional.pad(
-                        mix_node_ebd.squeeze(0), (0, 0, 0, real_n_padding), value=0.0
-                    )
+            
+        else:
+            assert middle_output is not None
+            node_ebd = middle_output['node_ebd_ext']
+            edge_ebd = middle_output['edge_ebd']
+            h2 = middle_output['h2']
+            angle_ebd = middle_output['angle_ebd']
+            nlist = middle_output['nlist']
+            nlist_mask = middle_output['nlist_mask']
+            a_nlist = middle_output['a_nlist']
+            a_nlist_mask = middle_output['a_nlist_mask']
+            a_sw = middle_output['a_sw']
+            edge_index = middle_output['edge_index']
+            angle_index = middle_output['angle_index']
+            sw = middle_output['sw']
 
-                assert "send_list" in comm_dict
-                assert "send_proc" in comm_dict
-                assert "recv_proc" in comm_dict
-                assert "send_num" in comm_dict
-                assert "recv_num" in comm_dict
-                assert "communicator" in comm_dict
-                ret = torch.ops.deepmd.border_op(
-                    comm_dict["send_list"],
-                    comm_dict["send_proc"],
-                    comm_dict["recv_proc"],
-                    comm_dict["send_num"],
-                    comm_dict["recv_num"],
-                    node_ebd,
-                    comm_dict["communicator"],
-                    torch.tensor(
-                        real_nloc,
-                        dtype=torch.int32,
-                        device=torch.device("cpu"),
-                    ),  # should be int of c++, placed on cpu
-                    torch.tensor(
-                        real_nall - real_nloc,
-                        dtype=torch.int32,
-                        device=torch.device("cpu"),
-                    ),  # should be int of c++, placed on cpu
+
+        if stage_size is not None and stage_index is not None:
+            num_layers = len(self.layers)
+            start = stage_index * stage_size
+            end = min(start + stage_size, num_layers)
+
+            if start >= num_layers or start < 0:
+                raise ValueError(f"Invalid stage_index {stage_index}, start={start}, num_layers={num_layers}")
+            
+            for idx in range(start, end):
+                ll = self.layers[idx]
+                node_ebd_ext = node_ebd               
+                
+                node_ebd, edge_ebd, angle_ebd, h2, sw, a_sw = ll.forward(
+                    node_ebd_ext,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    nlist,
+                    nlist_mask,
+                    sw,
+                    a_nlist,
+                    a_nlist_mask,
+                    a_sw,
+                    edge_index=edge_index,
+                    angle_index=angle_index,
                 )
-                node_ebd_ext = ret[0].unsqueeze(0)
-                if has_spin:
-                    node_ebd_real_ext, node_ebd_virtual_ext = torch.split(
-                        node_ebd_ext, [n_dim, n_dim], dim=2
-                    )
-                    node_ebd_ext = concat_switch_virtual(
-                        node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
-                    )
-            node_ebd, edge_ebd, angle_ebd = ll.forward(
-                node_ebd_ext,
-                edge_ebd,
-                h2,
-                angle_ebd,
-                nlist,
-                nlist_mask,
-                sw,
-                a_nlist,
-                a_nlist_mask,
-                a_sw,
-                edge_index=edge_index,
-                angle_index=angle_index,
-            )
 
-        # nb x nloc x 3 x e_dim
-        h2g2 = (
-            RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
-            if not self.use_dynamic_sel
-            else RepFlowLayer._cal_hg_dynamic(
-                edge_ebd,
-                h2,
-                sw,
-                owner=edge_index[0],
-                num_owner=nframes * nloc,
-                nb=nframes,
-                nloc=nloc,
-                scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
-            )
-        )
-        # (nb x nloc) x e_dim x 3
-        rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
+            if end == num_layers:
+                h2g2 = (
+                    RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
+                    if not self.use_dynamic_sel
+                    else RepFlowLayer._cal_hg_dynamic(
+                        edge_ebd,
+                        h2,
+                        sw,
+                        owner=edge_index[0],
+                        num_owner=nframes * nloc,
+                        nb=nframes,
+                        nloc=nloc,
+                        scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
+                    )
+                )
+                # (nb x nloc) x e_dim x 3
+                rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
+                return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
+            else:
+                
+                middle_output = {
+                    'node_ebd_ext': node_ebd,
+                    'edge_ebd': edge_ebd,
+                    'h2': h2,
+                    'angle_ebd': angle_ebd,
+                    'nlist': nlist,
+                    'nlist_mask': nlist_mask,
+                    'a_nlist': a_nlist,
+                    'a_nlist_mask': a_nlist_mask,
+                    'a_sw': a_sw,
+                    'sw': sw,
+                    'edge_index': edge_index,
+                    'angle_index': angle_index,
+                }
+                
 
-        return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
+                batch_graph = {
+                    'nlist': nlist,
+                    'extended_coord': extended_coord,
+                    'extended_atype': extended_atype
+                }
+                return middle_output, batch_graph
+
+        else:
+            
+            for idx, ll in enumerate(self.layers):
+                if not parallel_mode:
+                    assert mapping is not None
+                    node_ebd_ext = (
+                        torch.gather(node_ebd, 1, mapping)
+                        if not self.use_loc_mapping
+                        else node_ebd
+                    )
+                    
+                node_ebd, edge_ebd, angle_ebd, h2, sw, a_sw = ll.forward(
+                    node_ebd_ext,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    nlist.detach(),
+                    nlist_mask.detach(),
+                    sw,
+                    a_nlist.detach(),
+                    a_nlist_mask.detach(),
+                    a_sw,
+                    edge_index=edge_index.detach(),
+                    angle_index=angle_index.detach(),
+                )
+
+            # nb x nloc x 3 x e_dim
+            h2g2 = (
+                RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
+                if not self.use_dynamic_sel
+                else RepFlowLayer._cal_hg_dynamic(
+                    edge_ebd,
+                    h2,
+                    sw,
+                    owner=edge_index[0],
+                    num_owner=nframes * nloc,
+                    nb=nframes,
+                    nloc=nloc,
+                    scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
+                )
+            )
+            # (nb x nloc) x e_dim x 3
+            rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
+            return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
 
     def compute_input_stats(
         self,
-        merged: Callable[[], list[dict]] | list[dict],
-        path: DPPath | None = None,
+        merged: Union[Callable[[], list[dict]], list[dict]],
+        path: Optional[DPPath] = None,
     ) -> None:
         """
         Compute the input statistics (e.g. mean and stddev) for the descriptors from packed data.
@@ -713,7 +750,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             sampled = []
         env_mat_stat.load_or_compute_stats(sampled, path)
         self.stats = env_mat_stat.stats
-        mean, stddev = env_mat_stat()
+        mean, stddev = env_mat_stat[Any]()
         if not self.set_davg_zero:
             self.mean.copy_(
                 torch.tensor(mean, device=env.DEVICE, dtype=self.mean.dtype)

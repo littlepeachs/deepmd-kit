@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+from typing import (
+    Optional,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -59,7 +63,7 @@ class RepFlowLayer(torch.nn.Module):
         update_residual: float = 0.1,
         update_residual_init: str = "const",
         precision: str = "float64",
-        seed: int | list[int] | None = None,
+        seed: Optional[Union[int, list[int]]] = None,
         trainable: bool = True,
     ) -> None:
         super().__init__()
@@ -1129,7 +1133,7 @@ class RepFlowLayer(torch.nn.Module):
 
         # update angle_ebd
         a_updated = self.list_update(a_update_list, "angle")
-        return n_updated, e_updated, a_updated
+        return n_updated, e_updated, a_updated, h2 * 1.0, sw * 1.0, a_sw * 1.0
 
     @torch.jit.export
     def list_update_res_avg(
