@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import logging
 from typing import (
-    Any,
     Optional,
     Union,
 )
@@ -20,8 +19,8 @@ class ModelWrapper(torch.nn.Module):
         self,
         model: Union[torch.nn.Module, dict],
         loss: Union[torch.nn.Module, dict] = None,
-        model_params: Optional[dict[str, Any]] = None,
-        shared_links: Optional[dict[str, Any]] = None,
+        model_params=None,
+        shared_links=None,
     ) -> None:
         """Construct a DeePMD model wrapper.
 
@@ -42,9 +41,9 @@ class ModelWrapper(torch.nn.Module):
         elif isinstance(model, dict):
             self.multi_task = True
             for task_key in model:
-                assert isinstance(model[task_key], torch.nn.Module), (
-                    f"{task_key} in model_dict is not a torch.nn.Module!"
-                )
+                assert isinstance(
+                    model[task_key], torch.nn.Module
+                ), f"{task_key} in model_dict is not a torch.nn.Module!"
                 self.model[task_key] = model[task_key]
         # Loss
         self.loss = None
@@ -54,18 +53,14 @@ class ModelWrapper(torch.nn.Module):
                 self.loss["Default"] = loss
             elif isinstance(loss, dict):
                 for task_key in loss:
-                    assert isinstance(loss[task_key], torch.nn.Module), (
-                        f"{task_key} in loss_dict is not a torch.nn.Module!"
-                    )
+                    assert isinstance(
+                        loss[task_key], torch.nn.Module
+                    ), f"{task_key} in loss_dict is not a torch.nn.Module!"
                     self.loss[task_key] = loss[task_key]
         self.inference_only = self.loss is None
 
     def share_params(
-        self,
-        shared_links: dict[str, Any],
-        model_key_prob_map: dict,
-        data_stat_protect: float = 1e-2,
-        resume: bool = False,
+        self, shared_links, model_key_prob_map, data_stat_protect=1e-2, resume=False
     ) -> None:
         """
         Share the parameters of classes following rules defined in shared_links during multitask training.
@@ -95,12 +90,12 @@ class ModelWrapper(torch.nn.Module):
                     class_type_link = link_item["shared_type"]
                     model_key_link = link_item["model_key"]
                     shared_level_link = int(link_item["shared_level"])
-                    assert shared_level_link >= shared_level_base, (
-                        "The shared_links must be sorted by shared_level!"
-                    )
-                    assert "descriptor" in class_type_link, (
-                        f"Class type mismatched: {class_type_base} vs {class_type_link}!"
-                    )
+                    assert (
+                        shared_level_link >= shared_level_base
+                    ), "The shared_links must be sorted by shared_level!"
+                    assert (
+                        "descriptor" in class_type_link
+                    ), f"Class type mismatched: {class_type_base} vs {class_type_link}!"
                     if class_type_link == "descriptor":
                         link_class = self.model[model_key_link].get_descriptor()
                     elif "hybrid" in class_type_link:
@@ -127,12 +122,12 @@ class ModelWrapper(torch.nn.Module):
                         class_type_link = link_item["shared_type"]
                         model_key_link = link_item["model_key"]
                         shared_level_link = int(link_item["shared_level"])
-                        assert shared_level_link >= shared_level_base, (
-                            "The shared_links must be sorted by shared_level!"
-                        )
-                        assert class_type_base == class_type_link, (
-                            f"Class type mismatched: {class_type_base} vs {class_type_link}!"
-                        )
+                        assert (
+                            shared_level_link >= shared_level_base
+                        ), "The shared_links must be sorted by shared_level!"
+                        assert (
+                            class_type_base == class_type_link
+                        ), f"Class type mismatched: {class_type_base} vs {class_type_link}!"
                         link_class = self.model[
                             model_key_link
                         ].atomic_model.__getattr__(class_type_link)
@@ -153,24 +148,24 @@ class ModelWrapper(torch.nn.Module):
 
     def forward(
         self,
-        coord: torch.Tensor,
-        atype: torch.Tensor,
+        coord,
+        atype,
         spin: Optional[torch.Tensor] = None,
         box: Optional[torch.Tensor] = None,
         cur_lr: Optional[torch.Tensor] = None,
         label: Optional[torch.Tensor] = None,
         task_key: Optional[torch.Tensor] = None,
-        inference_only: bool = False,
-        do_atomic_virial: bool = False,
+        inference_only=False,
+        do_atomic_virial=False,
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
-    ) -> tuple[Any, Any, Any]:
+    ):
         if not self.multi_task:
             task_key = "Default"
         else:
-            assert task_key is not None, (
-                f"Multitask model must specify the inference task! Supported tasks are {list(self.model.keys())}."
-            )
+            assert (
+                task_key is not None
+            ), f"Multitask model must specify the inference task! Supported tasks are {list(self.model.keys())}."
         input_dict = {
             "coord": coord,
             "atype": atype,
@@ -190,8 +185,7 @@ class ModelWrapper(torch.nn.Module):
             return model_pred, None, None
         else:
             natoms = atype.shape[-1]
-            # pipeline parallel forward pass
-            model_pred, loss, more_loss = self.loss[task_key].forward_pp(
+            model_pred, loss, more_loss = self.loss[task_key](
                 input_dict,
                 self.model[task_key],
                 label,

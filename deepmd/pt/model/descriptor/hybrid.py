@@ -45,7 +45,7 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
     def __init__(
         self,
         list: list[Union[BaseDescriptor, dict[str, Any]]],
-        **kwargs: Any,
+        **kwargs,
     ) -> None:
         super().__init__()
         # warning: list is conflict with built-in list
@@ -128,6 +128,17 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
         """Returns the number of element types."""
         return self.descrpt_list[0].get_ntypes()
 
+    def get_angle_dim(self) -> int:
+        """Returns the angle embedding dimension of this descriptor."""
+        return self.descrpt_list[0].get_angle_dim()
+
+    def get_norm_fact(self) -> list[float]:
+        """Returns the norm factor."""
+        return self.descrpt_list[0].get_norm_fact()
+
+    def get_additional_output_for_fitting(self) -> dict[str, Optional[torch.Tensor]]:
+        return self.descrpt_list[0].get_additional_output_for_fitting()
+
     def get_type_map(self) -> list[str]:
         """Get the name to each type of atoms."""
         return self.descrpt_list[0].get_type_map()
@@ -138,9 +149,9 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
 
     def get_dim_emb(self) -> int:
         """Returns the output dimension."""
-        return sum([descrpt.get_dim_emb() for descrpt in self.descrpt_list])
+        return self.descrpt_list[0].get_dim_emb()
 
-    def mixed_types(self) -> bool:
+    def mixed_types(self):
         """Returns if the descriptor requires a neighbor list that distinguish different
         atomic types or not.
         """
@@ -164,17 +175,15 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
             )
         return all_protection[0]
 
-    def share_params(
-        self, base_class: "DescrptHybrid", shared_level: int, resume: bool = False
-    ) -> None:
+    def share_params(self, base_class, shared_level, resume=False) -> None:
         """
         Share the parameters of self to the base_class with shared_level during multitask training.
         If not start from checkpoint (resume is False),
         some separated parameters (e.g. mean and stddev) will be re-calculated across different classes.
         """
-        assert self.__class__ == base_class.__class__, (
-            "Only descriptors of the same type can share params!"
-        )
+        assert (
+            self.__class__ == base_class.__class__
+        ), "Only descriptors of the same type can share params!"
         if shared_level == 0:
             for ii, des in enumerate(self.descrpt_list):
                 self.descrpt_list[ii].share_params(
@@ -184,9 +193,7 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
             raise NotImplementedError
 
     def change_type_map(
-        self,
-        type_map: list[str],
-        model_with_new_type_stat: Optional["DescrptHybrid"] = None,
+        self, type_map: list[str], model_with_new_type_stat=None
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
@@ -269,13 +276,8 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
-    ) -> tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
+        fparam: Optional[torch.Tensor] = None,
+    ):
         """Compute the descriptor.
 
         Parameters
@@ -336,6 +338,12 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
             out_descriptor.append(odescriptor)
             if gr is not None:
                 out_gr.append(gr)
+            if g2 is not None:
+                if out_g2 is None:
+                    out_g2 = g2
+            if sw is not None:
+                if out_sw is None:
+                    out_sw = sw
         out_descriptor = torch.cat(out_descriptor, dim=-1)
         out_gr = torch.cat(out_gr, dim=-2) if out_gr else None
         return out_descriptor, out_gr, out_g2, out_h2, out_sw

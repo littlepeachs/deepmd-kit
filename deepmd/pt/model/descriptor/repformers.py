@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 from typing import (
-    Any,
     Callable,
     Optional,
     Union,
@@ -52,15 +51,15 @@ from .repformer_layer import (
 if not hasattr(torch.ops.deepmd, "border_op"):
 
     def border_op(
-        argument0: Any,
-        argument1: Any,
-        argument2: Any,
-        argument3: Any,
-        argument4: Any,
-        argument5: Any,
-        argument6: Any,
-        argument7: Any,
-        argument8: Any,
+        argument0,
+        argument1,
+        argument2,
+        argument3,
+        argument4,
+        argument5,
+        argument6,
+        argument7,
+        argument8,
     ) -> torch.Tensor:
         raise NotImplementedError(
             "border_op is not available since customized PyTorch OP library is not built when freezing the model. "
@@ -76,13 +75,13 @@ if not hasattr(torch.ops.deepmd, "border_op"):
 class DescrptBlockRepformers(DescriptorBlock):
     def __init__(
         self,
-        rcut: float,
-        rcut_smth: float,
+        rcut,
+        rcut_smth,
         sel: int,
         ntypes: int,
         nlayers: int = 3,
-        g1_dim: int = 128,
-        g2_dim: int = 16,
+        g1_dim=128,
+        g2_dim=16,
         axis_neuron: int = 4,
         direct_dist: bool = False,
         update_g1_has_conv: bool = True,
@@ -112,7 +111,6 @@ class DescrptBlockRepformers(DescriptorBlock):
         use_sqrt_nnei: bool = True,
         g1_out_conv: bool = True,
         g1_out_mlp: bool = True,
-        trainable: bool = True,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -199,8 +197,6 @@ class DescrptBlockRepformers(DescriptorBlock):
             The epsilon value for layer normalization.
         seed : int, optional
             Random seed for parameter initialization.
-        trainable : bool
-            Whether the block is trainable
         """
         super().__init__()
         self.rcut = float(rcut)
@@ -251,11 +247,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.seed = seed
 
         self.g2_embd = MLPLayer(
-            1,
-            self.g2_dim,
-            precision=precision,
-            seed=child_seed(seed, 0),
-            trainable=trainable,
+            1, self.g2_dim, precision=precision, seed=child_seed(seed, 0)
         )
         layers = []
         for ii in range(nlayers):
@@ -293,7 +285,6 @@ class DescrptBlockRepformers(DescriptorBlock):
                     g1_out_conv=self.g1_out_conv,
                     g1_out_mlp=self.g1_out_mlp,
                     seed=child_seed(child_seed(seed, 1), ii),
-                    trainable=trainable,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -337,7 +328,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         """Returns the embedding dimension g2."""
         return self.g2_dim
 
-    def __setitem__(self, key: str, value: Any) -> None:
+    def __setitem__(self, key, value) -> None:
         if key in ("avg", "data_avg", "davg"):
             self.mean = value
         elif key in ("std", "data_std", "dstd"):
@@ -345,7 +336,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         else:
             raise KeyError(key)
 
-    def __getitem__(self, key: str) -> Any:
+    def __getitem__(self, key):
         if key in ("avg", "data_avg", "davg"):
             return self.mean
         elif key in ("std", "data_std", "dstd"):
@@ -370,17 +361,17 @@ class DescrptBlockRepformers(DescriptorBlock):
         return self.env_protection
 
     @property
-    def dim_out(self) -> int:
+    def dim_out(self):
         """Returns the output dimension of this descriptor."""
         return self.g1_dim
 
     @property
-    def dim_in(self) -> int:
+    def dim_in(self):
         """Returns the atomic input dimension of this descriptor."""
         return self.g1_dim
 
     @property
-    def dim_emb(self) -> int:
+    def dim_emb(self):
         """Returns the embedding dimension g2."""
         return self.get_dim_emb()
 
@@ -400,13 +391,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         mapping: Optional[torch.Tensor] = None,
         type_embedding: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
-    ) -> tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
+    ):
         if comm_dict is None:
             assert mapping is not None
             assert extended_atype_embd is not None
@@ -506,13 +491,13 @@ class DescrptBlockRepformers(DescriptorBlock):
                     torch.tensor(
                         real_nloc,
                         dtype=torch.int32,
-                        device=torch.device("cpu"),
-                    ),  # should be int of c++, placed on cpu
+                        device=env.DEVICE,
+                    ),  # should be int of c++
                     torch.tensor(
                         real_nall - real_nloc,
                         dtype=torch.int32,
-                        device=torch.device("cpu"),
-                    ),  # should be int of c++, placed on cpu
+                        device=env.DEVICE,
+                    ),  # should be int of c++
                 )
                 g1_ext = ret[0].unsqueeze(0)
                 if has_spin:

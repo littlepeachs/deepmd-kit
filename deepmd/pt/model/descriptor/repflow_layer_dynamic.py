@@ -48,7 +48,7 @@ from deepmd.pt.model.network.e3nn_networks import (
 )
 
 
-class RepFlowLayer(torch.nn.Module):
+class RepFlowLayerDynamic(torch.nn.Module):
     def __init__(
         self,
         e_rcut: float,
@@ -59,63 +59,24 @@ class RepFlowLayer(torch.nn.Module):
         a_sel: int,
         ntypes: int,
         n_dim: int = 128,
-        e_dim: int = 16,
-        a_dim: int = 64,
-        a_compress_rate: int = 0,
-        a_compress_use_split: bool = False,
-        a_compress_e_rate: int = 1,
+        e_dim: int = 64,
+        a_dim: int = 32,
+        a_compress_rate: int = 1,
+        a_compress_use_split: bool = True,
+        a_compress_e_rate: int = 2,
         n_multi_edge_message: int = 1,
         axis_neuron: int = 4,
-        update_angle: bool = True,  # angle
+        update_angle: bool = True,
         optim_update: bool = True,
-        use_dynamic_sel: bool = False,
+        use_dynamic_sel: bool = True,
         sel_reduce_factor: float = 10.0,
-        smooth_edge_update: bool = False,
+        smooth_edge_update: bool = True,
         update_dihedral: bool = False,
-        d_dim: int = 32,
-        d_sel: int = 10,
-        d_rcut: float = 2.8,
-        d_rcut_smth: float = 2.0,
-        use_ffn_node_edge_message: bool = False,
-        use_ffn_edge_edge_message: bool = False,
-        use_ffn_edge_angle_message: bool = False,
-        use_ffn_angle_angle_message: bool = False,
-        ffn_hidden_dim: int = 1024,
-        edge_use_attn: bool = False,
-        edge_attn_hidden: int = 32,
-        edge_attn_head: int = 4,
-        edge_attn_use_ln: bool = True,
-        edge_rbf_dot_self: bool = False,
-        edge_rbf_dot_message: bool = False,
-        rbf_dim: int = 8,
-        residual_pref: list = [],
-        message_use_self_concat: bool = False,
-        use_slim_message: bool = False,
-        use_gated_mlp: bool = False,
-        gated_mlp_norm: str = "none",
-        only_angle_gated_mlp: bool = False,
-        node_use_rmsnorm: bool = False,
-        angle_use_node: bool = True,
-        angle_self_attention: bool = False,
-        angle_self_attention_gate: str = "none",
-        rmsnorm_mode: str = "none",
-        edge_rbf_cat_message: bool = False,
-        edge_message_use_dropout: bool = False,
-        angle_message_use_dropout: bool = False,
-        dropout_rate: float = 0.1,
-        use_e3nn_conv: bool = False,
-        e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
-        e3nn_use_edge_feat_weights: bool = False,
-        e3nn_conv_args: dict = {},
-        e3nn_angle_conv_args: dict = {},
-        use_e3nn_angle_conv: bool = False,
-        e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
-        e3nn_angle_use_cross: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
         update_residual_init: str = "const",
-        precision: str = "float64",
+        precision: str = "float32",
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -161,149 +122,18 @@ class RepFlowLayer(torch.nn.Module):
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
 
-        self.update_dihedral = update_dihedral
-        self.d_dim = d_dim
-        self.d_sel = d_sel
-        self.d_rcut = d_rcut
-        self.d_rcut_smth = d_rcut_smth
-        self.dynamic_d_sel = (self.d_sel * 4) / self.sel_reduce_factor
-        self.use_ffn_node_edge_message = use_ffn_node_edge_message
-        self.use_ffn_edge_edge_message = use_ffn_edge_edge_message
-        self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
-        self.use_ffn_angle_angle_message = use_ffn_angle_angle_message
-        self.ffn_hidden_dim = ffn_hidden_dim
-        if (
-            self.use_ffn_node_edge_message
-            or self.use_ffn_edge_edge_message
-            or self.use_ffn_edge_angle_message
-            or self.use_ffn_angle_angle_message
-        ):
-            assert not self.optim_update, "FFN does not support optim update!"
-
-        self.edge_use_attn = edge_use_attn
-        self.edge_attn_hidden = edge_attn_hidden
-        self.edge_attn_head = edge_attn_head
-        self.edge_attn_use_ln = edge_attn_use_ln
-        self.edge_rbf_dot_self = edge_rbf_dot_self
-        self.edge_rbf_dot_message = edge_rbf_dot_message
-        self.edge_rbf_cat_message = edge_rbf_cat_message
-        self.rbf_dim = rbf_dim
-        self.residual_pref = residual_pref
+        self.residual_pref = []
         self.residual_pref += [1.0] * 10
         residual_idx = 0
-        self.message_use_self_concat = message_use_self_concat
-        self.use_slim_message = use_slim_message
-        if self.message_use_self_concat:
-            assert (
-                self.n_multi_edge_message == 1
-            ), "Only one message head is supported for self concatenation!"
 
-        self.use_gated_mlp = use_gated_mlp
-        self.gated_mlp_norm = gated_mlp_norm
-        self.only_angle_gated_mlp = only_angle_gated_mlp
-        if self.use_gated_mlp:
-            assert not self.optim_update, "Gated MLP does not support optim update!"
-        self.node_use_rmsnorm = node_use_rmsnorm
-        if self.node_use_rmsnorm:
-            self.node_rmsnorm = RMSNorm(self.n_dim, precision=precision, trainable=True)
-        else:
-            self.node_rmsnorm = None
-
-        # add rms norm debug for each component, can be removed if not necessary
-        self.rmsnorm_mode = rmsnorm_mode
-        self.rmsnorm_mod_list = self.rmsnorm_mode.split(":")
-        # mode: ['NEM', 'ESM', 'EAM', 'ASM', 'E']
-        # node edge message
-        if "NEM" in self.rmsnorm_mod_list:
-            self.NEM_rmsnorm = RMSNorm(self.n_dim, precision=precision, trainable=True)
-        else:
-            self.NEM_rmsnorm = None
-
-        # edge self message
-        if "ESM" in self.rmsnorm_mod_list:
-            self.ESM_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
-        else:
-            self.ESM_rmsnorm = None
-
-        # edge angle message
-        if "EAM" in self.rmsnorm_mod_list:
-            self.EAM_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
-        else:
-            self.EAM_rmsnorm = None
-
-        # angle self message
-        if "ASM" in self.rmsnorm_mod_list:
-            self.ASM_rmsnorm = RMSNorm(self.a_dim, precision=precision, trainable=True)
-        else:
-            self.ASM_rmsnorm = None
-
-        # edge self
-        if "E" in self.rmsnorm_mod_list:
-            self.edge_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
-        else:
-            self.edge_rmsnorm = None
-
-        self.edge_message_use_dropout = edge_message_use_dropout
-        self.angle_message_use_dropout = angle_message_use_dropout
-        self.dropout_rate = dropout_rate
-        if self.edge_message_use_dropout:
-            self.edge_message_dropout = nn.Dropout(p=self.dropout_rate)
-        else:
-            self.edge_message_dropout = None
-
-        if self.angle_message_use_dropout:
-            self.angle_message_dropout = nn.Dropout(p=self.dropout_rate)
-        else:
-            self.angle_message_dropout = None
-
-        self.angle_use_node = angle_use_node
-        self.angle_self_attention = angle_self_attention
-        self.angle_self_attention_gate = angle_self_attention_gate
-
-        if (
-            self.edge_rbf_dot_self
-            or self.edge_rbf_dot_message
-            or self.edge_rbf_cat_message
-        ):
-            self.rbf_mlp = MLPLayer(
-                rbf_dim,
-                self.e_dim,
-                precision=precision,
-                seed=child_seed(seed, 30),
-            )
-        else:
-            self.rbf_mlp = None
-
-        if self.edge_rbf_dot_message:
-            self.rbf_mlp_message = MLPLayer(
-                rbf_dim,
-                self.n_dim,
-                precision=precision,
-                seed=child_seed(seed, 31),
-            )
-        else:
-            self.rbf_mlp_message = None
-
-        if self.edge_use_attn:
-            assert (
-                not self.use_dynamic_sel
-            ), "Attention does not support dynamic selection!"
-
-        assert update_residual_init in [
-            "norm",
-            "const",
-        ], "'update_residual_init' only support 'norm' or 'const'!"
-
-        self.update_residual = update_residual
-        self.update_residual_init = update_residual_init
+        
         self.n_residual = []
         self.e_residual = []
         self.a_residual = []
         self.d_residual = []
+
         self.edge_info_dim = (
             self.n_dim * 2 + self.e_dim
-            if not self.edge_rbf_cat_message
-            else self.n_dim * 2 + self.e_dim * 2
         )
 
         # node self mlp
@@ -346,35 +176,19 @@ class RepFlowLayer(torch.nn.Module):
             residual_idx += 1
 
         # node edge message
-        if not self.use_gated_mlp or self.only_angle_gated_mlp:
-            self.node_edge_linear = MLPLayer(
-                self.edge_info_dim
-                if not self.use_ffn_node_edge_message
-                else self.ffn_hidden_dim,
-                self.n_multi_edge_message * n_dim,
-                precision=precision,
-                seed=child_seed(seed, 4),
-            )
-        else:
-            self.node_edge_linear = GatedMLP(
-                self.edge_info_dim
-                if not self.use_ffn_node_edge_message
-                else self.ffn_hidden_dim,
-                self.n_multi_edge_message * n_dim,
-                activation_function=self.activation_function,
-                norm=self.gated_mlp_norm,
-                precision=precision,
-                seed=child_seed(seed, 4),
-            )
-        if self.message_use_self_concat:
-            self.node_edge_linear_2 = MLPLayer(
-                self.n_dim + self.n_dim,
-                self.n_dim,
-                precision=precision,
-                seed=child_seed(seed, 5),
-            )
-        else:
-            self.node_edge_linear_2 = None
+    
+        self.node_edge_linear = MLPLayer(
+            self.edge_info_dim,
+            self.n_multi_edge_message * n_dim,
+            precision=precision,
+            seed=child_seed(seed, 4),
+        )
+        self.node_edge_linear_2 = MLPLayer(
+            self.n_dim + self.n_dim,
+            self.n_dim,
+            precision=precision,
+            seed=child_seed(seed, 5),
+        )
 
         if self.update_style == "res_residual":
             for head_index in range(self.n_multi_edge_message):
@@ -389,97 +203,13 @@ class RepFlowLayer(torch.nn.Module):
                 )
                 residual_idx += 1
 
-        # node edge e3nn convolution
-        self.use_e3nn_conv = use_e3nn_conv
-        self.e3nn_conv_pattern = e3nn_conv_pattern
-        self.e3nn_conv_args = e3nn_conv_args
-        self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
-        if self.use_e3nn_conv:
-            self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, weight_layer_act="silu")
-            if self.update_style == "res_residual":
-                self.n_residual.append(
-                    get_residual(
-                        n_dim,
-                        self.update_residual * self.residual_pref[residual_idx],
-                        self.update_residual_init,
-                        precision=precision,
-                        seed=child_seed(seed, 8),
-                    )
-                )
-                residual_idx += 1
-        else:
-            self.e3nn_conv_block = None
 
-        # edge self message
-        if not self.use_gated_mlp or self.only_angle_gated_mlp:
-            self.edge_self_linear = MLPLayer(
-                self.edge_info_dim
-                if not self.use_ffn_edge_edge_message
-                else self.ffn_hidden_dim,
-                e_dim,
-                precision=precision,
-                seed=child_seed(seed, 6),
-            )
-        else:
-            self.edge_self_linear = GatedMLP(
-                self.edge_info_dim
-                if not self.use_ffn_edge_edge_message
-                else self.ffn_hidden_dim,
-                e_dim,
-                activation_function=self.activation_function,
-                norm=self.gated_mlp_norm,
-                precision=precision,
-                seed=child_seed(seed, 6),
-            )
-        if self.update_style == "res_residual":
-            self.e_residual.append(
-                get_residual(
-                    e_dim,
-                    self.update_residual * self.residual_pref[residual_idx],
-                    self.update_residual_init,
-                    precision=precision,
-                    seed=child_seed(seed, 7),
-                )
-            )
-            residual_idx += 1
-
-        # edge attention
-        if self.edge_use_attn:
-            self.edge_attn_map = Atten2Map(
-                e_dim,
-                self.edge_attn_hidden,
-                self.edge_attn_head,
-                has_gate=True,
-                smooth=True,
-                precision=precision,
-                seed=child_seed(seed, 21),
-            )
-            self.edge_mh_apply = Atten2MultiHeadApply(
-                e_dim,
-                self.edge_attn_head,
-                precision=precision,
-                seed=child_seed(seed, 22),
-            )
-            self.edge_lm = LayerNorm(
-                e_dim,
-                trainable=True,
-                precision=precision,
-                seed=child_seed(seed, 23),
-            )
-            if self.update_style == "res_residual":
-                self.e_residual.append(
-                    get_residual(
-                        e_dim,
-                        self.update_residual,
-                        self.update_residual_init,
-                        precision=precision,
-                        seed=child_seed(seed, 24),
-                    )
-                )
-        else:
-            self.edge_attn_map = None
-            self.edge_mh_apply = None
-            self.edge_lm = None
+        self.edge_self_linear = MLPLayer(
+            self.edge_info_dim,
+            e_dim,
+            precision=precision,
+            seed=child_seed(seed, 6),
+        )
 
         if self.update_angle:
             self.angle_dim = self.a_dim
@@ -487,8 +217,6 @@ class RepFlowLayer(torch.nn.Module):
                 # angle + node + edge * 2
                 self.angle_dim += (
                     self.n_dim + 2 * self.e_dim
-                    if self.angle_use_node
-                    else 2 * self.e_dim
                 )
                 self.a_compress_n_linear = None
                 self.a_compress_e_linear = None
@@ -498,8 +226,6 @@ class RepFlowLayer(torch.nn.Module):
                 # angle + a_dim/c + a_dim/2c * 2 * e_rate
                 self.angle_dim += (
                     (1 + self.a_compress_e_rate)
-                    if self.angle_use_node
-                    else self.a_compress_e_rate
                 ) * (self.a_dim // self.a_compress_rate)
                 self.e_a_compress_dim = (
                     self.a_dim // (2 * self.a_compress_rate) * self.a_compress_e_rate
@@ -524,38 +250,20 @@ class RepFlowLayer(torch.nn.Module):
                     self.a_compress_n_linear = None
                     self.a_compress_e_linear = None
 
-            # edge angle message
-            if not self.use_gated_mlp:
-                self.edge_angle_linear1 = MLPLayer(
-                    self.angle_dim
-                    if not self.use_ffn_edge_angle_message
-                    else self.ffn_hidden_dim,
-                    self.e_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 10),
+            self.edge_angle_linear1 = MLPLayer(
+                self.angle_dim,
+                self.e_dim,
+                precision=precision,
+                seed=child_seed(seed, 10),
+            )
+            
+            self.edge_angle_linear2 = MLPLayer(
+                self.e_dim,
+                self.e_dim,
+                precision=precision,
+                seed=child_seed(seed, 11),
                 )
-            else:
-                self.edge_angle_linear1 = GatedMLP(
-                    self.angle_dim
-                    if not self.use_ffn_edge_angle_message
-                    else self.ffn_hidden_dim,
-                    self.e_dim,
-                    activation_function=self.activation_function,
-                    norm=self.gated_mlp_norm,
-                    precision=precision,
-                    seed=child_seed(seed, 10),
-                )
-            if not self.use_slim_message:
-                self.edge_angle_linear2 = MLPLayer(
-                    self.e_dim
-                    if not self.message_use_self_concat
-                    else self.e_dim + self.e_dim,
-                    self.e_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 11),
-                )
-            else:
-                self.edge_angle_linear2 = None
+            
             if self.update_style == "res_residual":
                 self.e_residual.append(
                     get_residual(
@@ -568,48 +276,12 @@ class RepFlowLayer(torch.nn.Module):
                 )
                 residual_idx += 1
 
-            # for edge angle e3nn conv
-            self.use_e3nn_angle_conv = use_e3nn_angle_conv
-            self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
-            self.e3nn_angle_conv_args = e3nn_angle_conv_args
-            self.e3nn_angle_use_cross = e3nn_angle_use_cross
-            if self.use_e3nn_angle_conv:
-                self.e3nn_angle_conv_block = IrrepsAngleBlock(**self.e3nn_angle_conv_args, weight_layer_act="silu")
-                if self.update_style == "res_residual":
-                    self.e_residual.append(
-                        get_residual(
-                            e_dim,
-                            self.update_residual * self.residual_pref[residual_idx],
-                            self.update_residual_init,
-                            precision=precision,
-                            seed=child_seed(seed, 22),
-                        )
-                    )
-                    residual_idx += 1
-            else:
-                self.e3nn_angle_conv_block = None
-
-            # angle self message
-            if not self.use_gated_mlp:
-                self.angle_self_linear = MLPLayer(
-                    self.angle_dim
-                    if not self.use_ffn_angle_angle_message
-                    else self.ffn_hidden_dim,
-                    self.a_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 13),
-                )
-            else:
-                self.angle_self_linear = GatedMLP(
-                    self.angle_dim
-                    if not self.use_ffn_angle_angle_message
-                    else self.ffn_hidden_dim,
-                    self.a_dim,
-                    activation_function=self.activation_function,
-                    norm=self.gated_mlp_norm,
-                    precision=precision,
-                    seed=child_seed(seed, 13),
-                )
+            self.angle_self_linear = MLPLayer(
+                self.angle_dim,
+                self.a_dim,
+                precision=precision,
+                seed=child_seed(seed, 13),
+            )
 
             if self.update_style == "res_residual":
                 self.a_residual.append(
@@ -621,64 +293,12 @@ class RepFlowLayer(torch.nn.Module):
                         seed=child_seed(seed, 14),
                     )
                 )
+            self.angle_attention_mlp_in = None
+            self.angle_attention_mlp_out = None
 
-            if self.angle_self_attention:
-                self.angle_attention_mlp_in = MLPLayer(
-                    self.a_dim,
-                    self.a_dim * 3,  # query, key, value
-                    precision=precision,
-                    seed=child_seed(seed, 21),
-                )
-                self.angle_attention_mlp_out = MLPLayer(
-                    self.a_dim,
-                    self.a_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 22),
-                )
-            else:
-                self.angle_attention_mlp_in = None
-                self.angle_attention_mlp_out = None
-
-            if self.update_dihedral:
-                self.dihedral_dim = self.d_dim + 2 * self.a_dim
-                # angle dihedral message
-                self.angle_dihedral_linear = MLPLayer(
-                    self.dihedral_dim,
-                    self.a_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 15),
-                )
-                if self.update_style == "res_residual":
-                    self.a_residual.append(
-                        get_residual(
-                            self.a_dim,
-                            self.update_residual,
-                            self.update_residual_init,
-                            precision=precision,
-                            seed=child_seed(seed, 16),
-                        )
-                    )
-
-                # dihedral self message
-                self.dihedral_self_linear = MLPLayer(
-                    self.dihedral_dim,
-                    self.d_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 17),
-                )
-                if self.update_style == "res_residual":
-                    self.d_residual.append(
-                        get_residual(
-                            self.d_dim,
-                            self.update_residual,
-                            self.update_residual_init,
-                            precision=precision,
-                            seed=child_seed(seed, 18),
-                        )
-                    )
-            else:
-                self.angle_dihedral_linear = None
-                self.dihedral_self_linear = None
+            
+            self.angle_dihedral_linear = None
+            self.dihedral_self_linear = None
         else:
             self.angle_self_linear = None
             self.edge_angle_linear1 = None
@@ -690,27 +310,9 @@ class RepFlowLayer(torch.nn.Module):
             self.angle_dihedral_linear = None
             self.dihedral_self_linear = None
 
-        if self.use_ffn_node_edge_message or self.use_ffn_edge_edge_message:
-            self.edge_message_ffn1 = MLPLayer(
-                self.edge_info_dim,
-                self.ffn_hidden_dim,
-                precision=precision,
-                bias=False,
-                seed=child_seed(seed, 19),
-            )
-        else:
-            self.edge_message_ffn1 = None
+        self.edge_message_ffn1 = None
 
-        if self.use_ffn_edge_angle_message or self.use_ffn_angle_angle_message:
-            self.angle_message_ffn1 = MLPLayer(
-                self.angle_dim,
-                self.ffn_hidden_dim,
-                precision=precision,
-                bias=False,
-                seed=child_seed(seed, 20),
-            )
-        else:
-            self.angle_message_ffn1 = None
+        self.angle_message_ffn1 = None
 
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
@@ -725,7 +327,6 @@ class RepFlowLayer(torch.nn.Module):
         flat_sw: torch.Tensor,
         owner: torch.Tensor,
         num_owner: int,
-        nloc: int,
         scale_factor: float,
     ) -> torch.Tensor:
         """
@@ -756,7 +357,8 @@ class RepFlowLayer(torch.nn.Module):
         """
         n_edge, e_dim = flat_edge_ebd.shape
         # n_edge x e_dim
-        flat_edge_ebd = flat_edge_ebd * flat_sw.unsqueeze(-1)
+        
+        flat_edge_ebd = flat_edge_ebd * flat_sw
         # n_edge x 3 x e_dim
         flat_h2g2 = (flat_h2[:, :, None] * flat_edge_ebd[:, None, :]).reshape(
             -1, 3 * e_dim
@@ -764,7 +366,7 @@ class RepFlowLayer(torch.nn.Module):
         # nf x nloc x 3 x e_dim
         h2g2 = (
             aggregate(flat_h2g2, owner, average=False, num_owner=num_owner).reshape(
-                -1, nloc, 3, e_dim
+                num_owner, 3, e_dim
             )
             * scale_factor
         )
@@ -788,13 +390,14 @@ class RepFlowLayer(torch.nn.Module):
             Atomic invariant rep, with shape nb x nloc x (axis_neuron x e_dim)
         """
         # nb x nloc x 3 x e_dim
-        nb, nloc, _, e_dim = h2g2.shape
+        
+        nall, _, e_dim = h2g2.shape
         # nb x nloc x 3 x axis
         h2g2m = h2g2[..., :axis_neuron]
         # nb x nloc x axis x e_dim
         g1_13 = torch.matmul(torch.transpose(h2g2m, -1, -2), h2g2) / (3.0**1)
         # nb x nloc x (axisxng2)
-        g1_13 = g1_13.view(nb, nloc, axis_neuron * e_dim)
+        g1_13 = g1_13.view(nall, axis_neuron * e_dim)
         return g1_13
 
 
@@ -805,7 +408,6 @@ class RepFlowLayer(torch.nn.Module):
         flat_sw: torch.Tensor,
         owner: torch.Tensor,
         num_owner: int,
-        nloc: int,
         scale_factor: float,
         axis_neuron: int,
     ) -> torch.Tensor:
@@ -844,7 +446,6 @@ class RepFlowLayer(torch.nn.Module):
             flat_sw,
             owner,
             num_owner,
-            nloc,
             scale_factor,
         )
         # nb x nloc x (axis x e_dim)
@@ -957,7 +558,7 @@ class RepFlowLayer(torch.nn.Module):
         eik2a_index: torch.Tensor,
         feat: str = "edge",
     ) -> torch.Tensor:
-        nf, nloc, node_dim = node_ebd.shape
+        nloc, node_dim = node_ebd.shape
         angle_dim = flat_angle_ebd.shape[-1]
         edge_dim = flat_edge_ebd.shape[-1]
         sub_angle_idx = (0, angle_dim)
@@ -976,7 +577,7 @@ class RepFlowLayer(torch.nn.Module):
             raise NotImplementedError
         assert angle_dim + node_dim + 2 * edge_dim == matrix.size()[0]
 
-        # n_angle * angle_dim
+        # nloc * angle_dim
         sub_angle_update = torch.matmul(
             flat_angle_ebd, matrix[sub_angle_idx[0] : sub_angle_idx[1]]
         )
@@ -985,11 +586,11 @@ class RepFlowLayer(torch.nn.Module):
         sub_node_update = torch.matmul(
             node_ebd, matrix[sub_node_idx[0] : sub_node_idx[1]]
         )
-        # n_angle * angle_dim
+        
+            
         sub_node_update = torch.index_select(
-            sub_node_update.reshape(nf * nloc, -1), 0, n2a_index
+            sub_node_update.reshape(nloc, -1), 0, n2a_index
         )
-
         # n_edge * angle_dim
         sub_edge_update_ik = torch.matmul(
             flat_edge_ebd, matrix[sub_edge_idx_ik[0] : sub_edge_idx_ik[1]]
@@ -1016,13 +617,13 @@ class RepFlowLayer(torch.nn.Module):
         feat: str = "node",
     ) -> torch.Tensor:
         
-        nf, nall, node_dim = node_ebd_ext.shape
-        _, nloc, _ = node_ebd.shape
+        nall, node_dim = node_ebd_ext.shape
+        nloc = node_ebd.shape[0]
         edge_dim = flat_edge_ebd.shape[-1]
         sub_node_idx = (0, node_dim)
         sub_node_ext_idx = (node_dim, 2 * node_dim)
         sub_edge_idx = (2 * node_dim, 2 * node_dim + edge_dim)
-
+        
         if feat == "node":
             matrix, bias = self.node_edge_linear.matrix, self.node_edge_linear.bias
         elif feat == "edge":
@@ -1030,14 +631,14 @@ class RepFlowLayer(torch.nn.Module):
         else:
             raise NotImplementedError
         assert 2 * node_dim + edge_dim == matrix.size()[0]
-
+        
         # nf * nloc * node/edge_dim
         sub_node_update = torch.matmul(
             node_ebd, matrix[sub_node_idx[0] : sub_node_idx[1]]
         )
         # n_edge * node/edge_dim
         sub_node_update = torch.index_select(
-            sub_node_update.reshape(nf * nloc, -1), 0, n2e_index
+            sub_node_update.reshape(nall, -1), 0, n2e_index
         )
 
         # nf * nall * node/edge_dim
@@ -1046,7 +647,7 @@ class RepFlowLayer(torch.nn.Module):
         )
         # n_edge * node/edge_dim
         sub_node_ext_update = torch.index_select(
-            sub_node_ext_update.reshape(nf * nall, -1), 0, n_ext2e_index
+            sub_node_ext_update.reshape(nall, -1), 0, n_ext2e_index
         )
 
         # n_edge * node/edge_dim
@@ -1059,24 +660,17 @@ class RepFlowLayer(torch.nn.Module):
 
     def forward(
         self,
-        node_ebd_ext: torch.Tensor,  # nf x nall x n_dim [OR] nf x nloc x n_dim when not parrallel_mode
+        atype_embedding: torch.Tensor,  # nf x nall x n_dim [OR] nf x nloc x n_dim when not parrallel_mode
         edge_ebd: torch.Tensor,  # nf x nloc x nnei x e_dim
         h2: torch.Tensor,  # nf x nloc x nnei x 3
-        nlist: torch.Tensor,  # nf x nloc x nnei
-        nlist_mask: torch.Tensor,  # nf x nloc x nnei
         angle_ebd: torch.Tensor,  # nf x nloc x a_nnei x a_nnei x a_dim
         sw: torch.Tensor,  # switch func, nf x nloc x nnei
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         edge_index: torch.Tensor,  # n_edge x 2
         angle_index: torch.Tensor,  # n_angle x 3
-        d_sw: Optional[torch.Tensor] = None,  # n_dihedral
+        batch: torch.Tensor,
         rbf_ebd: Optional[torch.Tensor] = None,  # n_edge x num_b
-        edge_rbf_ebd: Optional[torch.Tensor] = None,  # n_edge x num_basis
-        edge_sph: Optional[torch.Tensor] = None,  # n_edge x num_sph
-        node_sph_embed: Optional[torch.Tensor] = None,  # nf x nloc x num_sph_node
-        edge_angle_filter: Optional[torch.Tensor] = None,  # n_angle x num_sph
-        edge_sph_embed: Optional[torch.Tensor] = None,  # n_edge x num_sph
-        angle_weights: Optional[torch.Tensor] = None,  # n_angle x 8
+        
     ):
         """
         Parameters
@@ -1115,53 +709,28 @@ class RepFlowLayer(torch.nn.Module):
         a_updated : nf x nloc x a_nnei x a_nnei x a_dim
             Updated angle embedding.
         """
-        nb, nloc, nnei = nlist.shape
-        nall = node_ebd_ext.shape[1]
-        node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
-        n_edge = int(nlist_mask.sum().item())
-        assert (nb, nloc) == node_ebd.shape[:2]
-        if not self.use_dynamic_sel:
-            assert (nb, nloc, nnei, 3) == h2.shape
-        else:
-            assert (n_edge, 3) == h2.shape
+
+        nall = atype_embedding.shape[0]
+        node_ebd= atype_embedding
+        n_edge = edge_ebd.shape[0]
+        
         # del a_nlist  # may be used in the future
 
-        n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+        n2e_index, n_ext2e_index = edge_index[0,:], edge_index[1,:]
         n2a_index, eij2a_index, eik2a_index = (
-            angle_index[:, 0],
-            angle_index[:, 1],
-            angle_index[:, 2],
+            angle_index[0,:],
+            angle_index[1,:],
+            angle_index[2,:],
         )
 
         # nb x nloc x nnei x n_dim [OR] n_edge x n_dim
         nei_node_ebd = (
             torch.index_select(
-                node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
+                node_ebd.reshape(-1, self.n_dim), 0, n_ext2e_index
             )
         )
 
-        # handle edge rbf
-        if (
-            self.edge_rbf_dot_self
-            or self.edge_rbf_dot_message
-            or self.edge_rbf_cat_message
-        ):
-            assert rbf_ebd is not None
-            assert self.rbf_mlp is not None
-            edge_rbf = self.rbf_mlp(rbf_ebd)
-        else:
-            edge_rbf = None
-
-        if self.edge_rbf_dot_message:
-            assert rbf_ebd is not None
-            assert self.rbf_mlp_message is not None
-            edge_rbf_node = self.rbf_mlp_message(rbf_ebd)
-        else:
-            edge_rbf_node = None
-
-        if self.edge_rbf_dot_self:
-            assert edge_rbf is not None
-            edge_ebd = edge_ebd * edge_rbf
+        
 
         n_update_list: list[torch.Tensor] = [node_ebd]
         e_update_list: list[torch.Tensor] = [edge_ebd]
@@ -1173,14 +742,14 @@ class RepFlowLayer(torch.nn.Module):
 
         # node sym (grrg + drrd)
         node_sym_list: list[torch.Tensor] = []
+        
         node_sym_list.append(
             self.symmetrization_op_dynamic(
                 edge_ebd,
                 h2,
                 sw,
                 owner=n2e_index,
-                num_owner=nb * nloc,
-                nloc=nloc,
+                num_owner=nall,
                 scale_factor=self.dynamic_e_sel ** (-0.5),
                 axis_neuron=self.axis_neuron,
             )
@@ -1191,8 +760,7 @@ class RepFlowLayer(torch.nn.Module):
                 h2,
                 sw,
                 owner=n2e_index,
-                num_owner=nb * nloc,
-                nloc=nloc,
+                num_owner=nall,
                 scale_factor=self.dynamic_e_sel ** (-0.5),
                 axis_neuron=self.axis_neuron,
             )
@@ -1202,12 +770,6 @@ class RepFlowLayer(torch.nn.Module):
         edge_info = None
         edge_info_ffn = None
 
-        # edge message use dropout
-        if self.edge_message_use_dropout:
-            assert edge_info is not None
-            assert self.edge_message_dropout is not None
-            edge_info = self.edge_message_dropout(edge_info)
-
         # node edge message
         # nb x nloc x nnei x (h * n_dim)
         if not self.optim_update:
@@ -1216,7 +778,7 @@ class RepFlowLayer(torch.nn.Module):
                 if not self.use_gated_mlp or self.only_angle_gated_mlp:
                     node_edge_update = self.act(
                         self.node_edge_linear(edge_info)
-                    ) * sw.unsqueeze(-1)
+                    ) * sw
                 else:
                     node_edge_update = self.node_edge_linear(edge_info) * sw.unsqueeze(
                         -1
@@ -1225,74 +787,39 @@ class RepFlowLayer(torch.nn.Module):
                 assert edge_info_ffn is not None
                 node_edge_update = self.act(
                     self.node_edge_linear(edge_info_ffn)
-                ) * sw.unsqueeze(-1)
+                ) * sw
         else:
+            
             node_edge_update = self.act(
                 self.optim_edge_update_dynamic(
                     node_ebd,
-                    node_ebd_ext,
+                    node_ebd,
                     edge_ebd,
                     n2e_index,
                     n_ext2e_index,
                     "node",
                 )
-            ) * sw.unsqueeze(-1)
-        if self.edge_rbf_dot_message:
-            assert edge_rbf_node is not None
-            node_edge_update = node_edge_update * edge_rbf_node
+            ) * sw
+            
         node_edge_update = (
             (
                 aggregate(
                     node_edge_update,
                     n2e_index,
                     average=False,
-                    num_owner=nb * nloc,
-                ).reshape(nb, nloc, -1)
+                    num_owner=nall,
+                ).reshape(nall, -1)
                 / self.dynamic_e_sel
             )
         )
 
-        if "NEM" in self.rmsnorm_mod_list:
-            assert self.NEM_rmsnorm is not None
-            node_edge_update = self.NEM_rmsnorm(node_edge_update)
+        n_update_list.append(node_edge_update)
 
-        if self.n_multi_edge_message > 1:
-            # nb x nloc x h x n_dim
-            node_edge_update_mul_head = node_edge_update.view(
-                nb, nloc, self.n_multi_edge_message, self.n_dim
-            )
-            for head_index in range(self.n_multi_edge_message):
-                n_update_list.append(node_edge_update_mul_head[:, :, head_index, :])
-        else:
-            if self.message_use_self_concat:
-                assert self.node_edge_linear_2 is not None
-                node_edge_update = self.act(
-                    self.node_edge_linear_2(
-                        torch.cat([node_ebd, node_edge_update], dim=-1)
-                    )
-                )
-            n_update_list.append(node_edge_update)
-
-        # node edge e3nn
-        if self.use_e3nn_conv:
-            assert self.e3nn_conv_block is not None
-            assert node_sph_embed is not None
-            assert edge_sph is not None
-            assert edge_rbf_ebd is not None
-            assert edge_index is not None
-            edge_weights = edge_rbf_ebd if not self.e3nn_use_edge_feat_weights else edge_ebd
-            node_sph_embed = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_weights, edge_index)
-            # node_sph_embed = node_sph_embed
-            sph_conv_update = node_sph_embed[:, :, :self.n_dim].clone()  # avoid following in-place op
-            n_update_list.append(sph_conv_update)
 
         # update node_ebd
         n_updated = self.list_update(n_update_list, "node")
 
-        # node edge e3nn joint update
-        if self.use_e3nn_conv:
-            assert node_sph_embed is not None
-            node_sph_embed[:, :, : self.n_dim] = n_updated
+
 
         # edge self message
         if not self.optim_update:
@@ -1309,28 +836,24 @@ class RepFlowLayer(torch.nn.Module):
             edge_self_update = self.act(
                 self.optim_edge_update_dynamic(
                     node_ebd,
-                    node_ebd_ext,
+                    node_ebd,
                     edge_ebd,
                     n2e_index,
                     n_ext2e_index,
                     "edge",
                 )
             )
-        if self.edge_rbf_dot_message:
-            assert edge_rbf is not None
-            edge_self_update = edge_self_update * edge_rbf
-
-        if "ESM" in self.rmsnorm_mod_list:
-            assert self.ESM_rmsnorm is not None
-            edge_self_update = self.ESM_rmsnorm(edge_self_update)
+        
 
         e_update_list.append(edge_self_update)
+
 
         if self.update_angle:
             assert self.angle_self_linear is not None
             assert self.edge_angle_linear1 is not None
             # assert self.edge_angle_linear2 is not None
             # get angle info
+            
             if self.a_compress_rate != 0:
                 if not self.a_compress_use_split:
                     assert self.a_compress_n_linear is not None
@@ -1339,7 +862,7 @@ class RepFlowLayer(torch.nn.Module):
                     edge_ebd_for_angle = self.a_compress_e_linear(edge_ebd)
                 else:
                     # use the first a_compress_dim dim for node and edge
-                    node_ebd_for_angle = node_ebd[:, :, : self.n_a_compress_dim]
+                    node_ebd_for_angle = node_ebd[...,: self.n_a_compress_dim]
                     edge_ebd_for_angle = edge_ebd[..., : self.e_a_compress_dim]
             else:
                 node_ebd_for_angle = node_ebd
@@ -1347,7 +870,7 @@ class RepFlowLayer(torch.nn.Module):
 
             angle_info = None
             angle_info_ffn = None
-
+            
             edge_angle_update = self.act(
                 self.optim_angle_update_dynamic(
                     angle_ebd,
@@ -1361,7 +884,7 @@ class RepFlowLayer(torch.nn.Module):
             )
 
             # n_angle x e_dim
-            weighted_edge_angle_update = edge_angle_update * a_sw.unsqueeze(-1)
+            weighted_edge_angle_update = edge_angle_update * a_sw
             # n_edge x e_dim
             padding_edge_angle_update = aggregate(
                 weighted_edge_angle_update,
@@ -1370,45 +893,11 @@ class RepFlowLayer(torch.nn.Module):
                 num_owner=n_edge,
             ) / (self.dynamic_a_sel**0.5)
                 
-            if self.message_use_self_concat:
-                padding_edge_angle_update = torch.cat(
-                    [edge_ebd, padding_edge_angle_update], dim=-1
-                )
-            if not self.use_slim_message:
-                assert self.edge_angle_linear2 is not None
-                padding_edge_angle_update = self.act(
-                    self.edge_angle_linear2(padding_edge_angle_update)
-                )
-
-            if "EAM" in self.rmsnorm_mod_list:
-                assert self.EAM_rmsnorm is not None
-                padding_edge_angle_update = self.EAM_rmsnorm(padding_edge_angle_update)
-
             e_update_list.append(padding_edge_angle_update)
-
-            # for edge angle e3nn conv
-            if self.use_e3nn_angle_conv:
-                assert self.e3nn_angle_conv_block is not None
-                assert edge_sph_embed is not None
-                assert edge_angle_filter is not None
-                assert angle_index is not None
-                if self.e3nn_angle_use_cross:
-                    assert angle_weights is not None
-                    angle_weights_input = angle_weights
-                else:
-                    angle_weights_input = angle_ebd
-                edge_sph_embed = self.e3nn_angle_conv_block(edge_sph_embed, edge_angle_filter, angle_weights_input, angle_index, a_sw)
-                # node_sph_embed = node_sph_embed
-                edge_sph_conv_update = edge_sph_embed[:, :self.e_dim].clone()  # avoid following in-place op
-                e_update_list.append(edge_sph_conv_update)
 
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
 
-            # edge angle e3nn joint update
-            if self.use_e3nn_angle_conv:
-                assert edge_sph_embed is not None
-                edge_sph_embed[:, : self.e_dim] = e_updated
 
             # angle self message
             # nb x nloc x a_nnei x a_nnei x dim_a
@@ -1424,14 +913,7 @@ class RepFlowLayer(torch.nn.Module):
                     angle_self_update = self.act(self.angle_self_linear(angle_info_ffn))
             else:
                 angle_self_update = self.act(
-                    self.optim_angle_update(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        "angle",
-                    )
-                    if not self.use_dynamic_sel
-                    else self.optim_angle_update_dynamic(
+                    self.optim_angle_update_dynamic(
                         angle_ebd,
                         node_ebd_for_angle,
                         edge_ebd_for_angle,
@@ -1441,18 +923,13 @@ class RepFlowLayer(torch.nn.Module):
                         "angle",
                     )
                 )
-            if "ASM" in self.rmsnorm_mod_list:
-                assert self.ASM_rmsnorm is not None
-                angle_self_update = self.ASM_rmsnorm(angle_self_update)
-
+                
             a_update_list.append(angle_self_update)
 
         e_updated = self.list_update(e_update_list, "edge")
-        d_updated = None
-
         # update angle_ebd
         a_updated = self.list_update(a_update_list, "angle")
-        return n_updated, e_updated, a_updated, d_updated, node_sph_embed, edge_sph_embed
+        return n_updated, e_updated, a_updated
 
     @torch.jit.export
     def list_update_res_avg(
@@ -1496,13 +973,6 @@ class RepFlowLayer(torch.nn.Module):
         else:
             raise NotImplementedError
 
-        if update_name == "node" and self.node_use_rmsnorm:
-            assert self.node_rmsnorm is not None
-            uu = self.node_rmsnorm(uu)
-
-        if update_name == "edge" and "E" in self.rmsnorm_mod_list:
-            assert self.edge_rmsnorm is not None
-            uu = self.edge_rmsnorm(uu)
         return uu
 
     @torch.jit.export
@@ -1583,7 +1053,7 @@ class RepFlowLayer(torch.nn.Module):
         return data
 
     @classmethod
-    def deserialize(cls, data: dict) -> "RepFlowLayer":
+    def deserialize(cls, data: dict) -> "RepFlowLayerDynamic":
         """Deserialize the networks from a dict.
 
         Parameters

@@ -2,7 +2,6 @@
 import copy
 import math
 from typing import (
-    Any,
     Optional,
     Union,
 )
@@ -12,12 +11,9 @@ import torch
 from deepmd.dpmodel import (
     get_hessian_name,
 )
-from deepmd.dpmodel.output_def import (
-    FittingOutputDef,
-)
 
 
-def make_hessian_model(T_Model: type) -> type:
+def make_hessian_model(T_Model):
     """Make a model that can compute Hessian.
 
     LIMITATION: this model is not jitable due to the restrictions of torch jit script.
@@ -38,8 +34,8 @@ def make_hessian_model(T_Model: type) -> type:
     class CM(T_Model):
         def __init__(
             self,
-            *args: Any,
-            **kwargs: Any,
+            *args,
+            **kwargs,
         ) -> None:
             super().__init__(
                 *args,
@@ -58,14 +54,14 @@ def make_hessian_model(T_Model: type) -> type:
                 if kk in keys:
                     self.hess_fitting_def[kk].r_hessian = True
 
-        def atomic_output_def(self) -> FittingOutputDef:
+        def atomic_output_def(self):
             """Get the fitting output def."""
             return self.hess_fitting_def
 
         def forward_common(
             self,
-            coord: torch.Tensor,
-            atype: torch.Tensor,
+            coord,
+            atype,
             box: Optional[torch.Tensor] = None,
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
@@ -163,9 +159,9 @@ def make_hessian_model(T_Model: type) -> type:
 
         def _cal_hessian_one_component(
             self,
-            ci: int,
-            coord: torch.Tensor,
-            atype: torch.Tensor,
+            ci,
+            coord,
+            atype,
             box: Optional[torch.Tensor] = None,
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
@@ -176,10 +172,11 @@ def make_hessian_model(T_Model: type) -> type:
             # fparam: Optional[torch.Tensor] = None,  # nfp
             # aparam: Optional[torch.Tensor] = None,  # (nloc x nap)
             wc = wrapper_class_forward_energy(self, ci, atype, box, fparam, aparam)
+
             hess = torch.autograd.functional.hessian(
                 wc,
                 coord,
-                create_graph=self.training,
+                create_graph=False,
             )
             return hess
 
@@ -199,8 +196,8 @@ def make_hessian_model(T_Model: type) -> type:
 
         def __call__(
             self,
-            xx: torch.Tensor,
-        ) -> torch.Tensor:
+            xx,
+        ):
             ci = self.ci
             atype, box, fparam, aparam = self.atype, self.box, self.fparam, self.aparam
             res = super(CM, self.obj).forward_common(

@@ -8,7 +8,6 @@ from pathlib import (
     Path,
 )
 from typing import (
-    Any,
     Optional,
     Union,
 )
@@ -26,7 +25,6 @@ from deepmd import (
 )
 from deepmd.common import (
     expand_sys_str,
-    j_loader,
 )
 from deepmd.env import (
     GLOBAL_CONFIG,
@@ -63,7 +61,6 @@ from deepmd.pt.utils.dataloader import (
 )
 from deepmd.pt.utils.env import (
     DEVICE,
-    LOCAL_RANK,
 )
 from deepmd.pt.utils.finetune import (
     get_finetune_rules,
@@ -96,34 +93,35 @@ log = logging.getLogger(__name__)
 
 
 def get_trainer(
-    config: dict[str, Any],
-    init_model: Optional[str] = None,
-    restart_model: Optional[str] = None,
-    finetune_model: Optional[str] = None,
-    force_load: bool = False,
-    init_frz_model: Optional[str] = None,
-    shared_links: Optional[dict[str, Any]] = None,
-    finetune_links: Optional[dict[str, Any]] = None,
-) -> training.Trainer:
+    config,
+    init_model=None,
+    restart_model=None,
+    finetune_model=None,
+    force_load=False,
+    init_frz_model=None,
+    shared_links=None,
+    finetune_links=None,
+):
     multi_task = "model_dict" in config.get("model", {})
 
+    # Initialize DDP
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        local_rank = int(local_rank)
+        dist.init_process_group(backend="cuda:nccl,cpu:gloo")
+
     def prepare_trainer_input_single(
-        model_params_single: dict[str, Any],
-        data_dict_single: dict[str, Any],
-        rank: int = 0,
-        seed: Optional[int] = None,
-    ) -> tuple[DpLoaderSet, Optional[DpLoaderSet], Optional[DPPath]]:
+        model_params_single, data_dict_single, rank=0, seed=None
+    ):
         training_dataset_params = data_dict_single["training_data"]
         validation_dataset_params = data_dict_single.get("validation_data", None)
         validation_systems = (
             validation_dataset_params["systems"] if validation_dataset_params else None
         )
         training_systems = training_dataset_params["systems"]
-        trn_patterns = training_dataset_params.get("rglob_patterns", None)
-        training_systems = process_systems(training_systems, patterns=trn_patterns)
+        training_systems = process_systems(training_systems)
         if validation_systems is not None:
-            val_patterns = validation_dataset_params.get("rglob_patterns", None)
-            validation_systems = process_systems(validation_systems, val_patterns)
+            validation_systems = process_systems(validation_systems)
 
         # stat files
         stat_file_path_single = data_dict_single.get("stat_file", None)
@@ -140,7 +138,7 @@ def get_trainer(
 
         # validation and training data
         # avoid the same batch sequence among devices
-        rank_seed = [rank, seed % (2**32)] if seed is not None else None
+        rank_seed = (seed + rank) % (2**32) if seed is not None else None
         validation_data_single = (
             DpLoaderSet(
                 validation_systems,
@@ -256,10 +254,9 @@ def train(
     output: str = "out.json",
 ) -> None:
     log.info("Configuration path: %s", input_file)
-    env.CUSTOM_OP_USE_JIT = True
-    if LOCAL_RANK == 0:
-        SummaryPrinter()()
-    config = j_loader(input_file)
+    SummaryPrinter()()
+    with open(input_file) as fin:
+        config = json.load(fin)
     # ensure suffix, as in the command line help, we say "path prefix of checkpoint files"
     if init_model is not None and not init_model.endswith(".pt"):
         init_model += ".pt"
@@ -272,9 +269,9 @@ def train(
     if multi_task:
         config["model"], shared_links = preprocess_shared_params(config["model"])
         # handle the special key
-        assert "RANDOM" not in config["model"]["model_dict"], (
-            "Model name can not be 'RANDOM' in multi-task mode!"
-        )
+        assert (
+            "RANDOM" not in config["model"]["model_dict"]
+        ), "Model name can not be 'RANDOM' in multi-task mode!"
 
     # update fine-tuning config
     finetune_links = None
@@ -339,10 +336,6 @@ def train(
     with open(output, "w") as fp:
         json.dump(config, fp, indent=4)
 
-    # Initialize DDP
-    if os.environ.get("LOCAL_RANK") is not None:
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo")
-
     trainer = get_trainer(
         config,
         init_model,
@@ -365,8 +358,6 @@ def train(
                     min_nbor_dist[model_item], dtype=torch.float64, device=DEVICE
                 )
     trainer.run()
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def freeze(
@@ -416,9 +407,9 @@ def change_bias(
     multi_task = "model_dict" in model_params
     bias_adjust_mode = "change-by-statistic" if mode == "change" else "set-by-statistic"
     if multi_task:
-        assert model_branch is not None, (
-            "For multitask model, the model branch must be set!"
-        )
+        assert (
+            model_branch is not None
+        ), "For multitask model, the model branch must be set!"
         assert model_branch in model_params["model_dict"], (
             f"For multitask model, the model branch must be in the 'model_dict'! "
             f"Available options are : {list(model_params['model_dict'].keys())}."
@@ -440,12 +431,12 @@ def change_bias(
 
     if bias_value is not None:
         # use user-defined bias
-        assert model_to_change.model_type in ["ener"], (
-            "User-defined bias is only available for energy model!"
-        )
-        assert len(bias_value) == len(type_map), (
-            f"The number of elements in the bias should be the same as that in the type_map: {type_map}."
-        )
+        assert model_to_change.model_type in [
+            "ener"
+        ], "User-defined bias is only available for energy model!"
+        assert (
+            len(bias_value) == len(type_map)
+        ), f"The number of elements in the bias should be the same as that in the type_map: {type_map}."
         old_bias = model_to_change.get_out_bias()
         bias_to_set = torch.tensor(
             bias_value, dtype=old_bias.dtype, device=old_bias.device

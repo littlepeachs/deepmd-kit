@@ -2,11 +2,13 @@
 from .denoise import (
     DenoiseLoss,
 )
+from .dens import (
+    DeNSLoss,
+)
 from .dos import (
     DOSLoss,
 )
 from .ener import (
-    EnergyHessianStdLoss,
     EnergyStdLoss,
 )
 from .ener_spin import (
@@ -24,8 +26,8 @@ from .tensor import (
 
 __all__ = [
     "DOSLoss",
+    "DeNSLoss",
     "DenoiseLoss",
-    "EnergyHessianStdLoss",
     "EnergySpinLoss",
     "EnergyStdLoss",
     "PropertyLoss",

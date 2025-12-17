@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import math
 from typing import (
-    Any,
     ClassVar,
     Optional,
     Union,
@@ -27,9 +27,14 @@ from deepmd.dpmodel.utils import (
     make_multilayer_network,
 )
 from deepmd.pt.model.network.init import (
+    _calculate_fan_in_and_fan_out,
     kaiming_normal_,
+    kaiming_uniform_,
     normal_,
+    orthogonal_,
+    spectral_,
     trunc_normal_,
+    uniform_,
     xavier_uniform_,
 )
 from deepmd.pt.utils.env import (
@@ -42,9 +47,12 @@ from deepmd.pt.utils.utils import (
     to_numpy_array,
     to_torch_tensor,
 )
+from deepmd.utils.version import (
+    check_version_compatibility,
+)
 
 
-def empty_t(shape: tuple[int, ...], precision: torch.dtype) -> torch.Tensor:
+def empty_t(shape, precision):
     return torch.empty(shape, dtype=precision, device=device)
 
 
@@ -73,8 +81,8 @@ class Identity(nn.Module):
 class MLPLayer(nn.Module):
     def __init__(
         self,
-        num_in: int,
-        num_out: int,
+        num_in,
+        num_out,
         bias: bool = True,
         use_timestep: bool = False,
         activation_function: Optional[str] = None,
@@ -84,10 +92,8 @@ class MLPLayer(nn.Module):
         precision: str = DEFAULT_PRECISION,
         init: str = "default",
         seed: Optional[Union[int, list[int]]] = None,
-        trainable: bool = True,
     ) -> None:
         super().__init__()
-        self.trainable = trainable
         # only use_timestep when skip connection is established.
         self.use_timestep = use_timestep and (
             num_out == num_in or num_out == num_in * 2
@@ -112,6 +118,8 @@ class MLPLayer(nn.Module):
             self.idt = None
         self.resnet = resnet
         if init == "default":
+            init = env.MLP_INIT
+        if init == "default":
             self._default_normal_init(
                 bavg=bavg, stddev=stddev, generator=random_generator
             )
@@ -125,15 +133,22 @@ class MLPLayer(nn.Module):
             self._zero_init(self.use_bias)
         elif init == "kaiming_normal":
             self._normal_init(generator=random_generator)
+        elif init == "kaiming_uniform":
+            self._kaiming_uniform_init(generator=random_generator)
         elif init == "final":
             self._zero_init(False)
+        elif init.split(":")[0] == "orthogonal":
+            gain = float(init.split(":")[1]) if len(init.split(":")) > 1 else 1.0
+            self._orthogonal_init(gain=gain, generator=random_generator)
+        elif init == "spectral":
+            self._spectral_init(bavg=bavg, stddev=stddev, generator=random_generator)
         else:
             raise ValueError(f"Unknown initialization method: {init}")
 
     def check_type_consistency(self) -> None:
         precision = self.precision
 
-        def check_var(var: Optional[torch.Tensor]) -> None:
+        def check_var(var) -> None:
             if var is not None:
                 # assertion "float64" == "double" would fail
                 assert PRECISION_DICT[var.dtype.name] is PRECISION_DICT[precision]
@@ -165,7 +180,7 @@ class MLPLayer(nn.Module):
             normal_(self.idt.data, mean=0.1, std=0.001, generator=generator)
 
     def _trunc_normal_init(
-        self, scale: float = 1.0, generator: Optional[torch.Generator] = None
+        self, scale=1.0, generator: Optional[torch.Generator] = None
     ) -> None:
         # Constant from scipy.stats.truncnorm.std(a=-2, b=2, loc=0., scale=1.)
         TRUNCATED_NORMAL_STDDEV_FACTOR = 0.87962566103423978
@@ -177,7 +192,7 @@ class MLPLayer(nn.Module):
     def _glorot_uniform_init(self, generator: Optional[torch.Generator] = None) -> None:
         xavier_uniform_(self.matrix, gain=1, generator=generator)
 
-    def _zero_init(self, use_bias: bool = True) -> None:
+    def _zero_init(self, use_bias=True) -> None:
         with torch.no_grad():
             self.matrix.fill_(0.0)
             if use_bias and self.bias is not None:
@@ -186,6 +201,32 @@ class MLPLayer(nn.Module):
 
     def _normal_init(self, generator: Optional[torch.Generator] = None) -> None:
         kaiming_normal_(self.matrix, nonlinearity="linear", generator=generator)
+
+    def _kaiming_uniform_init(
+        self, generator: Optional[torch.Generator] = None
+    ) -> None:
+        kaiming_uniform_(self.matrix, a=math.sqrt(5), generator=generator)
+        if self.bias is not None:
+            fan_in, _ = _calculate_fan_in_and_fan_out(self.matrix)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            uniform_(self.bias, -bound, bound)
+
+    def _orthogonal_init(
+        self, gain=1.0, generator: Optional[torch.Generator] = None
+    ) -> None:
+        orthogonal_(self.matrix, gain=gain, generator=generator)
+        if self.bias is not None:
+            with torch.no_grad():
+                self.bias.fill_(0.0)
+
+    def _spectral_init(
+        self,
+        bavg: float = 0.0,
+        stddev: float = 1.0,
+        generator: Optional[torch.Generator] = None,
+    ) -> None:
+        self._default_normal_init(bavg=bavg, stddev=stddev, generator=generator)
+        spectral_(self.matrix, generator=generator)
 
     def forward(
         self,
@@ -206,14 +247,18 @@ class MLPLayer(nn.Module):
         ori_prec = xx.dtype
         if not env.DP_DTYPE_PROMOTION_STRICT:
             xx = xx.to(self.prec)
-        yy = F.linear(xx, self.matrix.t(), self.bias)
-        yy = self.activate(yy)
+        yy = (
+            torch.matmul(xx, self.matrix) + self.bias
+            if self.bias is not None
+            else torch.matmul(xx, self.matrix)
+        )
+        yy = self.activate(yy).clone()
         yy = yy * self.idt if self.idt is not None else yy
         if self.resnet:
             if xx.shape[-1] == yy.shape[-1]:
-                yy = yy + xx
+                yy += xx
             elif 2 * xx.shape[-1] == yy.shape[-1]:
-                yy = yy + torch.concat([xx, xx], dim=-1)
+                yy += torch.concat([xx, xx], dim=-1)
             else:
                 yy = yy
         if not env.DP_DTYPE_PROMOTION_STRICT:
@@ -236,7 +281,6 @@ class MLPLayer(nn.Module):
             activation_function=self.activate_name,
             resnet=self.resnet,
             precision=self.precision,
-            trainable=self.trainable,
         )
         nl.w, nl.b, nl.idt = (
             to_numpy_array(self.matrix),
@@ -263,11 +307,10 @@ class MLPLayer(nn.Module):
             activation_function=nl["activation_function"],
             resnet=nl["resnet"],
             precision=nl["precision"],
-            trainable=nl["trainable"],
         )
         prec = PRECISION_DICT[obj.precision]
 
-        def check_load_param(ss: str) -> Optional[nn.Parameter]:
+        def check_load_param(ss):
             return (
                 nn.Parameter(data=to_torch_tensor(nl[ss]))
                 if nl[ss] is not None
@@ -280,11 +323,88 @@ class MLPLayer(nn.Module):
         return obj
 
 
+class FeedForward(nn.Module):
+    """
+    A feed forward network with two linear layers and an activation function.
+    No dropout, no gate and no residual connection.
+    """
+
+    def __init__(
+        self,
+        num_in: int,
+        num_out: int,
+        hidden_dim: int,
+        activation_function: Optional[str] = None,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_in = num_in
+        self.num_out = num_out
+        self.hidden_dim = hidden_dim
+        self.activation_function = activation_function
+        self.bias = bias
+        self.w1 = MLPLayer(
+            num_in=num_in,
+            num_out=hidden_dim,
+            bias=bias,
+        )
+        self.act = ActivationFn(activation_function)
+        self.w2 = MLPLayer(
+            num_in=hidden_dim,
+            num_out=num_out,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.act(self.w1(x)))
+
+    def serialize(self) -> dict:
+        """Serialize the networks to a dict.
+
+        Returns
+        -------
+        dict
+            The serialized networks.
+        """
+        data = {
+            "@class": "FeedForward",
+            "@version": 1,
+            "num_in": self.num_in,
+            "num_out": self.num_out,
+            "hidden_dim": self.hidden_dim,
+            "activation_function": self.activation_function,
+            "bias": self.bias,
+            "w1": self.w1.serialize(),
+            "w2": self.w2.serialize(),
+        }
+        return data
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "FeedForward":
+        """Deserialize the networks from a dict.
+
+        Parameters
+        ----------
+        data : dict
+            The dict to deserialize from.
+        """
+        data = data.copy()
+        check_version_compatibility(data.pop("@version"), 1, 1)
+        data.pop("@class")
+        w1 = data.pop("w1")
+        w2 = data.pop("w2")
+
+        obj = cls(**data)
+        obj.w1 = MLPLayer.deserialize(w1)
+        obj.w2 = MLPLayer.deserialize(w2)
+        return obj
+
+
 MLP_ = make_multilayer_network(MLPLayer, nn.Module)
 
 
 class MLP(MLP_):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.layers = torch.nn.ModuleList(self.layers)
 
@@ -305,8 +425,238 @@ class NetworkCollection(DPNetworkCollection, nn.Module):
         "fitting_network": FittingNet,
     }
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         # init both two base classes
         DPNetworkCollection.__init__(self, *args, **kwargs)
         nn.Module.__init__(self)
         self.networks = self._networks = torch.nn.ModuleList(self._networks)
+
+
+class GatedMLP(nn.Module):
+    """Gated MLP
+    similar model structure is used in CGCNN and M3GNet.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        activation_function: Optional[str] = None,
+        norm: str = "batch",
+        bias: bool = True,
+        precision: str = DEFAULT_PRECISION,
+        seed: Optional[Union[int, list[int]]] = None,
+    ) -> None:
+        """Initialize a gated MLP.
+
+        Args:
+            input_dim (int): the input dimension
+            output_dim (int): the output dimension
+            activation_function (str, optional): The name of the activation function to use in
+                the gated MLP. Must be one of "relu", "silu", "tanh", or "gelu".
+                Default = "silu"
+            norm (str, optional): The name of the normalization layer to use on the
+                updated atom features. Must be one of "batch", "layer", or None.
+                Default = "batch"
+            bias (bool): whether to use bias in each Linear layers.
+                Default = True
+        """
+        super().__init__()
+        self.mlp_core = MLPLayer(
+            input_dim,
+            output_dim,
+            bias=bias,
+            precision=precision,
+            seed=seed,
+        )
+        self.mlp_gate = MLPLayer(
+            input_dim,
+            output_dim,
+            bias=bias,
+            precision=precision,
+            seed=seed,
+        )
+        # for jit
+        self.matrix = self.mlp_core.matrix
+        self.bias = self.mlp_core.bias
+        self.act = ActivationFn(activation_function)
+        self.sigmoid = nn.Sigmoid()
+        self.norm1 = find_normalization(name=norm, dim=output_dim)
+        self.norm2 = find_normalization(name=norm, dim=output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Performs a forward pass through the MLP.
+
+        Args:
+            x (Tensor): a tensor of shape (batch_size, input_dim)
+
+        Returns
+        -------
+        Tensor: a tensor of shape (batch_size, output_dim)
+        """
+        if self.norm1 is None:
+            core = self.act(self.mlp_core(x))
+            gate = self.sigmoid(self.mlp_gate(x))
+        else:
+            core = self.act(self.norm1(self.mlp_core(x)))
+            gate = self.sigmoid(self.norm2(self.mlp_gate(x)))
+        return core * gate
+
+
+class AngleSH(nn.Module):
+    def __init__(self, L_max: int):
+        super().__init__()
+        self.L_max = L_max
+        l = torch.arange(L_max + 1, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=device)
+        norm = torch.sqrt((2 * l + 1) / (4 * torch.pi))
+        self.register_buffer("norm", norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        L = self.L_max
+        P0 = torch.ones_like(x)
+        P1 = x
+        P_list = [P0, P1]
+        for l in range(1, L):
+            Plp1 = ((2 * l + 1) * x * P_list[-1] - l * P_list[-2]) / (l + 1)
+            P_list.append(Plp1)
+
+        P = torch.concat(P_list, dim=-1)  # (..., L+1)
+        return P * self.norm.type(x.dtype)
+
+
+class AnglePriorEncoder(nn.Module):
+    """
+    Smooth delta encoder for bond angles a ∈ [0, π] (radians).
+    - Fixed 10 prior centers (in radians) taken from common molecular/material geometries.
+    - Kernel: Gaussian RBF on linear difference (no periodic wrapping).
+    - Output: softmax-normalized similarity vector of length 10 (smooth one-hot).
+    - Optional: learnable global width (sigma).
+
+    Centers (degrees → radians):
+      1) 180.0  : linear (sp), also octahedral/trans positions
+      2) 120.0  : trigonal planar (sp2), graphene etc.
+      3) 109.47 : ideal tetrahedral (sp3)
+      4) 104.5  : water H-O-H
+      5) 106.7  : ammonia H-N-H (trigonal pyramidal)
+      6) 90.0   : square planar / octahedral adjacent
+      7) 180.0  : (duplicate center kept intentionally for prior emphasis)
+      8) 120.0  : trigonal bipyramidal equatorial-equatorial
+      9) 90.0   : trigonal bipyramidal axial-equatorial
+     10) 60.0   : cyclopropane strained angle
+    """
+
+    def __init__(
+        self,
+        sigma_deg: float = 6.0,  # initial Gaussian width in degrees
+        learn_sigma: bool = True,  # make sigma trainable if desired
+        normalize: Optional[str] = "softmax",
+        eps: float = 1e-9,
+        interpolate: bool = False,  # whether to interpolate the angles
+    ):
+        super().__init__()
+        assert normalize in ("softmax", "l1", None)
+        self.normalize = normalize
+        self.eps = eps
+        self.interpolate = interpolate
+
+        # --- Fixed prior centers (degrees) ---
+        centers_deg = torch.tensor(
+            [180.0, 120.0, 109.47, 104.5, 106.7, 90.0, 180.0, 120.0, 90.0, 60.0]
+            if not interpolate
+            else [
+                180.0,
+                160.0,
+                140.0,
+                120.0,
+                109.47,
+                104.5,
+                106.7,
+                90.0,
+                80.0,
+                60.0,
+                40.0,
+                20.0,
+            ],
+            dtype=env.GLOBAL_PT_FLOAT_PRECISION,
+            device=device,
+        )
+
+        # Convert to radians and store as buffer: shape (K,)
+        centers_rad = centers_deg * (torch.pi / 180.0)
+        self.register_buffer("centers", centers_rad)  # (10 or 12,)
+
+        # --- Width parameter (global sigma, radians) ---
+        sigma_rad = float(sigma_deg) * math.pi / 180.0
+
+        # Softplus parameterization to keep sigma > 0
+        def inv_softplus(x: float) -> float:
+            x = max(x, 1e-12)
+            return float(math.log(math.exp(x) - 1.0))
+
+        raw = torch.tensor(
+            inv_softplus(sigma_rad), dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=device
+        )
+        if learn_sigma:
+            self.raw_sigma = nn.Parameter(data=raw)
+        else:
+            self.register_buffer("raw_sigma", raw)
+
+    @property
+    def sigma(self) -> torch.Tensor:
+        """Current positive width (radians)."""
+        return F.softplus(self.raw_sigma) + 1e-12
+
+    # @torch.no_grad()
+    # def auto_sigma_from_centers(self, factor: float = 0.6, min_sigma_deg: float = 1.0):
+    #     """
+    #     Set a reasonable global sigma from center spacing on [0, π].
+    #     Uses median nearest-neighbor distance x factor, with a lower bound.
+    #     """
+    #     c = self.centers  # (K,)
+    #     # Pairwise |c_i - c_j|
+    #     dmat = torch.abs(c[:, None] - c[None, :])
+    #     # Ignore self-distance
+    #     dmat = dmat + torch.eye(c.numel(), dtype=c.dtype, device=c.device) * 1e6
+    #     dmin = dmat.min(dim=1).values  # nearest neighbor distance per center
+    #     # Use median spacing to get a single global sigma
+    #     sigma = torch.clamp(torch.median(dmin) * factor,
+    #                         min=min_sigma_deg * math.pi / 180.0)
+    #     # Write into raw_sigma (inverse softplus)
+    #     with torch.no_grad():
+    #         self.raw_sigma.copy_(torch.log(torch.exp(sigma) - 1.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        a: (...,) tensor of angles in radians, expected in [0, π].
+        returns: (..., 10) similarity/weight vector.
+        """
+        theta = torch.acos(x)
+        centers = self.centers.type(x.dtype)
+        s = self.sigma.type(x.dtype)
+        # Linear difference (no periodicity)
+        diff = theta - centers  # (..., K)
+        # Gaussian kernel
+        sims = torch.exp(-0.5 * (diff / s).pow(2))  # (..., K)
+
+        # Normalization
+        if self.normalize is None:
+            codes = sims
+        elif self.normalize == "softmax":
+            codes = F.softmax(torch.log(sims + self.eps), dim=-1)
+        elif self.normalize == "l1":
+            codes = sims / (sims.sum(dim=-1, keepdim=True) + self.eps)
+        else:
+            raise ValueError(f"Unknown normalization: {self.normalize}")
+        return torch.cat([x, codes], dim=-1)
+
+
+def find_normalization(name: str, dim: int | None = None) -> nn.Module | None:
+    """Return an normalization function using name."""
+    if name is None:
+        return None
+    return {
+        "batch": nn.BatchNorm1d(dim),
+        "layer": nn.LayerNorm(dim),
+        "none": None,
+    }.get(name.lower(), None)

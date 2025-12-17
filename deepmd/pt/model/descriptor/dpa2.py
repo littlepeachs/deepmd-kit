@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 from typing import (
-    Any,
     Callable,
     Optional,
     Union,
@@ -156,7 +155,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         """
         super().__init__()
 
-        def init_subclass_params(sub_data: Any, sub_class: Any) -> Any:
+        def init_subclass_params(sub_data, sub_class):
             if isinstance(sub_data, dict):
                 return sub_class(**sub_data)
             elif isinstance(sub_data, sub_class):
@@ -189,7 +188,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             smooth=smooth,
             type_one_side=self.repinit_args.type_one_side,
             seed=child_seed(seed, 0),
-            trainable=trainable,
         )
         self.use_three_body = self.repinit_args.use_three_body
         if self.use_three_body:
@@ -209,7 +207,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
                 resnet_dt=self.repinit_args.resnet_dt,
                 smooth=smooth,
                 seed=child_seed(seed, 5),
-                trainable=trainable,
             )
         else:
             self.repinit_three_body = None
@@ -250,7 +247,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             g1_out_conv=self.repformer_args.g1_out_conv,
             g1_out_mlp=self.repformer_args.g1_out_mlp,
             seed=child_seed(seed, 1),
-            trainable=trainable,
         )
         self.rcsl_list = [
             (self.repformers.get_rcut(), self.repformers.get_nsel()),
@@ -262,9 +258,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             )
         self.rcsl_list.sort()
         for ii in range(1, len(self.rcsl_list)):
-            assert self.rcsl_list[ii - 1][1] <= self.rcsl_list[ii][1], (
-                "rcut and sel are not in the same order"
-            )
+            assert (
+                self.rcsl_list[ii - 1][1] <= self.rcsl_list[ii][1]
+            ), "rcut and sel are not in the same order"
         self.rcut_list = [ii[0] for ii in self.rcsl_list]
         self.nsel_list = [ii[1] for ii in self.rcsl_list]
         self.use_econf_tebd = use_econf_tebd
@@ -278,7 +274,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             use_econf_tebd=self.use_econf_tebd,
             use_tebd_bias=use_tebd_bias,
             type_map=type_map,
-            trainable=trainable,
         )
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision
@@ -304,7 +299,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
                 precision=precision,
                 init="glorot",
                 seed=child_seed(seed, 3),
-                trainable=trainable,
             )
         self.tebd_transform = None
         if self.add_tebd_to_repinit_out:
@@ -314,7 +308,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
                 bias=False,
                 precision=precision,
                 seed=child_seed(seed, 4),
-                trainable=trainable,
             )
         assert self.repinit.rcut > self.repformers.rcut
         assert self.repinit.sel[0] > self.repformers.sel[0]
@@ -391,17 +384,15 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         # the env_protection of repinit is the same as that of the repformer
         return self.repinit.get_env_protection()
 
-    def share_params(
-        self, base_class: Any, shared_level: int, resume: bool = False
-    ) -> None:
+    def share_params(self, base_class, shared_level, resume=False) -> None:
         """
         Share the parameters of self to the base_class with shared_level during multitask training.
         If not start from checkpoint (resume is False),
         some separated parameters (e.g. mean and stddev) will be re-calculated across different classes.
         """
-        assert self.__class__ == base_class.__class__, (
-            "Only descriptors of the same type can share params!"
-        )
+        assert (
+            self.__class__ == base_class.__class__
+        ), "Only descriptors of the same type can share params!"
         # For DPA2 descriptors, the user-defined share-level
         # shared_level: 0
         # share all parameters in type_embedding, repinit and repformers
@@ -425,14 +416,14 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             raise NotImplementedError
 
     def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat: Optional[Any] = None
+        self, type_map: list[str], model_with_new_type_stat=None
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
         """
-        assert self.type_map is not None, (
-            "'type_map' must be defined when performing type changing!"
-        )
+        assert (
+            self.type_map is not None
+        ), "'type_map' must be defined when performing type changing!"
         remap_index, has_new_type = get_index_between_two_maps(self.type_map, type_map)
         self.type_map = type_map
         self.type_embedding.change_type_map(type_map=type_map)
@@ -480,11 +471,11 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             repinit_three_body["dstd"] = repinit_three_body["dstd"][remap_index]
 
     @property
-    def dim_out(self) -> int:
+    def dim_out(self):
         return self.get_dim_out()
 
     @property
-    def dim_emb(self) -> int:
+    def dim_emb(self):
         """Returns the embedding dimension g2."""
         return self.get_dim_emb()
 
@@ -659,7 +650,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         if obj.repinit.dim_out != obj.repformers.dim_in:
             obj.g1_shape_tranform = MLPLayer.deserialize(g1_shape_tranform)
 
-        def t_cvt(xx: Any) -> torch.Tensor:
+        def t_cvt(xx):
             return torch.tensor(xx, dtype=obj.repinit.prec, device=env.DEVICE)
 
         # deserialize repinit
@@ -714,13 +705,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
-    ) -> tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
+    ):
         """Compute the descriptor.
 
         Parameters
@@ -829,12 +814,10 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             g1 = torch.cat([g1, g1_inp], dim=-1)
         return (
             g1.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
-            if rot_mat is not None
-            else None,
-            g2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if g2 is not None else None,
-            h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if h2 is not None else None,
-            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if sw is not None else None,
+            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            g2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
         )
 
     @classmethod
@@ -916,9 +899,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         # do some checks before the mocel compression process
         if self.compress:
             raise ValueError("Compression is already enabled.")
-        assert not self.repinit.resnet_dt, (
-            "Model compression error: repinit resnet_dt must be false!"
-        )
+        assert (
+            not self.repinit.resnet_dt
+        ), "Model compression error: repinit resnet_dt must be false!"
         for tt in self.repinit.exclude_types:
             if (tt[0] not in range(self.repinit.ntypes)) or (
                 tt[1] not in range(self.repinit.ntypes)
@@ -970,8 +953,4 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         self.repinit.enable_compression(
             self.table.data, self.table_config, self.lower, self.upper
         )
-
-        # Enable type embedding compression for repinit (se_atten)
-        self.repinit.type_embedding_compression(self.type_embedding)
-
         self.compress = True

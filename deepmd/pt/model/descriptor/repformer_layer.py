@@ -160,7 +160,6 @@ class Atten2Map(torch.nn.Module):
         attnw_shift: float = 20.0,
         precision: str = "float64",
         seed: Optional[Union[int, list[int]]] = None,
-        trainable: bool = True,
     ) -> None:
         """Return neighbor-wise multi-head self-attention maps, with gate mechanism."""
         super().__init__()
@@ -173,7 +172,6 @@ class Atten2Map(torch.nn.Module):
             bias=False,
             precision=precision,
             seed=seed,
-            trainable=trainable,
         )
         self.has_gate = has_gate
         self.smooth = smooth
@@ -287,7 +285,6 @@ class Atten2MultiHeadApply(torch.nn.Module):
         head_num: int,
         precision: str = "float64",
         seed: Optional[Union[int, list[int]]] = None,
-        trainable: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -298,14 +295,12 @@ class Atten2MultiHeadApply(torch.nn.Module):
             bias=False,
             precision=precision,
             seed=child_seed(seed, 0),
-            trainable=trainable,
         )
         self.head_map = MLPLayer(
             input_dim * head_num,
             input_dim,
             precision=precision,
             seed=child_seed(seed, 1),
-            trainable=trainable,
         )
         self.precision = precision
 
@@ -375,18 +370,12 @@ class Atten2EquiVarApply(torch.nn.Module):
         head_num: int,
         precision: str = "float64",
         seed: Optional[Union[int, list[int]]] = None,
-        trainable: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.head_num = head_num
         self.head_map = MLPLayer(
-            head_num,
-            1,
-            bias=False,
-            precision=precision,
-            seed=seed,
-            trainable=trainable,
+            head_num, 1, bias=False, precision=precision, seed=seed
         )
         self.precision = precision
 
@@ -454,7 +443,6 @@ class LocalAtten(torch.nn.Module):
         attnw_shift: float = 20.0,
         precision: str = "float64",
         seed: Optional[Union[int, list[int]]] = None,
-        trainable: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -466,7 +454,6 @@ class LocalAtten(torch.nn.Module):
             bias=False,
             precision=precision,
             seed=child_seed(seed, 0),
-            trainable=trainable,
         )
         self.mapkv = MLPLayer(
             input_dim,
@@ -474,14 +461,12 @@ class LocalAtten(torch.nn.Module):
             bias=False,
             precision=precision,
             seed=child_seed(seed, 1),
-            trainable=trainable,
         )
         self.head_map = MLPLayer(
             input_dim * head_num,
             input_dim,
             precision=precision,
             seed=child_seed(seed, 2),
-            trainable=trainable,
         )
         self.smooth = smooth
         self.attnw_shift = attnw_shift
@@ -585,12 +570,12 @@ class LocalAtten(torch.nn.Module):
 class RepformerLayer(torch.nn.Module):
     def __init__(
         self,
-        rcut: float,
-        rcut_smth: float,
+        rcut,
+        rcut_smth,
         sel: int,
         ntypes: int,
-        g1_dim: int = 128,
-        g2_dim: int = 16,
+        g1_dim=128,
+        g2_dim=16,
         axis_neuron: int = 4,
         update_chnnl_2: bool = True,
         update_g1_has_conv: bool = True,
@@ -617,7 +602,6 @@ class RepformerLayer(torch.nn.Module):
         g1_out_conv: bool = True,
         g1_out_mlp: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
-        trainable: bool = True,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -678,7 +662,6 @@ class RepformerLayer(torch.nn.Module):
                     self.update_residual_init,
                     precision=precision,
                     seed=child_seed(seed, 0),
-                    trainable=trainable,
                 )
             )
 
@@ -688,7 +671,6 @@ class RepformerLayer(torch.nn.Module):
             g1_dim,
             precision=precision,
             seed=child_seed(seed, 1),
-            trainable=trainable,
         )
         self.linear2 = None
         self.proj_g1g2 = None
@@ -705,7 +687,6 @@ class RepformerLayer(torch.nn.Module):
                 g2_dim,
                 precision=precision,
                 seed=child_seed(seed, 2),
-                trainable=trainable,
             )
             if self.update_style == "res_residual":
                 self.g2_residual.append(
@@ -715,7 +696,6 @@ class RepformerLayer(torch.nn.Module):
                         self.update_residual_init,
                         precision=precision,
                         seed=child_seed(seed, 3),
-                        trainable=trainable,
                     )
                 )
         if self.g1_out_mlp:
@@ -724,7 +704,6 @@ class RepformerLayer(torch.nn.Module):
                 g1_dim,
                 precision=precision,
                 seed=child_seed(seed, 15),
-                trainable=trainable,
             )
             if self.update_style == "res_residual":
                 self.g1_residual.append(
@@ -734,7 +713,6 @@ class RepformerLayer(torch.nn.Module):
                         self.update_residual_init,
                         precision=precision,
                         seed=child_seed(seed, 16),
-                        trainable=trainable,
                     )
                 )
         else:
@@ -747,7 +725,6 @@ class RepformerLayer(torch.nn.Module):
                     bias=False,
                     precision=precision,
                     seed=child_seed(seed, 4),
-                    trainable=trainable,
                 )
             else:
                 self.proj_g1g2 = MLPLayer(
@@ -756,7 +733,6 @@ class RepformerLayer(torch.nn.Module):
                     bias=False,
                     precision=precision,
                     seed=child_seed(seed, 4),
-                    trainable=trainable,
                 )
                 if self.update_style == "res_residual":
                     self.g1_residual.append(
@@ -766,7 +742,6 @@ class RepformerLayer(torch.nn.Module):
                             self.update_residual_init,
                             precision=precision,
                             seed=child_seed(seed, 17),
-                            trainable=trainable,
                         )
                     )
         if self.update_g2_has_g1g1:
@@ -776,7 +751,6 @@ class RepformerLayer(torch.nn.Module):
                 bias=False,
                 precision=precision,
                 seed=child_seed(seed, 5),
-                trainable=trainable,
             )
             if self.update_style == "res_residual":
                 self.g2_residual.append(
@@ -786,7 +760,6 @@ class RepformerLayer(torch.nn.Module):
                         self.update_residual_init,
                         precision=precision,
                         seed=child_seed(seed, 6),
-                        trainable=trainable,
                     )
                 )
         if self.update_g2_has_attn or self.update_h2:
@@ -798,15 +771,10 @@ class RepformerLayer(torch.nn.Module):
                 self.smooth,
                 precision=precision,
                 seed=child_seed(seed, 7),
-                trainable=trainable,
             )
             if self.update_g2_has_attn:
                 self.attn2_mh_apply = Atten2MultiHeadApply(
-                    g2_dim,
-                    attn2_nhead,
-                    precision=precision,
-                    seed=child_seed(seed, 8),
-                    trainable=trainable,
+                    g2_dim, attn2_nhead, precision=precision, seed=child_seed(seed, 8)
                 )
                 self.attn2_lm = LayerNorm(
                     g2_dim,
@@ -823,17 +791,12 @@ class RepformerLayer(torch.nn.Module):
                             self.update_residual_init,
                             precision=precision,
                             seed=child_seed(seed, 10),
-                            trainable=trainable,
                         )
                     )
 
             if self.update_h2:
                 self.attn2_ev_apply = Atten2EquiVarApply(
-                    g2_dim,
-                    attn2_nhead,
-                    precision=precision,
-                    seed=child_seed(seed, 11),
-                    trainable=trainable,
+                    g2_dim, attn2_nhead, precision=precision, seed=child_seed(seed, 11)
                 )
                 if self.update_style == "res_residual":
                     self.h2_residual.append(
@@ -843,7 +806,6 @@ class RepformerLayer(torch.nn.Module):
                             self.update_residual_init,
                             precision=precision,
                             seed=child_seed(seed, 12),
-                            trainable=trainable,
                         )
                     )
         if self.update_g1_has_attn:
@@ -854,7 +816,6 @@ class RepformerLayer(torch.nn.Module):
                 self.smooth,
                 precision=precision,
                 seed=child_seed(seed, 13),
-                trainable=trainable,
             )
             if self.update_style == "res_residual":
                 self.g1_residual.append(
@@ -864,7 +825,6 @@ class RepformerLayer(torch.nn.Module):
                         self.update_residual_init,
                         precision=precision,
                         seed=child_seed(seed, 14),
-                        trainable=trainable,
                     )
                 )
 
@@ -1141,7 +1101,7 @@ class RepformerLayer(torch.nn.Module):
         nlist: torch.Tensor,  # nf x nloc x nnei
         nlist_mask: torch.Tensor,  # nf x nloc x nnei
         sw: torch.Tensor,  # switch func, nf x nloc x nnei
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         """
         Parameters
         ----------

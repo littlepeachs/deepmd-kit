@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import logging
 from typing import (
-    Any,
     Optional,
     Union,
 )
@@ -14,8 +13,18 @@ from deepmd.dpmodel import (
     OutputVariableDef,
     fitting_check_output,
 )
+from deepmd.dpmodel.utils.seed import (
+    child_seed,
+)
+from deepmd.pt.model.network.mlp import (
+    FittingNet,
+    NetworkCollection,
+)
 from deepmd.pt.model.network.network import (
     ResidualDeep,
+)
+from deepmd.pt.model.network.utils import (
+    aggregate,
 )
 from deepmd.pt.model.task.fitting import (
     Fitting,
@@ -58,8 +67,9 @@ class EnergyFittingNet(InvarFitting):
         seed: Optional[Union[int, list[int]]] = None,
         type_map: Optional[list[str]] = None,
         default_fparam: Optional[list] = None,
-        **kwargs: Any,
+        **kwargs,
     ) -> None:
+        
         super().__init__(
             "energy",
             ntypes,
@@ -83,7 +93,7 @@ class EnergyFittingNet(InvarFitting):
     @classmethod
     def deserialize(cls, data: dict) -> "GeneralFitting":
         data = data.copy()
-        check_version_compatibility(data.pop("@version", 1), 4, 1)
+        check_version_compatibility(data.pop("@version", 1), 3, 1)
         data.pop("var_name")
         data.pop("dim_out")
         return super().deserialize(data)
@@ -105,15 +115,15 @@ class EnergyFittingNet(InvarFitting):
 class EnergyFittingNetDirect(Fitting):
     def __init__(
         self,
-        ntypes: int,
-        dim_descrpt: int,
-        neuron: list[int],
-        bias_atom_e: Optional[torch.Tensor] = None,
-        out_dim: int = 1,
-        resnet_dt: bool = True,
-        use_tebd: bool = True,
-        return_energy: bool = False,
-        **kwargs: Any,
+        ntypes,
+        dim_descrpt,
+        neuron,
+        bias_atom_e=None,
+        out_dim=1,
+        resnet_dt=True,
+        use_tebd=True,
+        return_energy=False,
+        **kwargs,
     ) -> None:
         """Construct a fitting net for energy.
 
@@ -163,7 +173,7 @@ class EnergyFittingNetDirect(Fitting):
                 filter_layers.append(one)
         self.filter_layers = torch.nn.ModuleList(filter_layers)
 
-    def output_def(self) -> FittingOutputDef:
+    def output_def(self):
         return FittingOutputDef(
             [
                 OutputVariableDef(
@@ -190,7 +200,7 @@ class EnergyFittingNetDirect(Fitting):
         raise NotImplementedError
 
     def change_type_map(
-        self, type_map: list[str], model_with_new_type_stat: Optional[Any] = None
+        self, type_map: list[str], model_with_new_type_stat=None
     ) -> None:
         raise NotImplementedError
 
@@ -260,3 +270,487 @@ class EnergyFittingNetDirect(Fitting):
             "energy": outs.to(env.GLOBAL_PT_FLOAT_PRECISION),
             "dforce": vec_out,
         }
+
+
+@Fitting.register("ener_direct")
+@fitting_check_output
+class EnergyFittingNetDirectHead(InvarFitting):
+    def __init__(
+        self,
+        ntypes: int,
+        dim_descrpt: int,
+        neuron: list[int] = [128, 128, 128],
+        bias_atom_e: Optional[torch.Tensor] = None,
+        resnet_dt: bool = True,
+        numb_fparam: int = 0,
+        numb_aparam: int = 0,
+        dim_case_embd: int = 0,
+        embedding_width: int = 128,
+        activation_function: str = "tanh",
+        precision: str = DEFAULT_PRECISION,
+        mixed_types: bool = True,
+        seed: Optional[Union[int, list[int]]] = None,
+        type_map: Optional[list[str]] = None,
+        additional_gradient: bool = False,
+        additional_noise_head: bool = False,
+        **kwargs,
+    ) -> None:
+        """Construct a fitting net for energy.
+
+        Args:
+        - ntypes: Element count.
+        - embedding_width: Embedding width per atom.
+        - neuron: Number of neurons in each hidden layers of the fitting net.
+        - bias_atom_e: Average energy per atom for each element.
+        - resnet_dt: Using time-step in the ResNet construction.
+        """
+        self.additional_gradient = additional_gradient
+        self.additional_noise_head = additional_noise_head
+        super().__init__(
+            "energy",
+            ntypes,
+            dim_descrpt,
+            1,
+            neuron=neuron,
+            bias_atom_e=bias_atom_e,
+            resnet_dt=resnet_dt,
+            numb_fparam=numb_fparam,
+            numb_aparam=numb_aparam,
+            dim_case_embd=dim_case_embd,
+            activation_function=activation_function,
+            precision=precision,
+            mixed_types=mixed_types,
+            seed=seed,
+            type_map=type_map,
+            **kwargs,
+        )
+
+        # embedding for direct force
+        self.force_input_dim = embedding_width  # can add force embedding if needed
+        self.force_embed = NetworkCollection(
+            1 if not self.mixed_types else 0,
+            self.ntypes,
+            network_type="fitting_network",
+            networks=[
+                FittingNet(
+                    self.force_input_dim,
+                    1,
+                    self.neuron,
+                    self.activation_function,
+                    self.resnet_dt,
+                    self.precision,
+                    bias_out=True,
+                    seed=child_seed(self.seed + 100, ii),
+                )
+                for ii in range(self.ntypes if not self.mixed_types else 1)
+            ],
+        )
+        # additional noise head
+        self.noise_input_dim = embedding_width  # can add noise embedding if needed
+        if self.additional_noise_head:
+            # dforce for force; dnosie for noise
+            self.noise_embed = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        self.noise_input_dim,
+                        1,
+                        self.neuron,
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=True,
+                        seed=child_seed(self.seed + 200, ii),
+                    )
+                    for ii in range(self.ntypes if not self.mixed_types else 1)
+                ],
+            )
+        else:
+            # dforce for noise
+            self.noise_embed = None
+
+        # set trainable
+        for param in self.parameters():
+            param.requires_grad = self.trainable
+
+    def output_def(self) -> FittingOutputDef:
+        out_list = [
+            OutputVariableDef(
+                self.var_name,
+                [self.dim_out],
+                reducible=True,
+                r_differentiable=self.additional_gradient,
+                c_differentiable=self.additional_gradient,
+            ),
+            OutputVariableDef(
+                "dforce",
+                [3],
+                reducible=False,
+                r_differentiable=False,
+                c_differentiable=False,
+            ),
+        ]
+        if self.additional_noise_head:
+            out_list.append(
+                OutputVariableDef(
+                    "dnoise",
+                    [3],
+                    reducible=False,
+                    r_differentiable=False,
+                    c_differentiable=False,
+                )
+            )
+
+        return FittingOutputDef(out_list)
+
+    # make jit happy with torch 2.0.0
+    exclude_types: list[int]
+
+    def need_additional_input(self) -> bool:
+        return True
+
+    def serialize(self) -> dict:
+        raise NotImplementedError
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "EnergyFittingNetDirectHead":
+        raise NotImplementedError
+
+    def change_type_map(
+        self, type_map: list[str], model_with_new_type_stat=None
+    ) -> None:
+        raise NotImplementedError
+
+    def get_type_map(self) -> list[str]:
+        raise NotImplementedError
+
+    def forward(
+        self,
+        descriptor: torch.Tensor,
+        atype: torch.Tensor,
+        gr: Optional[torch.Tensor] = None,
+        g2: Optional[torch.Tensor] = None,
+        h2: Optional[torch.Tensor] = None,
+        fparam: Optional[torch.Tensor] = None,
+        aparam: Optional[torch.Tensor] = None,
+        diff: Optional[torch.Tensor] = None,
+        edge_index: Optional[torch.Tensor] = None,
+        sw: Optional[torch.Tensor] = None,
+        angle_embd: Optional[torch.Tensor] = None,
+        angle_index: Optional[torch.Tensor] = None,
+        a_sw: Optional[torch.Tensor] = None,
+    ):
+        """Based on embedding net output, alculate total energy.
+
+        Args:
+        - inputs: Embedding matrix. Its shape is [nframes, natoms[0], self.dim_descrpt].
+        - natoms: Tell atom count and element count. Its shape is [2+self.ntypes].
+
+        Returns
+        -------
+        - `torch.Tensor`: Total energy with shape [nframes, natoms[0]].
+        """
+        out = self._forward_common(descriptor, atype, gr, g2, h2, fparam, aparam)[
+            self.var_name
+        ]
+        # energy
+        result = {self.var_name: out.to(env.GLOBAL_PT_FLOAT_PRECISION)}
+
+        # direct force
+        assert diff is not None
+        assert g2 is not None
+
+        nf, nloc, _ = descriptor.shape
+
+        # nf x nloc x nnei x 3 [OR] nedge x 3
+        edge_vec = diff
+        # nf x nloc x nnei x d [OR] nedge x d
+        edge_feature = g2
+        # nf x nloc x nnei x 1 [OR] nedge x 1
+        edge_weight = self.force_embed.networks[0](edge_feature)
+        # nf x nloc x nnei x 3 [OR] nedge x 3
+        fij = edge_weight * edge_vec
+        if edge_index is not None:
+            # use dynamic sel
+            n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+            # nf x nloc x 3
+            fi = aggregate(
+                fij,
+                n2e_index,
+                average=False,
+                num_owner=nf * nloc,
+            ).reshape(nf, nloc, 3)
+        else:
+            # nf x nloc x 3
+            fi = torch.sum(fij, dim=-2)
+
+        result["dforce"] = fi
+
+        if self.additional_noise_head:
+            assert self.noise_embed is not None
+            edge_weight = self.noise_embed.networks[0](edge_feature)
+            # nf x nloc x nnei x 3 [OR] nedge x 3
+            nij = edge_weight * edge_vec
+            if edge_index is not None:
+                # use dynamic sel
+                n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+                # nf x nloc x 3
+                ni = aggregate(
+                    nij,
+                    n2e_index,
+                    average=False,
+                    num_owner=nf * nloc,
+                ).reshape(nf, nloc, 3)
+            else:
+                # nf x nloc x 3
+                ni = torch.sum(nij, dim=-2)
+            result["dnoise"] = ni
+
+        return result
+
+
+@Fitting.register("ener_readout")
+@Fitting.register("ener_edge_readout")
+@fitting_check_output
+class EnergyFittingNetEdgeReadout(InvarFitting):
+    def __init__(
+        self,
+        ntypes: int,
+        dim_descrpt: int,
+        neuron: list[int] = [128, 128, 128],
+        bias_atom_e: Optional[torch.Tensor] = None,
+        resnet_dt: bool = True,
+        numb_fparam: int = 0,
+        numb_aparam: int = 0,
+        dim_case_embd: int = 0,
+        embedding_width: int = 128,
+        activation_function: str = "tanh",
+        precision: str = DEFAULT_PRECISION,
+        mixed_types: bool = True,
+        seed: Optional[Union[int, list[int]]] = None,
+        type_map: Optional[list[str]] = None,
+        angle_embedding_width: int = 32,
+        norm_fact: list[float] = [120.0, 30.0],
+        add_edge_readout: bool = True,
+        add_angle_readout: bool = False,
+        slim_edge_readout: bool = False,
+        slim_angle_readout: bool = False,
+        edge_extra_fact: float = 1.0,
+        angle_extra_fact: float = 1.0,
+        **kwargs,
+    ) -> None:
+        """Construct a fitting net for energy.
+
+        Args:
+        - ntypes: Element count.
+        - embedding_width: Embedding width per atom.
+        - neuron: Number of neurons in each hidden layers of the fitting net.
+        - bias_atom_e: Average energy per atom for each element.
+        - resnet_dt: Using time-step in the ResNet construction.
+        """
+        self.add_edge_readout = add_edge_readout
+        self.add_angle_readout = add_angle_readout
+        self.edge_extra_fact = edge_extra_fact
+        self.angle_extra_fact = angle_extra_fact
+        super().__init__(
+            "energy",
+            ntypes,
+            dim_descrpt,
+            1,
+            neuron=neuron,
+            bias_atom_e=bias_atom_e,
+            resnet_dt=resnet_dt,
+            numb_fparam=numb_fparam,
+            numb_aparam=numb_aparam,
+            dim_case_embd=dim_case_embd,
+            activation_function=activation_function,
+            precision=precision,
+            mixed_types=mixed_types,
+            seed=seed,
+            type_map=type_map,
+            **kwargs,
+        )
+
+        # embedding for edge readout
+        self.embedding_width = embedding_width
+        self.angle_embedding_width = angle_embedding_width
+        self.slim_edge_readout = slim_edge_readout
+        self.slim_angle_readout = slim_angle_readout
+        self.norm_e_fact = norm_fact[0]
+        self.norm_a_fact = norm_fact[1] if add_angle_readout else 1
+
+        if self.add_edge_readout:
+            self.edge_embed = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        self.embedding_width,
+                        1,
+                        self.neuron if not self.slim_edge_readout else self.neuron[:1],
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=True,
+                        seed=child_seed(self.seed + 100, ii),
+                    )
+                    for ii in range(self.ntypes if not self.mixed_types else 1)
+                ],
+            )
+        else:
+            self.edge_embed = None
+
+        if self.add_angle_readout:
+            self.angle_embed = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        self.angle_embedding_width,
+                        1,
+                        self.neuron if not self.slim_angle_readout else self.neuron[:1],
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=True,
+                        seed=child_seed(self.seed + 200, ii),
+                    )
+                    for ii in range(self.ntypes if not self.mixed_types else 1)
+                ],
+            )
+        else:
+            self.angle_embed = None
+
+        # set trainable
+        for param in self.parameters():
+            param.requires_grad = self.trainable
+
+    def output_def(self) -> FittingOutputDef:
+        out_list = [
+            OutputVariableDef(
+                self.var_name,
+                [self.dim_out],
+                reducible=True,
+                r_differentiable=True,
+                c_differentiable=True,
+            ),
+        ]
+
+        return FittingOutputDef(out_list)
+
+    # make jit happy with torch 2.0.0
+    exclude_types: list[int]
+
+    def need_additional_input(self) -> bool:
+        # need sw
+        return True
+
+    def serialize(self) -> dict:
+        raise NotImplementedError
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "EnergyFittingNetEdgeReadout":
+        raise NotImplementedError
+
+    def change_type_map(
+        self, type_map: list[str], model_with_new_type_stat=None
+    ) -> None:
+        raise NotImplementedError
+
+    def get_type_map(self) -> list[str]:
+        raise NotImplementedError
+
+    def forward(
+        self,
+        descriptor: torch.Tensor,
+        atype: torch.Tensor,
+        gr: Optional[torch.Tensor] = None,
+        g2: Optional[torch.Tensor] = None,
+        h2: Optional[torch.Tensor] = None,
+        fparam: Optional[torch.Tensor] = None,
+        aparam: Optional[torch.Tensor] = None,
+        diff: Optional[torch.Tensor] = None,
+        edge_index: Optional[torch.Tensor] = None,
+        sw: Optional[torch.Tensor] = None,
+        angle_embd: Optional[torch.Tensor] = None,
+        angle_index: Optional[torch.Tensor] = None,
+        a_sw: Optional[torch.Tensor] = None,
+    ):
+        """Based on embedding net output, alculate total energy.
+
+        Args:
+        - inputs: Embedding matrix. Its shape is [nframes, natoms[0], self.dim_descrpt].
+        - natoms: Tell atom count and element count. Its shape is [2+self.ntypes].
+
+        Returns
+        -------
+        - `torch.Tensor`: Total energy with shape [nframes, natoms[0]].
+        """
+        out = self._forward_common(descriptor, atype, gr, g2, h2, fparam, aparam)[
+            self.var_name
+        ]
+        nf, nloc, _ = descriptor.shape
+
+        if self.add_edge_readout:
+            assert g2 is not None
+            assert sw is not None
+            assert self.edge_embed is not None
+            # nf x nloc x nnei x d [OR] nedge x d
+            edge_feature = g2
+            # nf x nloc x nnei x 1 [OR] nedge x 1
+            edge_atomic_contrib = self.edge_embed.networks[0](edge_feature)
+            # nf x nloc x nnei x 1 [OR] nedge x 1
+            edge_atomic_contrib = edge_atomic_contrib * sw.unsqueeze(-1)
+            if edge_index is not None:
+                # use dynamic sel
+                n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+                # nf x nloc x 1
+                edge_energy = aggregate(
+                    edge_atomic_contrib,
+                    n2e_index,
+                    average=False,
+                    num_owner=nf * nloc,
+                ).reshape(nf, nloc, 1)
+            else:
+                # nf x nloc x 1
+                edge_energy = torch.sum(edge_atomic_contrib, dim=-2)
+            # energy
+            out = out + (edge_energy * self.edge_extra_fact) / self.norm_e_fact
+
+        if self.add_angle_readout:
+            assert angle_embd is not None
+            assert a_sw is not None
+            assert self.angle_embed is not None
+            # nf x nloc x a_nnei x a_nnei x d [OR] nangle x d
+            angle_feature = angle_embd
+            # nf x nloc x a_nnei x a_nnei x 1 [OR] nangle x 1
+            angle_atomic_contrib = self.angle_embed.networks[0](angle_feature)
+            # nf x nloc x a_nnei x a_nnei x 1 [OR] nangle x 1
+            angle_atomic_contrib = angle_atomic_contrib * a_sw.unsqueeze(-1)
+            if angle_index is not None:
+                # use dynamic sel
+                n2a_index, eij2a_index, eik2a_index = (
+                    angle_index[:, 0],
+                    angle_index[:, 1],
+                    angle_index[:, 2],
+                )
+                # nf x nloc x 1
+                angle_energy = aggregate(
+                    angle_atomic_contrib,
+                    n2a_index,
+                    average=False,
+                    num_owner=nf * nloc,
+                ).reshape(nf, nloc, 1)
+            else:
+                # nf x nloc x 1
+                angle_energy = torch.sum(
+                    torch.sum(angle_atomic_contrib, dim=-2), dim=-2
+                )
+            # energy
+            # self.norm_a_fact ** 2
+            out = out + (angle_energy * self.angle_extra_fact) / (self.norm_a_fact**2)
+        return {self.var_name: out.to(env.GLOBAL_PT_FLOAT_PRECISION)}

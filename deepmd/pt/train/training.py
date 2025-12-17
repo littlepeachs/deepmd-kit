@@ -2,10 +2,6 @@
 import functools
 import logging
 import time
-from collections.abc import (
-    Generator,
-    Iterable,
-)
 from copy import (
     deepcopy,
 )
@@ -14,8 +10,6 @@ from pathlib import (
 )
 from typing import (
     Any,
-    Callable,
-    Optional,
 )
 
 import numpy as np
@@ -30,8 +24,8 @@ from deepmd.loggers.training import (
 )
 from deepmd.pt.loss import (
     DenoiseLoss,
+    DeNSLoss,
     DOSLoss,
-    EnergyHessianStdLoss,
     EnergySpinLoss,
     EnergyStdLoss,
     PropertyLoss,
@@ -43,6 +37,7 @@ from deepmd.pt.model.model import (
     get_zbl_model,
 )
 from deepmd.pt.optimizer import (
+    SOAP,
     KFOptimizerWrapper,
     LKFOptimizer,
 )
@@ -53,7 +48,7 @@ from deepmd.pt.utils import (
     dp_random,
 )
 from deepmd.pt.utils.dataloader import (
-    DpLoaderSet,
+    BufferedIterator,
     get_sampler_from_params,
 )
 from deepmd.pt.utils.env import (
@@ -64,7 +59,10 @@ from deepmd.pt.utils.env import (
     SAMPLER_RECORD,
 )
 from deepmd.pt.utils.learning_rate import (
+    LearningRateCosine,
     LearningRateExp,
+    LearningRateLinear,
+    LearningRateWSD,
 )
 from deepmd.pt.utils.stat import (
     make_stat_input,
@@ -96,16 +94,16 @@ class Trainer:
     def __init__(
         self,
         config: dict[str, Any],
-        training_data: DpLoaderSet,
-        stat_file_path: Optional[str] = None,
-        validation_data: Optional[DpLoaderSet] = None,
-        init_model: Optional[str] = None,
-        restart_model: Optional[str] = None,
-        finetune_model: Optional[str] = None,
-        force_load: bool = False,
-        shared_links: Optional[dict[str, str]] = None,
-        finetune_links: Optional[dict[str, str]] = None,
-        init_frz_model: Optional[str] = None,
+        training_data,
+        stat_file_path=None,
+        validation_data=None,
+        init_model=None,
+        restart_model=None,
+        finetune_model=None,
+        force_load=False,
+        shared_links=None,
+        finetune_links=None,
+        init_frz_model=None,
     ) -> None:
         """Construct a DeePMD trainer.
 
@@ -144,7 +142,6 @@ class Trainer:
         self.num_steps = training_params["numb_steps"]
         self.disp_file = training_params.get("disp_file", "lcurve.out")
         self.disp_freq = training_params.get("disp_freq", 1000)
-        self.disp_avg = training_params.get("disp_avg", False)
         self.save_ckpt = training_params.get("save_ckpt", "model.ckpt")
         self.save_freq = training_params.get("save_freq", 1000)
         self.max_ckpt_keep = training_params.get("max_ckpt_keep", 5)
@@ -155,7 +152,7 @@ class Trainer:
         )
         self.lcurve_should_print_header = True
 
-        def get_opt_param(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        def get_opt_param(params):
             opt_type = params.get("opt_type", "Adam")
             opt_param = {
                 "kf_blocksize": params.get("kf_blocksize", 5120),
@@ -167,36 +164,8 @@ class Trainer:
             }
             return opt_type, opt_param
 
-        def cycle_iterator(iterable: Iterable) -> Generator[Any, None, None]:
-            """
-            Produces an infinite iterator by repeatedly cycling through the given iterable.
-
-            Args:
-                iterable (Iterable): The iterable to cycle through.
-
-            Yields
-            ------
-            Any: The next item from the iterable, cycling back to the beginning when the end is reached.
-            """
-            while True:
-                with torch.device("cpu"):
-                    it = iter(iterable)
-                yield from it
-
-        def get_data_loader(
-            _training_data: DpLoaderSet,
-            _validation_data: Optional[DpLoaderSet],
-            _training_params: dict[str, Any],
-        ) -> tuple[
-            DataLoader,
-            Generator[Any, None, None],
-            Optional[DataLoader],
-            Optional[Generator[Any, None, None]],
-            int,
-        ]:
-            def get_dataloader_and_iter(
-                _data: DpLoaderSet, _params: dict[str, Any]
-            ) -> tuple[DataLoader, Generator[Any, None, None]]:
+        def get_data_loader(_training_data, _validation_data, _training_params):
+            def get_dataloader_and_buffer(_data, _params):
                 _sampler = get_sampler_from_params(_data, _params)
                 if _sampler is None:
                     log.warning(
@@ -211,20 +180,21 @@ class Trainer:
                     else 0,  # setting to 0 diverges the behavior of its iterator; should be >=1
                     drop_last=False,
                     collate_fn=lambda batch: batch,  # prevent extra conversion
-                    pin_memory=(DEVICE != "cpu"),  # pin memory only if not on CPU
+                    pin_memory=True,
                 )
-                _data_iter = cycle_iterator(_dataloader)
-                return _dataloader, _data_iter
+                with torch.device("cpu"):
+                    _data_buffered = BufferedIterator(iter(_dataloader))
+                return _dataloader, _data_buffered
 
-            training_dataloader, training_data_iter = get_dataloader_and_iter(
+            training_dataloader, training_data_buffered = get_dataloader_and_buffer(
                 _training_data, _training_params["training_data"]
             )
 
             if _validation_data is not None:
                 (
                     validation_dataloader,
-                    validation_data_iter,
-                ) = get_dataloader_and_iter(
+                    validation_data_buffered,
+                ) = get_dataloader_and_buffer(
                     _validation_data, _training_params["validation_data"]
                 )
                 valid_numb_batch = _training_params["validation_data"].get(
@@ -232,32 +202,32 @@ class Trainer:
                 )
             else:
                 validation_dataloader = None
-                validation_data_iter = None
+                validation_data_buffered = None
                 valid_numb_batch = 1
             return (
                 training_dataloader,
-                training_data_iter,
+                training_data_buffered,
                 validation_dataloader,
-                validation_data_iter,
+                validation_data_buffered,
                 valid_numb_batch,
             )
 
         def single_model_stat(
-            _model: Any,
-            _data_stat_nbatch: int,
-            _training_data: DpLoaderSet,
-            _validation_data: Optional[DpLoaderSet],
-            _stat_file_path: Optional[str],
-            _data_requirement: list[DataRequirementItem],
-            finetune_has_new_type: bool = False,
-        ) -> Callable[[], Any]:
+            _model,
+            _data_stat_nbatch,
+            _training_data,
+            _validation_data,
+            _stat_file_path,
+            _data_requirement,
+            finetune_has_new_type=False,
+        ):
             _data_requirement += get_additional_data_requirement(_model)
             _training_data.add_data_requirement(_data_requirement)
             if _validation_data is not None:
                 _validation_data.add_data_requirement(_data_requirement)
 
             @functools.lru_cache
-            def get_sample() -> Any:
+            def get_sample():
                 sampled = make_stat_input(
                     _training_data.systems,
                     _training_data.dataloaders,
@@ -274,13 +244,20 @@ class Trainer:
                     _stat_file_path.root.close()
             return get_sample
 
-        def get_lr(lr_params: dict[str, Any]) -> LearningRateExp:
-            assert lr_params.get("type", "exp") == "exp", (
-                "Only learning rate `exp` is supported!"
-            )
+        def get_lr(lr_params):
+            lr_type = lr_params.get("type", "exp")
             lr_params["stop_steps"] = self.num_steps - self.warmup_steps
-            lr_exp = LearningRateExp(**lr_params)
-            return lr_exp
+            if lr_type == "exp":
+                lr_schedule = LearningRateExp(**lr_params)
+            elif lr_type == "cosine":
+                lr_schedule = LearningRateCosine(**lr_params)
+            elif lr_type == "wsd":
+                lr_schedule = LearningRateWSD(**lr_params)
+            elif lr_type == "linear":
+                lr_schedule = LearningRateLinear(**lr_params)
+            else:
+                raise ValueError(f"Not supported learning rate type '{lr_type}'!")
+            return lr_schedule
 
         # Optimizer
         if self.multi_task and training_params.get("optim_dict", None) is not None:
@@ -288,9 +265,9 @@ class Trainer:
             missing_keys = [
                 key for key in self.model_keys if key not in self.optim_dict
             ]
-            assert not missing_keys, (
-                f"These keys are not in optim_dict: {missing_keys}!"
-            )
+            assert (
+                not missing_keys
+            ), f"These keys are not in optim_dict: {missing_keys}!"
             self.opt_type = {}
             self.opt_param = {}
             for model_key in self.model_keys:
@@ -300,22 +277,8 @@ class Trainer:
         else:
             self.opt_type, self.opt_param = get_opt_param(training_params)
 
-        # loss_param_tmp for Hessian activation
-        loss_param_tmp = None
-        if not self.multi_task:
-            loss_param_tmp = config["loss"]
-        else:
-            loss_param_tmp = {
-                model_key: config["loss_dict"][model_key]
-                for model_key in self.model_keys
-            }
-
         # Model
-        self.model = get_model_for_wrapper(
-            model_params,
-            resuming=resuming,
-            _loss_params=loss_param_tmp,
-        )
+        self.model = get_model_for_wrapper(model_params, resuming=resuming)
 
         # Loss
         if not self.multi_task:
@@ -358,14 +321,14 @@ class Trainer:
                 self.validation_data,
                 self.valid_numb_batch,
             ) = get_data_loader(training_data, validation_data, training_params)
-            training_data.print_summary(
-                "training", to_numpy_array(self.training_dataloader.sampler.weights)
-            )
-            if validation_data is not None:
-                validation_data.print_summary(
-                    "validation",
-                    to_numpy_array(self.validation_dataloader.sampler.weights),
-                )
+            # training_data.print_summary(
+            #     "training", to_numpy_array(self.training_dataloader.sampler.weights)
+            # )
+            # if validation_data is not None:
+            #     validation_data.print_summary(
+            #         "validation",
+            #         to_numpy_array(self.validation_dataloader.sampler.weights),
+            #     )
         else:
             (
                 self.training_dataloader,
@@ -401,27 +364,27 @@ class Trainer:
                     training_params["data_dict"][model_key],
                 )
 
-                training_data[model_key].print_summary(
-                    f"training in {model_key}",
-                    to_numpy_array(self.training_dataloader[model_key].sampler.weights),
-                )
-                if (
-                    validation_data is not None
-                    and validation_data[model_key] is not None
-                ):
-                    validation_data[model_key].print_summary(
-                        f"validation in {model_key}",
-                        to_numpy_array(
-                            self.validation_dataloader[model_key].sampler.weights
-                        ),
-                    )
+                # training_data[model_key].print_summary(
+                #     f"training in {model_key}",
+                #     to_numpy_array(self.training_dataloader[model_key].sampler.weights),
+                # )
+                # if (
+                #     validation_data is not None
+                #     and validation_data[model_key] is not None
+                # ):
+                #     validation_data[model_key].print_summary(
+                #         f"validation in {model_key}",
+                #         to_numpy_array(
+                #             self.validation_dataloader[model_key].sampler.weights
+                #         ),
+                #     )
 
         # Learning rate
         self.warmup_steps = training_params.get("warmup_steps", 0)
         self.gradient_max_norm = training_params.get("gradient_max_norm", 0.0)
-        assert self.num_steps - self.warmup_steps > 0 or self.warmup_steps == 0, (
-            "Warm up steps must be less than total training steps!"
-        )
+        assert (
+            self.num_steps - self.warmup_steps > 0 or self.warmup_steps == 0
+        ), "Warm up steps must be less than total training steps!"
         if self.multi_task and config.get("learning_rate_dict", None) is not None:
             self.lr_exp = {}
             for model_key in self.model_keys:
@@ -461,9 +424,47 @@ class Trainer:
                     missing_keys = [
                         item for item in target_keys if item not in input_keys
                     ]
+                    old_model_params = self.wrapper.state_dict()["_extra_state"][
+                        "model_params"
+                    ]
+                    state_dict["_extra_state"]["model_params"] = old_model_params
                     if missing_keys:
                         target_state_dict = self.wrapper.state_dict()
                         slim_keys = []
+                        out_shape_list = [
+                            "model.Default.atomic_model.out_bias",
+                            "model.Default.atomic_model.out_std",
+                        ]
+                        for kk in out_shape_list:
+                            old_stat = state_dict[kk].clone().detach()
+                            state_dict[kk] = target_state_dict[kk].clone().detach()
+                            state_dict[kk][:1, :, :1] = old_stat
+
+                        # copy keys that are same in Default branch
+                        same_keys = [
+                            kk
+                            for kk in missing_keys
+                            if ".Default." not in kk
+                            and "model.Default." + ".".join(kk.split(".")[2:])
+                            in state_dict
+                        ]
+
+                        for same_k in same_keys:
+                            origin_k = "model.Default." + ".".join(
+                                same_k.split(".")[2:]
+                            )
+                            state_dict[same_k] = state_dict[origin_k].clone().detach()
+
+                        log.warning(
+                            "Force load mode allowed! All branches missing ones will use those in default branches if available."
+                        )
+
+                        missing_keys = [
+                            item
+                            for item in target_keys
+                            if item not in state_dict.keys()
+                        ]
+
                         for item in missing_keys:
                             state_dict[item] = target_state_dict[item].clone().detach()
                             new_key = True
@@ -472,7 +473,7 @@ class Trainer:
                                     new_key = False
                                     break
                             if new_key:
-                                tmp_keys = ".".join(item.split(".")[:3])
+                                tmp_keys = ".".join(item.split(".")[:-2])
                                 slim_keys.append(tmp_keys)
                         slim_keys = [i + ".*" for i in slim_keys]
                         log.warning(
@@ -512,11 +513,11 @@ class Trainer:
                     state_dict = pretrained_model_wrapper.state_dict()
 
                     def collect_single_finetune_params(
-                        _model_key: str,
-                        _finetune_rule_single: Any,
-                        _new_state_dict: dict[str, Any],
-                        _origin_state_dict: dict[str, Any],
-                        _random_state_dict: dict[str, Any],
+                        _model_key,
+                        _finetune_rule_single,
+                        _new_state_dict,
+                        _origin_state_dict,
+                        _random_state_dict,
                     ) -> None:
                         _new_fitting = _finetune_rule_single.get_random_fitting()
                         _model_key_from = _finetune_rule_single.get_model_branch()
@@ -526,31 +527,15 @@ class Trainer:
                             if i != "_extra_state" and f".{_model_key}." in i
                         ]
                         for item_key in target_keys:
-                            new_key = item_key.replace(
-                                f".{_model_key}.", f".{_model_key_from}."
-                            )
-                            use_random_initialization = _new_fitting and (
-                                ".descriptor." not in item_key
-                            )
-                            if (
-                                not use_random_initialization
-                                and new_key not in _origin_state_dict
-                            ):
-                                # for ZBL models finetuning from standard models
-                                if ".models.0." in new_key:
-                                    new_key = new_key.replace(".models.0.", ".")
-                                elif ".models.1." in new_key:
-                                    use_random_initialization = True
-                                else:
-                                    raise KeyError(
-                                        f"Key {new_key} not found in pretrained model."
-                                    )
-                            if use_random_initialization:
+                            if _new_fitting and (".descriptor." not in item_key):
                                 # print(f'Keep {item_key} in old model!')
                                 _new_state_dict[item_key] = (
                                     _random_state_dict[item_key].clone().detach()
                                 )
                             else:
+                                new_key = item_key.replace(
+                                    f".{_model_key}.", f".{_model_key_from}."
+                                )
                                 # print(f'Replace {item_key} with {new_key} in pretrained_model!')
                                 _new_state_dict[item_key] = (
                                     _origin_state_dict[new_key].clone().detach()
@@ -570,17 +555,40 @@ class Trainer:
                     state_dict["_extra_state"] = self.wrapper.state_dict()[
                         "_extra_state"
                     ]
-
-                self.wrapper.load_state_dict(state_dict)
+                old_model_params = self.wrapper.state_dict()["_extra_state"][
+                    "model_params"
+                ]
+                try:
+                    self.wrapper.load_state_dict(state_dict)
+                except RuntimeError as e:
+                    # init from direct fitting
+                    rm_list = []
+                    for kk in state_dict:
+                        # delete direct heads
+                        if (
+                            "fitting_net.force_embed." in kk
+                            or "fitting_net.noise_embed" in kk
+                        ):
+                            rm_list.append(kk)
+                    for kk in rm_list:
+                        state_dict.pop(kk)
+                    state_dict["_extra_state"]["model_params"] = old_model_params
+                    out_shape_list = [
+                        "model.Default.atomic_model.out_bias",
+                        "model.Default.atomic_model.out_std",
+                    ]
+                    for kk in out_shape_list:
+                        state_dict[kk] = state_dict[kk][:1, :, :1]
+                    self.wrapper.load_state_dict(state_dict)
 
                 # change bias for fine-tuning
                 if finetune_model is not None:
 
                     def single_model_finetune(
-                        _model: Any,
-                        _finetune_rule_single: Any,
-                        _sample_func: Callable,
-                    ) -> Any:
+                        _model,
+                        _finetune_rule_single,
+                        _sample_func,
+                    ):
                         _model = model_change_out_bias(
                             _model,
                             _sample_func,
@@ -639,9 +647,9 @@ class Trainer:
                     for ii in model_params["model_dict"]
                 ]
             )
-            assert np.allclose(_data_stat_protect, _data_stat_protect[0]), (
-                "Model key 'data_stat_protect' must be the same in each branch when multitask!"
-            )
+            assert np.allclose(
+                _data_stat_protect, _data_stat_protect[0]
+            ), "Model key 'data_stat_protect' must be the same in each branch when multitask!"
             self.wrapper.share_params(
                 shared_links,
                 resume=(resuming and not self.finetune_update_stat) or self.rank != 0,
@@ -661,7 +669,7 @@ class Trainer:
 
         # TODO add lr warmups for multitask
         # author: iProzd
-        def warm_up_linear(step: int, warmup_steps: int) -> float:
+        def warm_up_linear(step, warmup_steps):
             if step < warmup_steps:
                 return step / warmup_steps
             else:
@@ -669,20 +677,45 @@ class Trainer:
 
         # TODO add optimizers for multitask
         # author: iProzd
-        if self.opt_type in ["Adam", "AdamW"]:
+        if self.opt_type in ["Adam", "AdamW", "Lamb", "Soap"]:
             if self.opt_type == "Adam":
                 self.optimizer = torch.optim.Adam(
-                    self.wrapper.parameters(),
-                    lr=self.lr_exp.start_lr,
-                    fused=False if DEVICE.type == "cpu" else True,
+                    self.wrapper.parameters(), lr=self.lr_exp.start_lr, fused=True
                 )
-            else:
+            elif self.opt_type == "AdamW":
                 self.optimizer = torch.optim.AdamW(
                     self.wrapper.parameters(),
                     lr=self.lr_exp.start_lr,
-                    weight_decay=float(self.opt_param["weight_decay"]),
-                    fused=False if DEVICE.type == "cpu" else True,
+                    weight_decay=self.opt_param["weight_decay"],
                 )
+            elif self.opt_type == "Lamb":
+                import os
+
+                from pytorch_lamb import (
+                    Lamb,
+                )
+
+                weight_decay = float(os.environ.get("LAMB_WD", 0.01))
+                self.optimizer = Lamb(
+                    self.wrapper.parameters(),
+                    lr=self.lr_exp.start_lr,
+                    weight_decay=weight_decay,
+                    betas=(0.9, 0.999),
+                    adam=False,
+                )
+            elif self.opt_type == "Soap":
+                import os
+
+                weight_decay = float(os.environ.get("LAMB_WD", 0.01))
+                self.optimizer = SOAP(
+                    self.wrapper.parameters(),
+                    lr=self.lr_exp.start_lr,
+                    weight_decay=weight_decay,
+                    betas=(0.95, 0.95),
+                    precondition_frequency=10,
+                )
+            else:
+                raise ValueError("Not reach here!")
             if optimizer_state_dict is not None and self.restart_training:
                 self.optimizer.load_state_dict(optimizer_state_dict)
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -728,7 +761,7 @@ class Trainer:
             writer = SummaryWriter(log_dir=self.tensorboard_log_dir)
         if self.enable_profiler or self.profiling:
             prof = torch.profiler.profile(
-                schedule=torch.profiler.schedule(wait=1, warmup=15, active=3, repeat=1),
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     self.tensorboard_log_dir
                 )
@@ -739,7 +772,7 @@ class Trainer:
             )
             prof.start()
 
-        def step(_step_id: int, task_key: str = "Default") -> None:
+        def step(_step_id, task_key="Default") -> None:
             if self.multi_task:
                 model_index = dp_random.choice(
                     np.arange(self.num_model, dtype=np.int_),
@@ -763,7 +796,7 @@ class Trainer:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
                 fout1.flush()
-            if self.opt_type in ["Adam", "AdamW"]:
+            if self.opt_type in ["Adam", "AdamW", "Lamb", "Soap"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr
@@ -813,7 +846,7 @@ class Trainer:
                         else self.wrapper
                     )
 
-                    def fake_model() -> dict:
+                    def fake_model():
                         return model_pred
 
                     _, loss, more_loss = module.loss[task_key](
@@ -852,33 +885,6 @@ class Trainer:
             else:
                 raise ValueError(f"Not supported optimizer type '{self.opt_type}'")
 
-            if self.disp_avg:
-                # Accumulate loss for averaging over display interval
-                self.step_count_in_interval += 1
-                if not self.multi_task:
-                    # Accumulate loss for single task
-                    if not self.train_loss_accu:
-                        # Initialize accumulator with current loss structure
-                        for item in more_loss:
-                            if "l2_" not in item:
-                                self.train_loss_accu[item] = 0.0
-                    for item in more_loss:
-                        if "l2_" not in item:
-                            self.train_loss_accu[item] += more_loss[item]
-                else:
-                    # Accumulate loss for multi-task
-                    if task_key not in self.train_loss_accu:
-                        self.train_loss_accu[task_key] = {}
-                    if task_key not in self.step_count_per_task:
-                        self.step_count_per_task[task_key] = 0
-                    self.step_count_per_task[task_key] += 1
-
-                    for item in more_loss:
-                        if "l2_" not in item:
-                            if item not in self.train_loss_accu[task_key]:
-                                self.train_loss_accu[task_key][item] = 0.0
-                            self.train_loss_accu[task_key][item] += more_loss[item]
-
             # Log and persist
             display_step_id = _step_id + 1
             if self.display_in_training and (
@@ -886,47 +892,18 @@ class Trainer:
             ):
                 self.wrapper.eval()  # Will set to train mode before fininshing validation
 
-                if self.disp_avg:
+                def log_loss_train(_loss, _more_loss, _task_key="Default"):
+                    results = {}
+                    rmse_val = {
+                        item: _more_loss[item]
+                        for item in _more_loss
+                        if "l2_" not in item
+                    }
+                    for item in sorted(rmse_val.keys()):
+                        results[item] = rmse_val[item]
+                    return results
 
-                    def log_loss_train(
-                        _loss: Any, _more_loss: Any, _task_key: str = "Default"
-                    ) -> dict:
-                        results = {}
-                        if not self.multi_task:
-                            # Use accumulated average loss for single task
-                            for item in self.train_loss_accu:
-                                results[item] = (
-                                    self.train_loss_accu[item]
-                                    / self.step_count_in_interval
-                                )
-                        else:
-                            # Use accumulated average loss for multi-task
-                            if (
-                                _task_key in self.train_loss_accu
-                                and _task_key in self.step_count_per_task
-                            ):
-                                for item in self.train_loss_accu[_task_key]:
-                                    results[item] = (
-                                        self.train_loss_accu[_task_key][item]
-                                        / self.step_count_per_task[_task_key]
-                                    )
-                        return results
-                else:
-
-                    def log_loss_train(
-                        _loss: Any, _more_loss: Any, _task_key: str = "Default"
-                    ) -> dict:
-                        results = {}
-                        rmse_val = {
-                            item: _more_loss[item]
-                            for item in _more_loss
-                            if "l2_" not in item
-                        }
-                        for item in sorted(rmse_val.keys()):
-                            results[item] = rmse_val[item]
-                        return results
-
-                def log_loss_valid(_task_key: str = "Default") -> dict:
+                def log_loss_valid(_task_key="Default"):
                     single_results = {}
                     sum_natoms = 0
                     if not self.multi_task:
@@ -982,31 +959,24 @@ class Trainer:
                 else:
                     train_results = {_key: {} for _key in self.model_keys}
                     valid_results = {_key: {} for _key in self.model_keys}
-                    if self.disp_avg:
-                        # For multi-task, use accumulated average loss for all tasks
-                        for _key in self.model_keys:
+                    train_results[task_key] = log_loss_train(
+                        loss, more_loss, _task_key=task_key
+                    )
+                    for _key in self.model_keys:
+                        if _key != task_key:
+                            self.optimizer.zero_grad()
+                            input_dict, label_dict, _ = self.get_data(
+                                is_train=True, task_key=_key
+                            )
+                            _, loss, more_loss = self.wrapper(
+                                **input_dict,
+                                cur_lr=pref_lr,
+                                label=label_dict,
+                                task_key=_key,
+                            )
                             train_results[_key] = log_loss_train(
                                 loss, more_loss, _task_key=_key
                             )
-                    else:
-                        train_results[task_key] = log_loss_train(
-                            loss, more_loss, _task_key=task_key
-                        )
-                        for _key in self.model_keys:
-                            if _key != task_key:
-                                self.optimizer.zero_grad()
-                                input_dict, label_dict, _ = self.get_data(
-                                    is_train=True, task_key=_key
-                                )
-                                _, loss, more_loss = self.wrapper(
-                                    **input_dict,
-                                    cur_lr=pref_lr,
-                                    label=label_dict,
-                                    task_key=_key,
-                                )
-                                train_results[_key] = log_loss_train(
-                                    loss, more_loss, _task_key=_key
-                                )
                         valid_results[_key] = log_loss_valid(_task_key=_key)
                         if self.rank == 0:
                             log.info(
@@ -1028,50 +998,22 @@ class Trainer:
                                 )
                 self.wrapper.train()
 
-                if self.disp_avg:
-                    # Reset loss accumulators after display
-                    if not self.multi_task:
-                        for item in self.train_loss_accu:
-                            self.train_loss_accu[item] = 0.0
-                    else:
-                        for task_key in self.model_keys:
-                            if task_key in self.train_loss_accu:
-                                for item in self.train_loss_accu[task_key]:
-                                    self.train_loss_accu[task_key][item] = 0.0
-                            if task_key in self.step_count_per_task:
-                                self.step_count_per_task[task_key] = 0
-                    self.step_count_in_interval = 0
-                    self.last_display_step = display_step_id
-
                 current_time = time.time()
                 train_time = current_time - self.t0
                 self.t0 = current_time
                 if self.rank == 0 and self.timing_in_training:
-                    eta = int(
-                        (self.num_steps - display_step_id)
-                        / min(self.disp_freq, display_step_id - self.start_step)
-                        * train_time
-                    )
                     log.info(
                         format_training_message(
                             batch=display_step_id,
                             wall_time=train_time,
-                            eta=eta,
                         )
                     )
+                # the first training time is not accurate
                 if (
-                    (self.num_steps - self.start_step)
-                    <= 2 * self.disp_freq  # not enough steps
-                    or (_step_id - self.start_step)
-                    >= self.disp_freq  # skip first disp_freq steps
+                    (_step_id + 1 - self.start_step) > self.disp_freq
+                    or self.num_steps - self.start_step < 2 * self.disp_freq
                 ):
                     self.total_train_time += train_time
-                    if display_step_id == 1:
-                        self.timed_steps += 1
-                    else:
-                        self.timed_steps += min(
-                            self.disp_freq, _step_id - self.start_step
-                        )
 
                 if fout:
                     if self.lcurve_should_print_header:
@@ -1082,14 +1024,11 @@ class Trainer:
                     )
 
             if (
-                (
-                    (display_step_id) % self.save_freq == 0
-                    and _step_id != self.start_step
-                )
-                or (display_step_id) == self.num_steps
+                ((_step_id + 1) % self.save_freq == 0 and _step_id != self.start_step)
+                or (_step_id + 1) == self.num_steps
             ) and (self.rank == 0 or dist.get_rank() == 0):
                 # Handle the case if rank 0 aborted and re-assigned
-                self.latest_model = Path(self.save_ckpt + f"-{display_step_id}.pt")
+                self.latest_model = Path(self.save_ckpt + f"-{_step_id + 1}.pt")
 
                 module = (
                     self.wrapper.module
@@ -1116,18 +1055,6 @@ class Trainer:
         self.wrapper.train()
         self.t0 = time.time()
         self.total_train_time = 0.0
-        self.timed_steps = 0
-
-        if self.disp_avg:
-            # Initialize loss accumulators
-            if not self.multi_task:
-                self.train_loss_accu = {}
-            else:
-                self.train_loss_accu = {key: {} for key in self.model_keys}
-                self.step_count_per_task = dict.fromkeys(self.model_keys, 0)
-            self.step_count_in_interval = 0
-            self.last_display_step = 0
-
         for step_id in range(self.start_step, self.num_steps):
             step(step_id)
             if JIT:
@@ -1167,12 +1094,24 @@ class Trainer:
                 with open("checkpoint", "w") as f:
                     f.write(str(self.latest_model))
 
-            if self.timing_in_training and self.timed_steps:
-                msg = f"average training time: {self.total_train_time / self.timed_steps:.4f} s/batch"
-                excluded_steps = self.num_steps - self.start_step - self.timed_steps
-                if excluded_steps > 0:
-                    msg += f" ({excluded_steps} batches excluded)"
-                log.info(msg)
+            elapsed_batch = self.num_steps - self.start_step
+            if self.timing_in_training and elapsed_batch // self.disp_freq > 0:
+                if self.start_step >= 2 * self.disp_freq:
+                    log.info(
+                        "average training time: %.4f s/batch (exclude first %d batches)",
+                        self.total_train_time
+                        / (
+                            elapsed_batch // self.disp_freq * self.disp_freq
+                            - self.disp_freq
+                        ),
+                        self.disp_freq,
+                    )
+                else:
+                    log.info(
+                        "average training time: %.4f s/batch",
+                        self.total_train_time
+                        / (elapsed_batch // self.disp_freq * self.disp_freq),
+                    )
 
             if JIT:
                 pth_model_path = (
@@ -1192,17 +1131,13 @@ class Trainer:
             writer.close()
         if self.enable_profiler or self.profiling:
             prof.stop()
-            if self.enable_profiler:
-                log.info(
-                    f"The profiling trace has been saved under {self.tensorboard_log_dir}"
-                )
-            if not self.enable_profiler and self.profiling:
+            if self.profiling:
                 prof.export_chrome_trace(self.profiling_file)
                 log.info(
-                    f"The profiling trace has been saved to: {self.profiling_file}"
+                    f"The profiling trace have been saved to: {self.profiling_file}"
                 )
 
-    def save_model(self, save_path: str, lr: float = 0.0, step: int = 0) -> None:
+    def save_model(self, save_path, lr=0.0, step=0) -> None:
         module = (
             self.wrapper.module
             if dist.is_available() and dist.is_initialized()
@@ -1227,18 +1162,49 @@ class Trainer:
             checkpoint_files.sort(key=lambda x: x.stat().st_mtime)
             checkpoint_files[0].unlink()
 
-    def get_data(
-        self, is_train: bool = True, task_key: str = "Default"
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        if is_train:
-            iterator = self.training_data
+    def get_data(self, is_train=True, task_key="Default"):
+        if not self.multi_task:
+            if is_train:
+                try:
+                    batch_data = next(iter(self.training_data))
+                except StopIteration:
+                    # Refresh the status of the dataloader to start from a new epoch
+                    with torch.device("cpu"):
+                        self.training_data = BufferedIterator(
+                            iter(self.training_dataloader)
+                        )
+                    batch_data = next(iter(self.training_data))
+            else:
+                if self.validation_data is None:
+                    return {}, {}, {}
+                try:
+                    batch_data = next(iter(self.validation_data))
+                except StopIteration:
+                    self.validation_data = BufferedIterator(
+                        iter(self.validation_dataloader)
+                    )
+                    batch_data = next(iter(self.validation_data))
         else:
-            iterator = self.validation_data
-        if self.multi_task:
-            iterator = iterator[task_key]
-        if iterator is None:
-            return {}, {}, {}
-        batch_data = next(iterator)
+            if is_train:
+                try:
+                    batch_data = next(iter(self.training_data[task_key]))
+                except StopIteration:
+                    # Refresh the status of the dataloader to start from a new epoch
+                    self.training_data[task_key] = BufferedIterator(
+                        iter(self.training_dataloader[task_key])
+                    )
+                    batch_data = next(iter(self.training_data[task_key]))
+            else:
+                if self.validation_data[task_key] is None:
+                    return {}, {}, {}
+                try:
+                    batch_data = next(iter(self.validation_data[task_key]))
+                except StopIteration:
+                    self.validation_data[task_key] = BufferedIterator(
+                        iter(self.validation_dataloader[task_key])
+                    )
+                    batch_data = next(iter(self.validation_data[task_key]))
+
         for key in batch_data.keys():
             if key == "sid" or key == "fid" or key == "box" or "find_" in key:
                 continue
@@ -1259,7 +1225,7 @@ class Trainer:
             "fparam",
             "aparam",
         ]
-        input_dict = dict.fromkeys(input_keys)
+        input_dict = {item_key: None for item_key in input_keys}
         label_dict = {}
         for item_key in batch_data:
             if item_key in input_keys:
@@ -1274,9 +1240,7 @@ class Trainer:
         log_dict["sid"] = batch_data["sid"]
         return input_dict, label_dict, log_dict
 
-    def print_header(
-        self, fout: Any, train_results: dict[str, Any], valid_results: dict[str, Any]
-    ) -> None:
+    def print_header(self, fout, train_results, valid_results) -> None:
         train_keys = sorted(train_results.keys())
         print_str = ""
         print_str += "# {:5s}".format("step")
@@ -1308,12 +1272,7 @@ class Trainer:
         fout.flush()
 
     def print_on_training(
-        self,
-        fout: Any,
-        step_id: int,
-        cur_lr: float,
-        train_results: dict,
-        valid_results: dict,
+        self, fout, step_id, cur_lr, train_results, valid_results
     ) -> None:
         train_keys = sorted(train_results.keys())
         print_str = ""
@@ -1345,7 +1304,7 @@ class Trainer:
         fout.flush()
 
 
-def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
+def get_additional_data_requirement(_model):
     additional_data_requirement = []
     if _model.get_dim_fparam() > 0:
         _fparam_default = (
@@ -1381,19 +1340,9 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
     return additional_data_requirement
 
 
-def whether_hessian(loss_params: dict[str, Any]) -> bool:
+def get_loss(loss_params, start_lr, _ntypes, _model):
     loss_type = loss_params.get("type", "ener")
-    return loss_type == "ener" and loss_params.get("start_pref_h", 0.0) > 0.0
-
-
-def get_loss(
-    loss_params: dict[str, Any], start_lr: float, _ntypes: int, _model: Any
-) -> TaskLoss:
-    loss_type = loss_params.get("type", "ener")
-    if whether_hessian(loss_params):
-        loss_params["starter_learning_rate"] = start_lr
-        return EnergyHessianStdLoss(**loss_params)
-    elif loss_type == "ener":
+    if loss_type == "ener":
         loss_params["starter_learning_rate"] = start_lr
         return EnergyStdLoss(**loss_params)
     elif loss_type == "dos":
@@ -1404,18 +1353,20 @@ def get_loss(
         loss_params["starter_learning_rate"] = start_lr
         return EnergySpinLoss(**loss_params)
     elif loss_type == "denoise":
-        loss_params["ntypes"] = _ntypes
-        return DenoiseLoss(**loss_params)
+        loss_params["starter_learning_rate"] = start_lr
+        return DeNSLoss(**loss_params)
     elif loss_type == "tensor":
         model_output_type = _model.model_output_type()
         if "mask" in model_output_type:
             model_output_type.pop(model_output_type.index("mask"))
         tensor_name = model_output_type[0]
-        loss_params["tensor_size"] = _model.model_output_def()[tensor_name].output_size
-        loss_params["label_name"] = tensor_name
-        if tensor_name == "polarizability":
-            tensor_name = "polar"
         loss_params["tensor_name"] = tensor_name
+        loss_params["tensor_size"] = _model.model_output_def()[tensor_name].output_size
+        label_name = tensor_name
+        if label_name == "polarizability":
+            label_name = "polar"
+        loss_params["label_name"] = label_name
+        loss_params["tensor_name"] = label_name
         return TensorLoss(**loss_params)
     elif loss_type == "property":
         task_dim = _model.get_task_dim()
@@ -1431,8 +1382,8 @@ def get_loss(
 
 
 def get_single_model(
-    _model_params: dict[str, Any],
-) -> Any:
+    _model_params,
+):
     if "use_srtab" in _model_params:
         model = get_zbl_model(deepcopy(_model_params)).to(DEVICE)
     else:
@@ -1440,14 +1391,8 @@ def get_single_model(
     return model
 
 
-def get_model_for_wrapper(
-    _model_params: dict[str, Any],
-    resuming: bool = False,
-    _loss_params: Optional[dict[str, Any]] = None,
-) -> Any:
+def get_model_for_wrapper(_model_params, resuming=False):
     if "model_dict" not in _model_params:
-        if _loss_params is not None and whether_hessian(_loss_params):
-            _model_params["hessian_mode"] = True
         _model = get_single_model(
             _model_params,
         )
@@ -1456,8 +1401,6 @@ def get_model_for_wrapper(
         model_keys = list(_model_params["model_dict"])
         do_case_embd, case_embd_index = get_case_embd_config(_model_params)
         for _model_key in model_keys:
-            if _loss_params is not None and whether_hessian(_loss_params[_model_key]):
-                _model_params["model_dict"][_model_key]["hessian_mode"] = True
             _model[_model_key] = get_single_model(
                 _model_params["model_dict"][_model_key],
             )
@@ -1467,10 +1410,10 @@ def get_model_for_wrapper(
     return _model
 
 
-def get_case_embd_config(_model_params: dict[str, Any]) -> tuple[bool, dict[str, int]]:
-    assert "model_dict" in _model_params, (
-        "Only support setting case embedding for multi-task model!"
-    )
+def get_case_embd_config(_model_params):
+    assert (
+        "model_dict" in _model_params
+    ), "Only support setting case embedding for multi-task model!"
     model_keys = list(_model_params["model_dict"])
     sorted_model_keys = sorted(model_keys)
     numb_case_embd_list = [
@@ -1492,10 +1435,10 @@ def get_case_embd_config(_model_params: dict[str, Any]) -> tuple[bool, dict[str,
 
 
 def model_change_out_bias(
-    _model: Any,
-    _sample_func: Callable[[], Any],
-    _bias_adjust_mode: str = "change-by-statistic",
-) -> Any:
+    _model,
+    _sample_func,
+    _bias_adjust_mode="change-by-statistic",
+):
     old_bias = deepcopy(_model.get_out_bias())
     _model.change_out_bias(
         _sample_func,

@@ -3,10 +3,6 @@ import logging
 from copy import (
     deepcopy,
 )
-from typing import (
-    Optional,
-    Union,
-)
 
 import torch
 
@@ -29,8 +25,8 @@ log = logging.getLogger(__name__)
 class Tester:
     def __init__(
         self,
-        model_ckpt: Union[str, torch.nn.Module],
-        head: Optional[str] = None,
+        model_ckpt,
+        head=None,
     ) -> None:
         """Construct a DeePMD tester.
 
@@ -44,6 +40,8 @@ class Tester:
         model_params = state_dict["_extra_state"]["model_params"]
         self.multi_task = "model_dict" in model_params
         if self.multi_task:
+            if head is None and "Default" in model_params["model_dict"]:
+                head = "Default"
             assert head is not None, "Head must be specified in multitask mode!"
             self.head = head
             assert head in model_params["model_dict"], (
@@ -59,9 +57,6 @@ class Tester:
                     ] = state_dict[item].clone()
             state_dict = state_dict_head
 
-        model_params.pop(
-            "hessian_mode", None
-        )  # wrapper Hessian to Energy model due to JIT limit
         self.model_params = deepcopy(model_params)
         self.model = get_model(model_params).to(DEVICE)
 

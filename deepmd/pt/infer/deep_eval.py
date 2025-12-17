@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import json
-import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -59,27 +58,15 @@ from deepmd.pt.utils.auto_batch_size import (
 from deepmd.pt.utils.env import (
     DEVICE,
     GLOBAL_PT_FLOAT_PRECISION,
-    RESERVED_PRECISION_DICT,
+    RESERVED_PRECISON_DICT,
 )
 from deepmd.pt.utils.utils import (
     to_numpy_array,
     to_torch_tensor,
 )
-from deepmd.utils.econf_embd import (
-    sort_element_type,
-)
-from deepmd.utils.model_branch_dict import (
-    get_model_dict,
-)
 
 if TYPE_CHECKING:
     import ase.neighborlist
-
-    from deepmd.pt.model.model.model import (
-        BaseModel,
-    )
-
-log = logging.getLogger(__name__)
 
 
 class DeepEval(DeepEvalBackend):
@@ -93,7 +80,7 @@ class DeepEval(DeepEvalBackend):
         The output definition of the model.
     *args : list
         Positional arguments.
-    auto_batch_size : bool or int or AutomaticBatchSize, default: True
+    auto_batch_size : bool or int or AutomaticBatchSize, default: False
         If True, automatic batch size will be used. If int, it will be used
         as the initial batch size.
     neighbor_list : ase.neighborlist.NewPrimitiveNeighborList, optional
@@ -111,51 +98,34 @@ class DeepEval(DeepEvalBackend):
         auto_batch_size: Union[bool, int, AutoBatchSize] = True,
         neighbor_list: Optional["ase.neighborlist.NewPrimitiveNeighborList"] = None,
         head: Optional[Union[str, int]] = None,
-        no_jit: bool = False,
         **kwargs: Any,
     ) -> None:
         self.output_def = output_def
         self.model_path = model_file
-        if str(self.model_path).endswith(".pt"):
+        if str(self.model_path).endswith(".pt") and "weighted_metric" not in self.model_path:
             state_dict = torch.load(
                 model_file, map_location=env.DEVICE, weights_only=True
             )
             if "model" in state_dict:
                 state_dict = state_dict["model"]
+            import pdb; pdb.set_trace()
             self.input_param = state_dict["_extra_state"]["model_params"]
             self.model_def_script = self.input_param
             self.multi_task = "model_dict" in self.input_param
             if self.multi_task:
-                model_alias_dict, model_branch_dict = get_model_dict(
-                    self.input_param["model_dict"]
-                )
                 model_keys = list(self.input_param["model_dict"].keys())
-                if head is None and "Default" in model_alias_dict:
-                    head = "Default"
-                    log.info(
-                        f"Using default head {model_alias_dict[head]} for multitask model."
-                    )
                 if isinstance(head, int):
                     head = model_keys[0]
-                assert head is not None, (
-                    f"Head must be set for multitask model! Available heads are: {model_keys}, "
-                    f"use `dp --pt show your_model.pt model-branch` to show detail information."
-                )
-                if head not in model_alias_dict:
-                    # preprocess with potentially case-insensitive input
-                    head_lower = head.lower()
-                    for mk in model_alias_dict:
-                        if mk.lower() == head_lower:
-                            # mapped the first matched head
-                            head = mk
-                            break
-                # replace with alias
-                assert head in model_alias_dict, (
-                    f"No head or alias named {head} in model! Available heads are: {model_keys},"
-                    f"use `dp --pt show your_model.pt model-branch` to show detail information."
-                )
-                head = model_alias_dict[head]
-
+                if head is None and "Default" in model_keys:
+                    head = "Default"
+                if head is None and "MP_traj_v024_alldata_mixu" in model_keys:
+                    head = "MP_traj_v024_alldata_mixu"
+                assert (
+                    head is not None
+                ), f"Head must be set for multitask model! Available heads are: {model_keys}"
+                assert (
+                    head in model_keys
+                ), f"No head named {head} in model! Available heads are: {model_keys}"
                 self.input_param = self.input_param["model_dict"][head]
                 state_dict_head = {"_extra_state": state_dict["_extra_state"]}
                 for item in state_dict:
@@ -165,8 +135,7 @@ class DeepEval(DeepEvalBackend):
                         ] = state_dict[item].clone()
                 state_dict = state_dict_head
             model = get_model(self.input_param).to(DEVICE)
-            if not self.input_param.get("hessian_mode") and not no_jit:
-                model = torch.jit.script(model)
+            # model = torch.jit.script(model)
             self.dp = ModelWrapper(model)
             self.dp.load_state_dict(state_dict)
         elif str(self.model_path).endswith(".pth"):
@@ -177,6 +146,17 @@ class DeepEval(DeepEvalBackend):
                 self.model_def_script = json.loads(model_def_script)
             else:
                 self.model_def_script = {}
+        elif "weighted_metric" in self.model_path:
+            state_dict = torch.load(model_file, map_location=env.DEVICE, weights_only=True)
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
+            self.input_param = {'type': 'dpa3_dynamic', 'type_map': ['H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne', 'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca', 'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn', 'Ga', 'Ge', 'As', 'Se', 'Br', 'Kr', 'Rb', 'Sr', 'Y', 'Zr', 'Nb', 'Mo', 'Tc', 'Ru', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn', 'Sb', 'Te', 'I', 'Xe', 'Cs', 'Ba', 'La', 'Ce', 'Pr', 'Nd', 'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb', 'Lu', 'Hf', 'Ta', 'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg', 'Tl', 'Pb', 'Bi', 'Ac', 'Th', 'Pa', 'U', 'Np', 'Pu'], 'descriptor': {'type': 'dpa3', 'repflow': {'n_dim': 128, 'e_dim': 64, 'a_dim': 32, 'nlayers': 6, 'e_rcut': 6.0, 'e_rcut_smth': 5.3, 'e_sel': 200, 'a_rcut': 4.0, 'a_rcut_smth': 3.5, 'a_sel': 50, 'axis_neuron': 4, 'skip_stat': True, 'a_compress_rate': 1, 'a_compress_e_rate': 2, 'a_compress_use_split': True, 'update_angle': True, 'update_style': 'res_residual', 'update_residual': 0.1, 'update_residual_init': 'const', 'smooth_edge_update': True, 'use_dynamic_sel': True, 'sel_reduce_factor': 10.0}, 'activation_function': 'custom_silu:10.0', 'use_tebd_bias': False, 'precision': 'float32', 'concat_output_tebd': False}, 'fitting_net': {'neuron': [240, 240, 240], 'resnet_dt': True, 'seed': 1, 'precision': 'float32', 'activation_function': 'custom_silu:10.0', 'type': 'ener', 'numb_fparam': 0, 'numb_aparam': 0, 'dim_case_embd': 0, 'trainable': True, 'rcond': None, 'atom_ener': [], 'use_aparam_as_mask': False}}
+            self.model_def_script = self.input_param
+            self.multi_task = "model_dict" in self.input_param
+            model = get_model(self.input_param).to(DEVICE)
+            import pdb; pdb.set_trace()
+            self.dp = ModelWrapper(model)
+            model.load_state_dict(state_dict)
         else:
             raise ValueError("Unknown model file format!")
         self.dp.eval()
@@ -196,7 +176,6 @@ class DeepEval(DeepEvalBackend):
         self._has_spin = getattr(self.dp.model["Default"], "has_spin", False)
         if callable(self._has_spin):
             self._has_spin = self._has_spin()
-        self._has_hessian = self.model_def_script.get("hessian_mode", False)
 
     def get_rcut(self) -> float:
         """Get the cutoff radius of this model."""
@@ -219,12 +198,7 @@ class DeepEval(DeepEvalBackend):
         return self.dp.model["Default"].get_dim_aparam()
 
     def has_default_fparam(self) -> bool:
-        """Check if the model has default frame parameters."""
-        try:
-            return self.dp.model["Default"].has_default_fparam()
-        except AttributeError:
-            # for compatibility with old models
-            return False
+        return self.dp.model["Default"].has_default_fparam()
 
     def get_intensive(self) -> bool:
         return self.dp.model["Default"].get_intensive()
@@ -284,24 +258,9 @@ class DeepEval(DeepEvalBackend):
         """Get the number of spin atom types of this model. Only used in old implement."""
         return 0
 
-    def get_has_spin(self) -> bool:
+    def get_has_spin(self):
         """Check if the model has spin atom types."""
         return self._has_spin
-
-    def get_has_hessian(self) -> bool:
-        """Check if the model has hessian."""
-        return self._has_hessian
-
-    def get_model_branch(self) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
-        """Get the model branch information."""
-        if "model_dict" in self.model_def_script:
-            model_alias_dict, model_branch_dict = get_model_dict(
-                self.model_def_script["model_dict"]
-            )
-            return model_alias_dict, model_branch_dict
-        else:
-            # single-task model
-            return {"Default": "Default"}, {"Default": {"alias": [], "info": {}}}
 
     def eval(
         self,
@@ -397,9 +356,9 @@ class DeepEval(DeepEvalBackend):
             The requested output definitions.
         """
         if atomic:
-            output_defs = list(self.output_def.var_defs.values())
+            return list(self.output_def.var_defs.values())
         else:
-            output_defs = [
+            return [
                 x
                 for x in self.output_def.var_defs.values()
                 if x.category
@@ -408,16 +367,8 @@ class DeepEval(DeepEvalBackend):
                     OutputVariableCategory.REDU,
                     OutputVariableCategory.DERV_R,
                     OutputVariableCategory.DERV_C_REDU,
-                    OutputVariableCategory.DERV_R_DERV_R,
                 )
             ]
-        if not self.get_has_hessian():
-            output_defs = [
-                x
-                for x in output_defs
-                if x.category != OutputVariableCategory.DERV_R_DERV_R
-            ]
-        return output_defs
 
     def _eval_func(self, inner_func: Callable, numb_test: int, natoms: int) -> Callable:
         """Wrapper method with auto batch size.
@@ -438,7 +389,7 @@ class DeepEval(DeepEvalBackend):
         """
         if self.auto_batch_size is not None:
 
-            def eval_func(*args: Any, **kwargs: Any) -> Any:
+            def eval_func(*args, **kwargs):
                 return self.auto_batch_size.execute_all(
                     inner_func, numb_test, natoms, *args, **kwargs
                 )
@@ -472,9 +423,9 @@ class DeepEval(DeepEvalBackend):
         fparam: Optional[np.ndarray],
         aparam: Optional[np.ndarray],
         request_defs: list[OutputVariableDef],
-    ) -> tuple[np.ndarray, ...]:
+    ):
         model = self.dp.to(DEVICE)
-        prec = NP_PRECISION_DICT[RESERVED_PRECISION_DICT[GLOBAL_PT_FLOAT_PRECISION]]
+        prec = NP_PRECISION_DICT[RESERVED_PRECISON_DICT[GLOBAL_PT_FLOAT_PRECISION]]
 
         nframes = coords.shape[0]
         if len(atom_types.shape) == 1:
@@ -489,7 +440,7 @@ class DeepEval(DeepEvalBackend):
             device=DEVICE,
         )
         type_input = torch.tensor(
-            atom_types.astype(NP_PRECISION_DICT[RESERVED_PRECISION_DICT[torch.long]]),
+            atom_types.astype(NP_PRECISION_DICT[RESERVED_PRECISON_DICT[torch.long]]),
             dtype=torch.long,
             device=DEVICE,
         )
@@ -535,10 +486,19 @@ class DeepEval(DeepEvalBackend):
                 out = batch_output[pt_name].reshape(shape).detach().cpu().numpy()
                 results.append(out)
             else:
-                shape = self._get_output_shape(odef, nframes, natoms)
-                results.append(
-                    np.full(np.abs(shape), np.nan, dtype=prec)
-                )  # this is kinda hacky
+                if (
+                    self._OUTDEF_DP2BACKEND[odef.name] == "force"
+                    and "dforce" in batch_output
+                ):
+                    # if no force, use dforce if possible
+                    shape = self._get_output_shape(odef, nframes, natoms)
+                    out = batch_output["dforce"].reshape(shape).detach().cpu().numpy()
+                    results.append(out)
+                else:
+                    shape = self._get_output_shape(odef, nframes, natoms)
+                    results.append(
+                        np.full(np.abs(shape), np.nan, dtype=prec)
+                    )  # this is kinda hacky
         return tuple(results)
 
     def _eval_model_spin(
@@ -550,7 +510,7 @@ class DeepEval(DeepEvalBackend):
         fparam: Optional[np.ndarray],
         aparam: Optional[np.ndarray],
         request_defs: list[OutputVariableDef],
-    ) -> tuple[np.ndarray, ...]:
+    ):
         model = self.dp.to(DEVICE)
 
         nframes = coords.shape[0]
@@ -621,15 +581,13 @@ class DeepEval(DeepEvalBackend):
                         np.abs(shape),
                         np.nan,
                         dtype=NP_PRECISION_DICT[
-                            RESERVED_PRECISION_DICT[GLOBAL_PT_FLOAT_PRECISION]
+                            RESERVED_PRECISON_DICT[GLOBAL_PT_FLOAT_PRECISION]
                         ],
                     )
                 )  # this is kinda hacky
         return tuple(results)
 
-    def _get_output_shape(
-        self, odef: OutputVariableDef, nframes: int, natoms: int
-    ) -> list[int]:
+    def _get_output_shape(self, odef, nframes, natoms):
         if odef.category == OutputVariableCategory.DERV_C_REDU:
             # virial
             return [nframes, *odef.shape[:-1], 9]
@@ -647,9 +605,6 @@ class DeepEval(DeepEvalBackend):
             # Something wrong here?
             # return [nframes, *shape, natoms, 1]
             return [nframes, natoms, *odef.shape, 1]
-        elif odef.category == OutputVariableCategory.DERV_R_DERV_R:
-            return [nframes, 3 * natoms, 3 * natoms]
-            # return [nframes, *odef.shape, 3 * natoms, 3 * natoms]
         else:
             raise RuntimeError("unknown category")
 
@@ -686,56 +641,6 @@ class DeepEval(DeepEvalBackend):
     def get_model_def_script(self) -> str:
         """Get model definition script."""
         return self.model_def_script
-
-    def get_model_size(self) -> dict:
-        """Get model parameter count.
-
-        Returns
-        -------
-        dict
-            A dictionary containing the number of parameters in the model.
-            The keys are 'descriptor', 'fitting_net', and 'total'.
-        """
-        params_dict = dict(self.dp.named_parameters())
-        sum_param_des = sum(
-            params_dict[k].numel() for k in params_dict.keys() if "descriptor" in k
-        )
-        sum_param_fit = sum(
-            params_dict[k].numel()
-            for k in params_dict.keys()
-            if "fitting" in k and "_networks" not in k
-        )
-        return {
-            "descriptor": sum_param_des,
-            "fitting-net": sum_param_fit,
-            "total": sum_param_des + sum_param_fit,
-        }
-
-    def get_observed_types(self) -> dict:
-        """Get observed types (elements) of the model during data statistics.
-
-        Returns
-        -------
-        dict
-            A dictionary containing the information of observed type in the model:
-            - 'type_num': the total number of observed types in this model.
-            - 'observed_type': a list of the observed types in this model.
-        """
-        observed_type_list = self.dp.model["Default"].get_observed_type_list()
-        return {
-            "type_num": len(observed_type_list),
-            "observed_type": sort_element_type(observed_type_list),
-        }
-
-    def get_model(self) -> "BaseModel":
-        """Get the PyTorch model.
-
-        Returns
-        -------
-        BaseModel
-            The PyTorch model instance.
-        """
-        return self.dp.model["Default"]
 
     def eval_descriptor(
         self,

@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 from typing import (
-    Any,
-    Callable,
     Optional,
 )
 
@@ -30,7 +28,7 @@ from deepmd.pt.utils.env import (
     GLOBAL_PT_ENER_FLOAT_PRECISION,
     GLOBAL_PT_FLOAT_PRECISION,
     PRECISION_DICT,
-    RESERVED_PRECISION_DICT,
+    RESERVED_PRECISON_DICT,
 )
 from deepmd.pt.utils.nlist import (
     extend_input_and_build_neighbor_list,
@@ -41,7 +39,7 @@ from deepmd.utils.path import (
 )
 
 
-def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
+def make_model(T_AtomicModel: type[BaseAtomicModel]):
     """Make a model as a derived class of an atomic model.
 
     The model provide two interfaces.
@@ -67,10 +65,10 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
     class CM(BaseModel):
         def __init__(
             self,
-            *args: Any,
+            *args,
             # underscore to prevent conflict with normal inputs
             atomic_model_: Optional[T_AtomicModel] = None,
-            **kwargs: Any,
+            **kwargs,
         ) -> None:
             super().__init__(*args, **kwargs)
             if atomic_model_ is not None:
@@ -78,11 +76,11 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             else:
                 self.atomic_model: T_AtomicModel = T_AtomicModel(*args, **kwargs)
             self.precision_dict = PRECISION_DICT
-            self.reverse_precision_dict = RESERVED_PRECISION_DICT
+            self.reverse_precision_dict = RESERVED_PRECISON_DICT
             self.global_pt_float_precision = GLOBAL_PT_FLOAT_PRECISION
             self.global_pt_ener_float_precision = GLOBAL_PT_ENER_FLOAT_PRECISION
 
-        def model_output_def(self) -> ModelOutputDef:
+        def model_output_def(self):
             """Get the output def for the model."""
             return ModelOutputDef(self.atomic_output_def())
 
@@ -131,12 +129,13 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
         # cannot use the name forward. torch script does not work
         def forward_common(
             self,
-            coord: torch.Tensor,
-            atype: torch.Tensor,
+            coord,
+            atype,
             box: Optional[torch.Tensor] = None,
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
             do_atomic_virial: bool = False,
+            force_embedding_input: Optional[torch.Tensor] = None,
         ) -> dict[str, torch.Tensor]:
             """Return model prediction.
 
@@ -182,6 +181,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 mixed_types=True,
                 box=bb,
             )
+            # import pdb; pdb.set_trace()
             model_predict_lower = self.forward_common_lower(
                 extended_coord,
                 extended_atype,
@@ -190,7 +190,9 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 do_atomic_virial=do_atomic_virial,
                 fparam=fp,
                 aparam=ap,
+                force_embedding_input=force_embedding_input,
             )
+            
             model_predict = communicate_extended_output(
                 model_predict_lower,
                 self.model_output_def(),
@@ -208,8 +210,8 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
 
         def change_out_bias(
             self,
-            merged: Any,
-            bias_adjust_mode: str = "change-by-statistic",
+            merged,
+            bias_adjust_mode="change-by-statistic",
         ) -> None:
             """Change the output bias of atomic model according to the input data and the pretrained model.
 
@@ -232,21 +234,20 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 merged,
                 bias_adjust_mode=bias_adjust_mode,
             )
-            if bias_adjust_mode == "set-by-statistic":
-                self.atomic_model.compute_fitting_input_stat(merged)
 
         def forward_common_lower(
             self,
-            extended_coord: torch.Tensor,
-            extended_atype: torch.Tensor,
-            nlist: torch.Tensor,
+            extended_coord,
+            extended_atype,
+            nlist,
             mapping: Optional[torch.Tensor] = None,
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
             do_atomic_virial: bool = False,
             comm_dict: Optional[dict[str, torch.Tensor]] = None,
             extra_nlist_sort: bool = False,
-        ) -> dict[str, torch.Tensor]:
+            force_embedding_input: Optional[torch.Tensor] = None,
+        ):
             """Return model prediction. Lower interface that takes
             extended atomic coordinates and types, nlist, and mapping
             as input, and returns the predictions on the extended region.
@@ -296,14 +297,15 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 fparam=fp,
                 aparam=ap,
                 comm_dict=comm_dict,
+                force_embedding_input=force_embedding_input,
             )
+            
             model_predict = fit_output_to_model_output(
                 atomic_ret,
                 self.atomic_output_def(),
                 cc_ext,
                 do_atomic_virial=do_atomic_virial,
                 create_graph=self.training,
-                mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
             )
             model_predict = self.output_type_cast(model_predict, input_prec)
             return model_predict
@@ -387,7 +389,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             extended_atype: torch.Tensor,
             nlist: torch.Tensor,
             extra_nlist_sort: bool = False,
-        ) -> torch.Tensor:
+        ):
             """Format the neighbor list.
 
             1. If the number of neighbors in the `nlist` is equal to sum(self.sel),
@@ -438,7 +440,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             nlist: torch.Tensor,
             nnei: int,
             extra_nlist_sort: bool = False,
-        ) -> torch.Tensor:
+        ):
             n_nf, n_nloc, n_nnei = nlist.shape
             # nf x nall x 3
             extended_coord = extended_coord.view([n_nf, -1, 3])
@@ -500,7 +502,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             return self.atomic_model.do_grad_c(var_name)
 
         def change_type_map(
-            self, type_map: list[str], model_with_new_type_stat: Optional[Any] = None
+            self, type_map: list[str], model_with_new_type_stat=None
         ) -> None:
             """Change the type related params to new ones, according to `type_map` and the original one in the model.
             If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
@@ -516,10 +518,10 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             return self.atomic_model.serialize()
 
         @classmethod
-        def deserialize(cls, data: Any) -> "CM":
+        def deserialize(cls, data) -> "CM":
             return cls(atomic_model_=T_AtomicModel.deserialize(data))
 
-        def set_case_embd(self, case_idx: int) -> None:
+        def set_case_embd(self, case_idx: int):
             self.atomic_model.set_case_embd(case_idx)
 
         @torch.jit.export
@@ -529,7 +531,6 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
 
         @torch.jit.export
         def has_default_fparam(self) -> bool:
-            """Check if the model has default frame parameters."""
             return self.atomic_model.has_default_fparam()
 
         def get_default_fparam(self) -> Optional[torch.Tensor]:
@@ -584,9 +585,9 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
 
         def compute_or_load_stat(
             self,
-            sampled_func: Callable[[], Any],
+            sampled_func,
             stat_file_path: Optional[DPPath] = None,
-        ) -> None:
+        ):
             """Compute or load the statistics."""
             return self.atomic_model.compute_or_load_stat(sampled_func, stat_file_path)
 
@@ -617,8 +618,8 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
 
         def forward(
             self,
-            coord: torch.Tensor,
-            atype: torch.Tensor,
+            coord,
+            atype,
             box: Optional[torch.Tensor] = None,
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
