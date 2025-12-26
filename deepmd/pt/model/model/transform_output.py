@@ -164,6 +164,8 @@ def fit_output_to_model_output(
     redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
     model_ret = dict(fit_ret.items())
     for kk, vv in fit_ret.items():
+        if kk == 'batch':
+            continue
         vdef = fit_output_def[kk]
         shap = vdef.shape
         atom_axis = -(len(shap) + 1)
@@ -177,9 +179,29 @@ def fit_output_to_model_output(
                 else:
                     model_ret[kk_redu] = torch.mean(vv.to(redu_prec), dim=atom_axis)
             else:
-                model_ret[kk_redu] = torch.sum(vv.to(redu_prec), dim=atom_axis)
+                batch = fit_ret.get("batch")
+                if batch is not None:
+                    vv = vv.squeeze(0)
+                    
+                    batch = batch.to(device=vv.device, dtype=torch.long).unsqueeze(-1)
+                    
+                    n_batch = int(batch.max().item() + 1)
+                    redu_shape = list(vv.shape)
+                    redu_shape[0] = n_batch
+                    base = torch.zeros(redu_shape, dtype=redu_prec, device=vv.device)
+                    model_ret[kk_redu] = torch.scatter_reduce(
+                        base,
+                        0,
+                        batch,
+                        vv.to(redu_prec),
+                        reduce="sum",
+                        include_self=True,
+                    )
+                else:
+                    model_ret[kk_redu] = torch.sum(vv.to(redu_prec), dim=atom_axis)
             if vdef.r_differentiable:
                 kk_derv_r, kk_derv_c = get_deriv_name(kk)
+                
                 dr, dc = take_deriv(
                     vv,
                     model_ret[kk_redu],
@@ -192,11 +214,25 @@ def fit_output_to_model_output(
                 model_ret[kk_derv_r] = dr
                 if vdef.c_differentiable:
                     assert dc is not None
-                    model_ret[kk_derv_c] = dc
-                    model_ret[kk_derv_c + "_redu"] = torch.sum(
-                        model_ret[kk_derv_c].to(redu_prec), dim=1
-                    )
+                    model_ret[kk_derv_c] = dc.squeeze(1)
+                    batch = fit_ret.get("batch")
+                    n_batch = int(batch.max().item() + 1)
+                    dc = model_ret[kk_derv_c]
+                    device = dc.device
+                    dtype = redu_prec
+                    batch = batch.to(device=device, dtype=torch.long)
+                    redu_list = []
+                    for ii in range(n_batch):
+                        idx = torch.nonzero(batch == ii, as_tuple=True)[0]
+                        if idx.numel() == 0:
+                            redu_list.append(torch.zeros(dc.shape[-1], device=device, dtype=dtype))
+                            continue
+                        sele = torch.index_select(dc, 0, idx).to(dtype)
+                        redu_list.append(torch.sum(sele, dim=0))
+                    model_ret[kk_derv_c + "_redu"] = torch.stack(redu_list, dim=0)
+                    
     return model_ret
+
 
 
 def communicate_extended_output(

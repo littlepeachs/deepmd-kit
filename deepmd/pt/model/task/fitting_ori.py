@@ -745,8 +745,12 @@ class GeneralFitting(Fitting):
     ) -> dict[str, torch.Tensor]:
         # cast the input to internal precsion
         xx = descriptor.to(self.prec)
-        
-        natoms, nd = xx.shape
+        nf, nloc, nd = xx.shape
+
+        if self.numb_fparam > 0 and fparam is None:
+            # use default fparam
+            assert self.default_fparam_tensor is not None
+            fparam = torch.tile(self.default_fparam_tensor.unsqueeze(0), [nf, 1])
 
         fparam = fparam.to(self.prec) if fparam is not None else None
         aparam = aparam.to(self.prec) if aparam is not None else None
@@ -767,10 +771,71 @@ class GeneralFitting(Fitting):
                 f"get an input descriptor of dim {nd},"
                 f"which is not consistent with {self.dim_descrpt}."
             )
-        
+        # check fparam dim, concate to input descriptor
+        if self.numb_fparam > 0:
+            assert fparam is not None, "fparam should not be None"
+            assert self.fparam_avg is not None
+            assert self.fparam_inv_std is not None
+            if fparam.shape[-1] != self.numb_fparam:
+                raise ValueError(
+                    "get an input fparam of dim {fparam.shape[-1]}, ",
+                    "which is not consistent with {self.numb_fparam}.",
+                )
+            fparam = fparam.view([nf, self.numb_fparam])
+            nb, _ = fparam.shape
+            t_fparam_avg = self._extend_f_avg_std(self.fparam_avg, nb)
+            t_fparam_inv_std = self._extend_f_avg_std(self.fparam_inv_std, nb)
+            fparam = (fparam - t_fparam_avg) * t_fparam_inv_std
+            fparam = torch.tile(fparam.reshape([nf, 1, -1]), [1, nloc, 1])
+            xx = torch.cat(
+                [xx, fparam],
+                dim=-1,
+            )
+            if xx_zeros is not None:
+                xx_zeros = torch.cat(
+                    [xx_zeros, fparam],
+                    dim=-1,
+                )
+        # check aparam dim, concate to input descriptor
+        if self.numb_aparam > 0 and not self.use_aparam_as_mask:
+            assert aparam is not None, "aparam should not be None"
+            assert self.aparam_avg is not None
+            assert self.aparam_inv_std is not None
+            if aparam.shape[-1] != self.numb_aparam:
+                raise ValueError(
+                    f"get an input aparam of dim {aparam.shape[-1]}, ",
+                    f"which is not consistent with {self.numb_aparam}.",
+                )
+            aparam = aparam.view([nf, -1, self.numb_aparam])
+            nb, nloc, _ = aparam.shape
+            t_aparam_avg = self._extend_a_avg_std(self.aparam_avg, nb, nloc)
+            t_aparam_inv_std = self._extend_a_avg_std(self.aparam_inv_std, nb, nloc)
+            aparam = (aparam - t_aparam_avg) * t_aparam_inv_std
+            xx = torch.cat(
+                [xx, aparam],
+                dim=-1,
+            )
+            if xx_zeros is not None:
+                xx_zeros = torch.cat(
+                    [xx_zeros, aparam],
+                    dim=-1,
+                )
+
+        if self.dim_case_embd > 0:
+            assert self.case_embd is not None
+            case_embd = torch.tile(self.case_embd.reshape([1, 1, -1]), [nf, nloc, 1])
+            xx = torch.cat(
+                [xx, case_embd],
+                dim=-1,
+            )
+            if xx_zeros is not None:
+                xx_zeros = torch.cat(
+                    [xx_zeros, case_embd],
+                    dim=-1,
+                )
 
         outs = torch.zeros(
-            (natoms, net_dim_out),
+            (nf, nloc, net_dim_out),
             dtype=self.prec,
             device=descriptor.device,
         )  # jit assertion
@@ -787,7 +852,45 @@ class GeneralFitting(Fitting):
             outs = (
                 outs + atom_property + self.bias_atom_e[atype].to(self.prec)
             )  # Shape is [nframes, natoms[0], net_dim_out]
-        outs = outs.unsqueeze(0)
+        else:
+            if self.eval_return_middle_output:
+                outs_middle = torch.zeros(
+                    (nf, nloc, self.neuron[-1]),
+                    dtype=self.prec,
+                    device=descriptor.device,
+                )  # jit assertion
+                for type_i, ll in enumerate(self.filter_layers.networks):
+                    mask = (atype == type_i).unsqueeze(-1)
+                    mask = torch.tile(mask, (1, 1, net_dim_out))
+                    middle_output_type = ll.call_until_last(xx)
+                    middle_output_type = torch.where(
+                        torch.tile(mask, (1, 1, self.neuron[-1])),
+                        middle_output_type,
+                        0.0,
+                    )
+                    outs_middle = outs_middle + middle_output_type
+                results["middle_output"] = outs_middle
+            for type_i, ll in enumerate(self.filter_layers.networks):
+                mask = (atype == type_i).unsqueeze(-1)
+                mask = torch.tile(mask, (1, 1, net_dim_out))
+                atom_property = ll(xx)
+                if xx_zeros is not None:
+                    # must assert, otherwise jit is not happy
+                    assert self.remove_vaccum_contribution is not None
+                    if not (
+                        len(self.remove_vaccum_contribution) > type_i
+                        and not self.remove_vaccum_contribution[type_i]
+                    ):
+                        atom_property -= ll(xx_zeros)
+                atom_property = atom_property + self.bias_atom_e[type_i].to(self.prec)
+                atom_property = torch.where(mask, atom_property, 0.0)
+                outs = (
+                    outs + atom_property
+                )  # Shape is [nframes, natoms[0], net_dim_out]
+        # nf x nloc
+        mask = self.emask(atype).to(torch.bool)
+        # nf x nloc x nod
+        outs = torch.where(mask[:, :, None], outs, 0.0)
         results.update({self.var_name: outs})
         return results
 

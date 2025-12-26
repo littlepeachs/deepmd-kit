@@ -267,6 +267,8 @@ class EnergyStdLoss(TaskLoss):
             pref_f = pref_f * find_force
             force_pred = model_pred["force"]
             force_label = label["force"]
+            if force_pred.dim() == 2 and force_label.dim() == 3:
+                force_label = force_label.reshape(-1,3)
             diff_f = (force_label - force_pred).reshape(-1)
 
             if self.relative_f is not None:
@@ -353,6 +355,7 @@ class EnergyStdLoss(TaskLoss):
         if self.has_v and "virial" in model_pred and "virial" in label:
             find_virial = label.get("find_virial", 0.0)
             pref_v = pref_v * find_virial
+            
             diff_v = label["virial"] - model_pred["virial"].reshape(-1, 9)
             l2_virial_loss = torch.mean(torch.square(diff_v))
             if not self.inference:

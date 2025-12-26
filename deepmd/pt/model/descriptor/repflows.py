@@ -465,7 +465,6 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.e_rcut,
             self.e_rcut_smth,
             protection=self.env_protection,
-            use_exp_switch=self.use_exp_switch,
         )
         nlist_mask = nlist != -1
         sw = torch.squeeze(sw, -1)
@@ -487,7 +486,6 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.a_rcut,
             self.a_rcut_smth,
             protection=self.env_protection,
-            use_exp_switch=self.use_exp_switch,
         )
         a_nlist_mask = a_nlist != -1
         a_sw = torch.squeeze(a_sw, -1)

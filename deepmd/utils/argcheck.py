@@ -2391,6 +2391,23 @@ def standard_model_args() -> Argument:
     )
     return ca
 
+@model_args_plugin.register("dpa3_dynamic")
+def dpa3_dynamic_model_args() -> Argument:
+    ca = Argument(
+        "dpa3_dynamic",
+        dict,
+        [
+            Argument(
+                "descriptor", dict,
+            ),
+            Argument(
+                "fitting_net",
+                dict,
+            ),
+        ],
+        doc="DPA3 dynamic model.",
+    )
+    return ca
 
 @hybrid_model_args_plugin.register("pairwise_dprc")
 def pairwise_dprc() -> Argument:

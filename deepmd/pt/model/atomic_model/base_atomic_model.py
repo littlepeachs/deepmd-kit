@@ -105,6 +105,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         self.register_buffer("out_std", out_std_data)
 
     def set_out_bias(self, out_bias: torch.Tensor) -> None:
+        import pdb; pdb.set_trace()
         self.out_bias = out_bias
 
     def __setitem__(self, key: str, value: torch.Tensor) -> None:
@@ -592,6 +593,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         ntypes = self.get_ntypes()
         out_bias_data = torch.clone(self.out_bias)
         out_std_data = torch.clone(self.out_std)
+        
         for kk in out_bias.keys():
             assert kk in out_std.keys()
             idx = self._get_bias_index(kk)

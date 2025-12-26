@@ -199,6 +199,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 do_atomic_virial=do_atomic_virial,
             )
             model_predict = self.output_type_cast(model_predict, input_prec)
+            import pdb; pdb.set_trace()
             return model_predict
 
         def get_out_bias(self) -> torch.Tensor:
