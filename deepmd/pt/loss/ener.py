@@ -240,11 +240,11 @@ class EnergyStdLoss(TaskLoss):
             'stress':[], # in first stage， computing the force，
             'energy':[], # in first stage, computing the energy
             'dE_dinputs': [None,None,None,None], # tuple[dE_dfeas], FW1 output   FW1 send
-            'dL_doutputs': [], # BW0 recv
+            'dL_doutputs': [None,None,None,None], # BW0 recv
             'dL_dinputs': [], # BW0 send
             'dE_doutputs': [None,None,None,None], # FW1 recv 
-            'dL_dE_dinputs': [], # BW1 recv
-            'dL_dE_doutputs': [], # BW1 send
+            'dL_dE_dinputs': [None,None,None,None], # BW1 recv
+            'dL_dE_doutputs': [None,None,None,None], # BW1 send
             'loss_f': [],  # loss from batch input
             'loss_e': [],  # loss from batch input
             'loss_v': [],  # loss from batch input
@@ -269,7 +269,10 @@ class EnergyStdLoss(TaskLoss):
 
         """
         
-        mask = [(t is not None) and (t.requires_grad) for t in tensors]
+        mask = [
+            isinstance(t, torch.Tensor) and (t is not None) and t.requires_grad
+            for t in tensors
+        ]
         filtered = tuple(t for t, m in zip(tensors, mask) if m)
         return filtered, mask
 
@@ -299,6 +302,30 @@ class EnergyStdLoss(TaskLoss):
             """
             grad_iter = iter(grads)
             return tuple(next(grad_iter) if m else None for m in mask)
+
+    def _retain_grad_for_tensors(self, tensors: Optional[Tuple[Optional[torch.Tensor], ...]]) -> None:
+        """对需要继续反传的中间张量调用 retain_grad，保证后续 .grad 可用。"""
+        if tensors is None:
+            return
+        for t in tensors:
+            if t is None:
+                continue
+            if hasattr(t, "retain_grad") and t.requires_grad:
+                t.retain_grad()
+
+    def _clear_pipe_buffers(self, buffer_id, micro_batch_id):
+        """
+        Releases tensors for a specific micro-batch from the buffer and logs their memory usage before clearing.
+        """
+        # logging.info(f"Rank {distutils.get_rank()}, Before MB {micro_batch_id} Clear, Memory {torch.cuda.memory_allocated() / 1e9:.4f} GB")
+        
+        # 清除其他非 pipe_buffers 的缓存
+        self.input_chunks[micro_batch_id] = None
+        self.targets[micro_batch_id] = None
+        
+        # 原始的清除逻辑保持不变
+        for key in self.pipe_buffers:
+            self.pipe_buffers[key][micro_batch_id] = None
     
     
     def safe_autograd_grad(self,
@@ -336,7 +363,23 @@ class EnergyStdLoss(TaskLoss):
                 allow_unused=allow_unused
             )
             return self.restore_tensor_with_none(grads, mask)
-
+    
+    def detach_and_grad(self, inputs):
+        """
+        Detach tensors from the computation graph and enable gradients for the new leaf tensors.
+        Handles nested structures (dict, list, tuple).
+        """
+        if isinstance(inputs, torch.Tensor):
+            out = inputs.detach()
+            if out.is_floating_point():
+                out.requires_grad_(True)
+            return out
+        elif isinstance(inputs, dict):
+            return {k: self.detach_and_grad(v) for k, v in inputs.items()}
+        elif isinstance(inputs, (list, tuple)):
+            return type(inputs)(self.detach_and_grad(v) for v in inputs)
+        return inputs
+    
     def _forward_pass_0(self, model,buffer_id, micro_batch_id):
         if self.stage_id == 0:
             data = self.pipe_buffers['data'][buffer_id] 
@@ -421,7 +464,7 @@ class EnergyStdLoss(TaskLoss):
             
             self.pipe_buffers['outputs'].append(middle_output)
 
-            self.pipe_buffers['inputs'].append(middle_output)
+            self.pipe_buffers['inputs'].append(self.detach_and_grad(middle_output))
             
 
         elif self.stage_id != self.num_stages - 1:
@@ -440,7 +483,7 @@ class EnergyStdLoss(TaskLoss):
             
             # self.pipe_buffers['batched_graph'][buffer_id] = batch_graph
             self.pipe_buffers['outputs'].append(middle_output)
-            self.pipe_buffers['inputs'].append(middle_output)
+            self.pipe_buffers['inputs'].append(self.detach_and_grad(middle_output))
             
             # logging.info(f"outputs {outputs}")
 
@@ -535,8 +578,9 @@ class EnergyStdLoss(TaskLoss):
             grad_outputs = torch.ones_like(E)
             
             dE_dfeas = self.safe_autograd_grad(E, filtered_inputs, grad_outputs=grad_outputs, create_graph=True, retain_graph=True)
-            
-            self.pipe_buffers['dE_dinputs'][buffer_id] = self.restore_tensor_with_none(dE_dfeas, mask)
+            restored = self.restore_tensor_with_none(dE_dfeas, mask)
+            self._retain_grad_for_tensors(restored)
+            self.pipe_buffers['dE_dinputs'][buffer_id] = restored
             
             self.pipe_buffers['dE_doutputs'][buffer_id-1] = self.pipe_buffers['dE_dinputs'][buffer_id]
             
@@ -563,9 +607,10 @@ class EnergyStdLoss(TaskLoss):
             filtered_input_feas = self.filter_tensor_with_mask(input_tensors, mask) # x messsage
             
             dE_dfeas = self.safe_autograd_grad(outputs, filtered_input_feas, grad_outputs=filtered_dE_doutputs, create_graph=True, retain_graph=True)
-            
+            restored = self.restore_tensor_with_none(dE_dfeas, mask)
+            self._retain_grad_for_tensors(restored)
 
-            self.pipe_buffers['dE_dinputs'][buffer_id] = self.restore_tensor_with_none(dE_dfeas, mask)
+            self.pipe_buffers['dE_dinputs'][buffer_id] = restored
             self.pipe_buffers['dE_doutputs'][buffer_id-1] = self.pipe_buffers['dE_dinputs'][buffer_id]
             
 
@@ -614,17 +659,22 @@ class EnergyStdLoss(TaskLoss):
             
             self.pipe_buffers['loss_f'].append(loss_f)
             self.pipe_buffers['loss_v'].append(loss_v)
-            import pdb; pdb.set_trace()
+            
 
     # mask 记录了中间的有效的feature，方便进行梯度的传递。因为传递有的是图的信息，标量，不涉及导数
     # mask = [True, True, True, False, True, True, False]  
     def _backward_pass_1(self, buffer_id, micro_batch_id):
+        
         if self.stage_id == 0:
             loss_f = self.pipe_buffers['loss_f'][buffer_id]
-            torch.autograd.backward(loss_f / self.global_atom_num, retain_graph=True)
+            torch.autograd.backward(loss_f, retain_graph=True)
+            
             dE_doutputs = self.pipe_buffers['dE_doutputs'][buffer_id] #FW1 的 inputs，求一下梯度
             dL_dE_doutputs = tuple([t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in dE_doutputs]) # 有的dE_doutputs是none，none type没有梯度
             self.pipe_buffers['dL_dE_doutputs'][buffer_id] = dL_dE_doutputs
+            
+            if buffer_id + 1 < self.num_stages:
+                self.pipe_buffers['dL_dE_dinputs'][buffer_id + 1] = dL_dE_doutputs
             
             self.pipe_buffers['dE_doutputs'][buffer_id] = None
             self.pipe_buffers['dL_dE_dinputs'][buffer_id] = None
@@ -638,44 +688,105 @@ class EnergyStdLoss(TaskLoss):
 
             
             dE_doutputs = self.pipe_buffers['dE_doutputs'][buffer_id]
+            
+            dL_dE_doutputs = tuple(t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in dE_doutputs)
+            
+            if buffer_id + 1 < self.num_stages:
+                self.pipe_buffers['dL_dE_dinputs'][buffer_id + 1] = dL_dE_doutputs
+
+            # 清理
             self.pipe_buffers['dE_doutputs'][buffer_id] = None
             self.pipe_buffers['dL_dE_dinputs'][buffer_id] = None
             self.pipe_buffers['dE_dinputs'][buffer_id] = None
-            dL_dE_doutputs = tuple(t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in dE_doutputs)
-            self.pipe_buffers['dL_dE_doutputs'][buffer_id] = dL_dE_doutputs
+
+            
+            
             
         elif self.stage_id == self.num_stages - 1:
-            loss_e = self.pipe_buffers['loss_e'][buffer_id]
+            inputs = self.pipe_buffers['inputs'][buffer_id]
+            
+            # 处理 dict 或 tensor 输入
+            if isinstance(inputs, dict):
+                input_tensors = tuple(inputs.values())
+            else:
+                input_tensors = inputs
+            
+            self._retain_grad_for_tensors(input_tensors)
+
+            loss_e = self.pipe_buffers['loss_e'][0]
             dL_dE_dinputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dL_dE_dinputs'][buffer_id]) #  output grad
             dE_dinputs = self.filter_tensor_with_mask(self.pipe_buffers['dE_dinputs'][buffer_id], mask) # output
             torch.autograd.backward(dE_dinputs, grad_tensors=dL_dE_dinputs, retain_graph=True)
-            torch.autograd.backward(loss_e/self.global_energy_size, retain_graph=False)
+            torch.autograd.backward(loss_e, retain_graph=True)
             # print(f"BW1 loss_e{loss_e}, self.global_energy_size {self.global_energy_size},loss_e/self.global_energy_size {loss_e/self.global_energy_size}")
-            dL_dinputs = tuple(t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in self.pipe_buffers['inputs'][buffer_id])
-            self.pipe_buffers['dL_dinputs'][buffer_id] = dL_dinputs
+
+            
+            dL_dinputs = tuple([
+                t.grad.clone() if (t is not None and t.grad is not None) else None 
+                for t in input_tensors
+            ])
+            
+            if buffer_id - 1 >= 0:
+                self.pipe_buffers['dL_doutputs'][buffer_id - 1] = dL_dinputs
+            
+            # 清理
             
             self.pipe_buffers['inputs'][buffer_id] = None
             self.pipe_buffers['dE_doutputs'][buffer_id] = None
             self.pipe_buffers['dL_dE_dinputs'][buffer_id] = None
             self.pipe_buffers['dE_dinputs'][buffer_id] = None
-            
     
     def _backward_pass_0(self, buffer_id, micro_batch_id):
         
-        # assert self.stage_id != self.num_stages - 1
+        # Stage 3 (Last Stage)
         if self.stage_id == self.num_stages - 1:
-            # TODO 注意 there is the loss_e.backward() but now is in the BW1 (_backward_pass_1)
+            # Stage 3 的输入梯度已经在 _backward_pass_1 中计算并发送给 Stage 2 了
+            # 所以这里不需要做任何操作
             pass
+            
+        # Stage 0, 1, 2
         else:
-            dL_doutputs, mask = self.filter_tensors_with_grad(self.pipe_buffers['dL_doutputs'][buffer_id])
-            outputs = self.filter_tensor_with_mask(self.pipe_buffers['outputs'][buffer_id], mask) # output
-            torch.autograd.backward(outputs, grad_tensors=dL_doutputs, retain_graph=False)
-            if self.stage_id != 0:
-                dL_dinputs = tuple([t.grad.clone().detach() if (t is not None and t.grad is not None ) else None for t in self.pipe_buffers['inputs'][buffer_id]])
-                self.pipe_buffers['dL_dinputs'][buffer_id] = dL_dinputs
-            elif self.stage_id == 0:
-                self._clear_pipe_buffers(buffer_id, micro_batch_id)
+            # 1. 接收来自后一级 (Stage i+1) 的梯度
+            # 这里的 dL_doutputs 应该是由后一级写入的 (Stage 2 的由 Stage 3 BW1 写入)
 
+            # 2. 获取当前层的 Output Tensors (需要与梯度对应)
+            outputs_raw = self.pipe_buffers['outputs'][buffer_id]
+            if isinstance(outputs_raw, dict):
+                output_tensors = tuple(outputs_raw.values())
+            else:
+                output_tensors = outputs_raw
+            output_tensors, mask = self.filter_tensors_with_grad(output_tensors)
+
+            outputs = self.filter_tensor_with_mask(output_tensors, mask)
+            
+            dL_doutputs_raw = self.pipe_buffers['dL_doutputs'][buffer_id]
+            dL_doutputs = self.filter_tensor_with_mask(dL_doutputs_raw,mask)
+            
+
+            inputs_raw = self.pipe_buffers['inputs'][buffer_id]
+            if isinstance(inputs_raw, dict):
+                input_tensors = tuple(inputs_raw.values())
+            else:
+                input_tensors = inputs_raw
+            self._retain_grad_for_tensors(input_tensors)
+            input_tensors, mask = self.filter_tensors_with_grad(input_tensors)     
+            input_tensors= self.filter_tensor_with_mask(input_tensors, mask)  
+            # 3. 标准反向传播
+            # 计算当前层 Inputs 的梯度
+            torch.autograd.backward(outputs, grad_tensors=dL_doutputs, retain_graph=True)
+            
+            # 4. 将 Input 梯度传递给上一级 (Stage i-1)
+            # if self.stage_id != 0:
+
+            dL_dinputs = tuple([
+                t.grad.clone().detach() if (t is not None and t.grad is not None) else None 
+                for t in input_tensors
+            ])
+            
+            # 写入上一级的 dL_doutputs
+            if buffer_id - 1 >= 0:
+                self.pipe_buffers['dL_doutputs'][buffer_id - 1] = dL_dinputs
+                    
     def forward_pp(self,
                 input_dict: dict[str, torch.Tensor],
                 model: torch.nn.Module,
@@ -708,7 +819,24 @@ class EnergyStdLoss(TaskLoss):
         self._forward_pass_1(1,0)
         self.stage_id = 0
         self._forward_pass_1(0,0)
-        # 目前完成前向能力与受力计算，backward部分和模型无关
+        self._backward_pass_1(0,0)
+        self.stage_id = 1
+        
+        self._backward_pass_1(1,0)  
+        self.stage_id = 2
+        self._backward_pass_1(2,0)
+        self.stage_id = 3
+        self._backward_pass_1(3,0)
+        self._backward_pass_0(3,0)
+        self.stage_id = 2
+        self._backward_pass_0(2,0)
+        self.stage_id = 1
+        self._backward_pass_0(1,0)
+        self.stage_id = 0
+        self._backward_pass_0(0,0)
+        print("------- Parameters Grad --------")
+        print(model.atomic_model.descriptor.repflows.layers[1].node_edge_linear.matrix.grad)
+        import pdb; pdb.set_trace()
 
     def forward(
         self,
@@ -911,29 +1039,32 @@ class EnergyStdLoss(TaskLoss):
                     rmse_gf.detach(), find_drdq
                 )
         
-        if self.has_v and "virial" in model_pred and "virial" in label:
-            find_virial = label.get("find_virial", 0.0)
-            pref_v = pref_v * find_virial
-            diff_v = label["virial"] - model_pred["virial"].reshape(-1, 9)
-            l2_virial_loss = torch.mean(torch.square(diff_v))
-            if not self.inference:
-                more_loss["l2_virial_loss"] = self.display_if_exist(
-                    l2_virial_loss.detach(), find_virial
-                )
-            if not self.use_huber:
-                loss += atom_norm * (pref_v * l2_virial_loss)
-            else:
-                l_huber_loss = custom_huber_loss(
-                    atom_norm * model_pred["virial"].reshape(-1),
-                    atom_norm * label["virial"].reshape(-1),
-                    delta=self.huber_delta,
-                )
-                loss += pref_v * l_huber_loss
-            rmse_v = l2_virial_loss.sqrt() * atom_norm
-            more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
-            if mae:
-                mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
-                more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
+        # if self.has_v and "virial" in model_pred and "virial" in label:
+        #     find_virial = label.get("find_virial", 0.0)
+        #     pref_v = pref_v * find_virial
+        #     diff_v = label["virial"] - model_pred["virial"].reshape(-1, 9)
+        #     l2_virial_loss = torch.mean(torch.square(diff_v))
+        #     if not self.inference:
+        #         more_loss["l2_virial_loss"] = self.display_if_exist(
+        #             l2_virial_loss.detach(), find_virial
+        #         )
+        #     if not self.use_huber:
+        #         loss += atom_norm * (pref_v * l2_virial_loss)
+        #     else:
+        #         l_huber_loss = custom_huber_loss(
+        #             atom_norm * model_pred["virial"].reshape(-1),
+        #             atom_norm * label["virial"].reshape(-1),
+        #             delta=self.huber_delta,
+        #         )
+        #         loss += pref_v * l_huber_loss
+        #     rmse_v = l2_virial_loss.sqrt() * atom_norm
+        #     more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
+        #     if mae:
+        #         mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
+        #         more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
+        
+        loss.backward()
+        print(model.atomic_model.descriptor.repflows.layers[1].node_edge_linear.matrix.grad)
         import pdb; pdb.set_trace()
         if self.has_ae and "atom_energy" in model_pred and "atom_ener" in label:
             atom_ener = model_pred["atom_energy"]
