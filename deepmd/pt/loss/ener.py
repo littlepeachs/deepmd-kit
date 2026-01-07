@@ -248,10 +248,12 @@ class EnergyStdLoss(TaskLoss):
             'loss_f': [],  # loss from batch input
             'loss_e': [],  # loss from batch input
             'loss_v': [],  # loss from batch input
-            'loss_m': [],  # loss from batch input
+            'loss': [],  # loss from batch input
             'data':[],
             'batched_graph': [], 
             'targets': [],
+            'more_loss': {},
+            'model_pred': {},
         }
 
         self.global_atom_num = 0
@@ -313,20 +315,29 @@ class EnergyStdLoss(TaskLoss):
             if hasattr(t, "retain_grad") and t.requires_grad:
                 t.retain_grad()
 
-    def _clear_pipe_buffers(self, buffer_id, micro_batch_id):
-        """
-        Releases tensors for a specific micro-batch from the buffer and logs their memory usage before clearing.
-        """
-        # logging.info(f"Rank {distutils.get_rank()}, Before MB {micro_batch_id} Clear, Memory {torch.cuda.memory_allocated() / 1e9:.4f} GB")
-        
-        # 清除其他非 pipe_buffers 的缓存
-        self.input_chunks[micro_batch_id] = None
-        self.targets[micro_batch_id] = None
-        
-        # 原始的清除逻辑保持不变
-        for key in self.pipe_buffers:
-            self.pipe_buffers[key][micro_batch_id] = None
-    
+    def _clear_pipe_buffers(self):
+        self.pipe_buffers = {
+            'inputs': [],  # [feas, graph_bg_ag]
+            'outputs': [],  # [feas, graph_bg_ag] or preadiction : dict[str, Tensor]
+            'forces':[], # in first stage， computing the force，
+            'stress':[], # in first stage， computing the force，
+            'energy':[], # in first stage, computing the energy
+            'dE_dinputs': [None,None,None,None], # tuple[dE_dfeas], FW1 output   FW1 send
+            'dL_doutputs': [None,None,None,None], # BW0 recv
+            'dL_dinputs': [], # BW0 send
+            'dE_doutputs': [None,None,None,None], # FW1 recv 
+            'dL_dE_dinputs': [None,None,None,None], # BW1 recv
+            'dL_dE_doutputs': [None,None,None,None], # BW1 send
+            'loss_f': [],  # loss from batch input
+            'loss_e': [],  # loss from batch input
+            'loss_v': [],  # loss from batch input
+            'loss': [],  # loss from batch input
+            'data':[],
+            'batched_graph': [], 
+            'targets': [],
+            'more_loss': {},
+            'model_pred': {},
+        }
     
     def safe_autograd_grad(self,
             outputs: torch.Tensor,
@@ -550,12 +561,21 @@ class EnergyStdLoss(TaskLoss):
             self.pipe_buffers['energy'].append(E)
 
             target_energy = self.pipe_buffers['targets'][0]['energy']
-       
-            loss_e = torch.mean(torch.square(E - target_energy))
-            loss_e = self.pref_e * loss_e/ nloc
+
+            l2_ener_loss = torch.mean(torch.square(E - target_energy))
+            self.pipe_buffers['more_loss']['l2_ener_loss'] = l2_ener_loss
+            rmse_e = torch.sqrt(l2_ener_loss) / self.global_atom_num
+            self.pipe_buffers['more_loss']['rmse_e'] = rmse_e.detach()
+
+            loss_e = self.pref_e * l2_ener_loss / nloc
             
             # logging.info(f'loss_e {loss_e}')
             self.pipe_buffers['loss_e'].append(loss_e)
+
+            self.pipe_buffers['model_pred']['energy'] = ret_dict['energy_redu']
+            self.pipe_buffers['model_pred']['mask'] = ret_dict['mask']
+            self.pipe_buffers['model_pred']['atomic_energy'] = ret_dict['energy']
+
             
      
     def _forward_pass_1(self, buffer_id, micro_batch_id):
@@ -652,13 +672,27 @@ class EnergyStdLoss(TaskLoss):
             virial = ret_dict['energy_derv_c_redu']
             
             # TODO: 这里其实是f+s
-            loss = torch.mean(torch.square(force - self.pipe_buffers['targets'][buffer_id]['force']))
-            loss_f = self.pref_f * loss
-            loss = torch.mean(torch.square(virial - self.pipe_buffers['targets'][buffer_id]['virial']))
-            loss_v = self.pref_v * loss / self.global_atom_num
+            l2_force_loss = torch.mean(torch.square(force - self.pipe_buffers['targets'][buffer_id]['force']))
+            loss_f = self.pref_f * l2_force_loss
+            l2_virial_loss = torch.mean(torch.square(virial - self.pipe_buffers['targets'][buffer_id]['virial']))
+            loss_v = self.pref_v * l2_virial_loss / self.global_atom_num
             
+            self.pipe_buffers['more_loss']['l2_force_loss'] = l2_force_loss
+            rmse_f = torch.sqrt(l2_force_loss)
+            self.pipe_buffers['more_loss']['rmse_f'] = rmse_f.detach()
+            self.pipe_buffers['more_loss']['l2_virial_loss'] = l2_virial_loss
+            rmse_v = torch.sqrt(l2_virial_loss) / self.global_atom_num
+            self.pipe_buffers['more_loss']['rmse_v'] = rmse_v.detach()
+
             self.pipe_buffers['loss_f'].append(loss_f)
             self.pipe_buffers['loss_v'].append(loss_v)
+            loss = loss_f+loss_v+self.pipe_buffers['loss_e'][buffer_id]
+            rmse = torch.sqrt(loss.detach())
+            self.pipe_buffers['more_loss']['rmse'] = rmse
+            self.pipe_buffers['loss'].append(loss)
+
+            self.pipe_buffers['model_pred']['force'] = ret_dict['energy_derv_r']
+            self.pipe_buffers['model_pred']['virial'] = ret_dict['energy_derv_c_redu']
             
 
     # mask 记录了中间的有效的feature，方便进行梯度的传递。因为传递有的是图的信息，标量，不涉及导数
@@ -834,9 +868,11 @@ class EnergyStdLoss(TaskLoss):
         self._backward_pass_0(1,0)
         self.stage_id = 0
         self._backward_pass_0(0,0)
-        print("------- Parameters Grad --------")
-        print(model.atomic_model.descriptor.repflows.layers[1].node_edge_linear.matrix.grad)
-        import pdb; pdb.set_trace()
+        model_pred = self.pipe_buffers['model_pred']
+        loss = self.pipe_buffers['loss'][0]
+        more_loss = self.pipe_buffers['more_loss']
+        self._clear_pipe_buffers()
+        return model_pred, loss, more_loss
 
     def forward(
         self,
@@ -1039,33 +1075,33 @@ class EnergyStdLoss(TaskLoss):
                     rmse_gf.detach(), find_drdq
                 )
         
-        # if self.has_v and "virial" in model_pred and "virial" in label:
-        #     find_virial = label.get("find_virial", 0.0)
-        #     pref_v = pref_v * find_virial
-        #     diff_v = label["virial"] - model_pred["virial"].reshape(-1, 9)
-        #     l2_virial_loss = torch.mean(torch.square(diff_v))
-        #     if not self.inference:
-        #         more_loss["l2_virial_loss"] = self.display_if_exist(
-        #             l2_virial_loss.detach(), find_virial
-        #         )
-        #     if not self.use_huber:
-        #         loss += atom_norm * (pref_v * l2_virial_loss)
-        #     else:
-        #         l_huber_loss = custom_huber_loss(
-        #             atom_norm * model_pred["virial"].reshape(-1),
-        #             atom_norm * label["virial"].reshape(-1),
-        #             delta=self.huber_delta,
-        #         )
-        #         loss += pref_v * l_huber_loss
-        #     rmse_v = l2_virial_loss.sqrt() * atom_norm
-        #     more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
-        #     if mae:
-        #         mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
-        #         more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
+        if self.has_v and "virial" in model_pred and "virial" in label:
+            find_virial = label.get("find_virial", 0.0)
+            pref_v = pref_v * find_virial
+            diff_v = label["virial"] - model_pred["virial"].reshape(-1, 9)
+            l2_virial_loss = torch.mean(torch.square(diff_v))
+            if not self.inference:
+                more_loss["l2_virial_loss"] = self.display_if_exist(
+                    l2_virial_loss.detach(), find_virial
+                )
+            if not self.use_huber:
+                loss += atom_norm * (pref_v * l2_virial_loss)
+            else:
+                l_huber_loss = custom_huber_loss(
+                    atom_norm * model_pred["virial"].reshape(-1),
+                    atom_norm * label["virial"].reshape(-1),
+                    delta=self.huber_delta,
+                )
+                loss += pref_v * l_huber_loss
+            rmse_v = l2_virial_loss.sqrt() * atom_norm
+            more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
+            if mae:
+                mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
+                more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
         
-        loss.backward()
-        print(model.atomic_model.descriptor.repflows.layers[1].node_edge_linear.matrix.grad)
-        import pdb; pdb.set_trace()
+        # loss.backward()
+        # print(model.atomic_model.descriptor.repflows.layers[1].node_edge_linear.matrix.grad)
+        # import pdb; pdb.set_trace()
         if self.has_ae and "atom_energy" in model_pred and "atom_ener" in label:
             atom_ener = model_pred["atom_energy"]
             atom_ener_label = label["atom_ener"]

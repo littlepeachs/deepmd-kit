@@ -777,7 +777,8 @@ class Trainer:
                 model_pred, loss, more_loss = self.wrapper(
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                 )
-                loss.backward()
+                # if PP is used, loss is backward() in loss/ener.py
+                # loss.backward()
                 if self.gradient_max_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(
                         self.wrapper.parameters(),
