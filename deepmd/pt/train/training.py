@@ -3,7 +3,6 @@ import functools
 import logging
 import time
 from collections.abc import (
-    Callable,
     Generator,
     Iterable,
 )
@@ -15,6 +14,8 @@ from pathlib import (
 )
 from typing import (
     Any,
+    Callable,
+    Optional,
 )
 
 import numpy as np
@@ -96,15 +97,15 @@ class Trainer:
         self,
         config: dict[str, Any],
         training_data: DpLoaderSet,
-        stat_file_path: str | None = None,
-        validation_data: DpLoaderSet | None = None,
-        init_model: str | None = None,
-        restart_model: str | None = None,
-        finetune_model: str | None = None,
+        stat_file_path: Optional[str] = None,
+        validation_data: Optional[DpLoaderSet] = None,
+        init_model: Optional[str] = None,
+        restart_model: Optional[str] = None,
+        finetune_model: Optional[str] = None,
         force_load: bool = False,
-        shared_links: dict[str, str] | None = None,
-        finetune_links: dict[str, str] | None = None,
-        init_frz_model: str | None = None,
+        shared_links: Optional[dict[str, str]] = None,
+        finetune_links: Optional[dict[str, str]] = None,
+        init_frz_model: Optional[str] = None,
     ) -> None:
         """Construct a DeePMD trainer.
 
@@ -184,13 +185,13 @@ class Trainer:
 
         def get_data_loader(
             _training_data: DpLoaderSet,
-            _validation_data: DpLoaderSet | None,
+            _validation_data: Optional[DpLoaderSet],
             _training_params: dict[str, Any],
         ) -> tuple[
             DataLoader,
             Generator[Any, None, None],
-            DataLoader | None,
-            Generator[Any, None, None] | None,
+            Optional[DataLoader],
+            Optional[Generator[Any, None, None]],
             int,
         ]:
             def get_dataloader_and_iter(
@@ -245,8 +246,8 @@ class Trainer:
             _model: Any,
             _data_stat_nbatch: int,
             _training_data: DpLoaderSet,
-            _validation_data: DpLoaderSet | None,
-            _stat_file_path: str | None,
+            _validation_data: Optional[DpLoaderSet],
+            _stat_file_path: Optional[str],
             _data_requirement: list[DataRequirementItem],
             finetune_has_new_type: bool = False,
         ) -> Callable[[], Any]:
@@ -613,13 +614,7 @@ class Trainer:
 
         if init_frz_model is not None:
             frz_model = torch.jit.load(init_frz_model, map_location=DEVICE)
-            state = frz_model.state_dict()
-            missing, unexpected = self.model.load_state_dict(state, strict=False)
-            if missing or unexpected:
-                log.warning(
-                    "Checkpoint loaded non-strictly. "
-                    f"Missing keys: {missing}, Unexpected keys: {unexpected}"
-                )
+            self.model.load_state_dict(frz_model.state_dict())
 
         # Get model prob for multi-task
         if self.multi_task:
@@ -761,22 +756,58 @@ class Trainer:
             cur_lr = _lr.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
-            input_dict, label_dict, log_dict = self.get_data(
-                is_train=True, task_key=task_key
-            )
-            if SAMPLER_RECORD:
-                print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
-                fout1.write(print_str)
-                fout1.flush()
+            # input_dict, label_dict, log_dict = self.get_data(
+            #     is_train=True, task_key=task_key
+            # )
+            
             if self.opt_type in ["Adam", "AdamW"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
+                
+                # 从这里开始实现pp
+                coef = cur_lr / self.wrapper.loss[task_key].starter_learning_rate
+                self.wrapper.loss[task_key].pref_e = self.wrapper.loss[task_key].limit_pref_e + (self.wrapper.loss[task_key].start_pref_e - self.wrapper.loss[task_key].limit_pref_e) * coef
+                self.wrapper.loss[task_key].pref_f = self.wrapper.loss[task_key].limit_pref_f + (self.wrapper.loss[task_key].start_pref_f - self.wrapper.loss[task_key].limit_pref_f) * coef
+                self.wrapper.loss[task_key].pref_v = self.wrapper.loss[task_key].limit_pref_v + (self.wrapper.loss[task_key].start_pref_v - self.wrapper.loss[task_key].limit_pref_v) * coef
+                
+                model = self.wrapper.model[task_key]
+
+                self.wrapper.loss[task_key].stage_id = 0
+                for i in range(4):
+                    if i == 0:
+                        input_dict, label_dict, log_dict = self.get_data(
+                            is_train=True, task_key=task_key
+                        )
+                        self.wrapper.loss[task_key].pipe_buffers['data'].append(input_dict)
+                        self.wrapper.loss[task_key].pipe_buffers['targets'].append(label_dict)
+                        self.wrapper.loss[task_key].global_atom_num = input_dict['atype'].shape[1]
+                    self.wrapper.loss[task_key].stage_id = i
+                    self.wrapper.loss[task_key]._forward_pass_0(model, self.wrapper.loss[task_key].stage_id, 0)
+                    
+                for i in range(4)[::-1]:
+                    self.wrapper.loss[task_key].stage_id = i
+                    self.wrapper.loss[task_key]._forward_pass_1(i,0)
+
+                for i in range(4):
+                    self.wrapper.loss[task_key].stage_id = i
+                    self.wrapper.loss[task_key]._backward_pass_1(i,0)
+                
+                for i in range(4)[::-1]:
+                    self.wrapper.loss[task_key].stage_id = i
+                    self.wrapper.loss[task_key]._backward_pass_0(i,0)
+
+                model_pred = self.wrapper.loss[task_key].pipe_buffers['model_pred']
+                loss = self.wrapper.loss[task_key].pipe_buffers['loss'][0]
+                more_loss = self.wrapper.loss[task_key].pipe_buffers['more_loss']
+                self.wrapper.loss[task_key]._clear_pipe_buffers()
+                
+                # model_pred, loss, more_loss = forward_pp(
+                #     input_dict, model=self.wrapper.model[task_key], label=label_dict, learning_rate=cur_lr,task_key=task_key
+                # )
+                
                 # if PP is used, loss is backward() in loss/ener.py
                 # loss.backward()
                 if self.gradient_max_norm > 0.0:
@@ -947,12 +978,48 @@ class Trainer:
                         if input_dict == {}:
                             # no validation data
                             return {}
-                        _, loss, more_loss = self.wrapper(
-                            **input_dict,
-                            cur_lr=pref_lr,
-                            label=label_dict,
-                            task_key=_task_key,
-                        )
+                        
+                        # 从这里开始实现pp
+                        coef = cur_lr / self.wrapper.loss[task_key].starter_learning_rate
+                        self.wrapper.loss[task_key].pref_e = self.wrapper.loss[task_key].limit_pref_e + (self.wrapper.loss[task_key].start_pref_e - self.wrapper.loss[task_key].limit_pref_e) * coef
+                        self.wrapper.loss[task_key].pref_f = self.wrapper.loss[task_key].limit_pref_f + (self.wrapper.loss[task_key].start_pref_f - self.wrapper.loss[task_key].limit_pref_f) * coef
+                        self.wrapper.loss[task_key].pref_v = self.wrapper.loss[task_key].limit_pref_v + (self.wrapper.loss[task_key].start_pref_v - self.wrapper.loss[task_key].limit_pref_v) * coef
+                        
+                        model = self.wrapper.model[task_key]
+
+                        self.wrapper.loss[task_key].stage_id = 0
+                        for i in range(4):
+                            if i == 0:
+                                input_dict, label_dict, log_dict = self.get_data(
+                                    is_train=True, task_key=task_key
+                                )
+                                self.wrapper.loss[task_key].pipe_buffers['data'].append(input_dict)
+                                self.wrapper.loss[task_key].pipe_buffers['targets'].append(label_dict)
+                                self.wrapper.loss[task_key].global_atom_num = input_dict['atype'].shape[1]
+                            self.wrapper.loss[task_key].stage_id = i
+                            self.wrapper.loss[task_key]._forward_pass_0(model, self.wrapper.loss[task_key].stage_id, 0)
+                            
+                        for i in range(4)[::-1]:
+                            self.wrapper.loss[task_key].stage_id = i
+                            self.wrapper.loss[task_key]._forward_pass_1(i,0)
+
+                        for i in range(4):
+                            self.wrapper.loss[task_key].stage_id = i
+                            self.wrapper.loss[task_key]._backward_pass_1(i,0)
+                        
+                        for i in range(4)[::-1]:
+                            self.wrapper.loss[task_key].stage_id = i
+                            self.wrapper.loss[task_key]._backward_pass_0(i,0)
+
+                        model_pred = self.wrapper.loss[task_key].pipe_buffers['model_pred']
+                        loss = self.wrapper.loss[task_key].pipe_buffers['loss'][0]
+                        more_loss = self.wrapper.loss[task_key].pipe_buffers['more_loss']
+                        self.wrapper.loss[task_key]._clear_pipe_buffers()
+                        
+                        # _, loss, more_loss = forward_pp(
+                        #     input_dict, model=self.wrapper.model[task_key], label=label_dict, learning_rate=cur_lr,task_key=task_key
+                        # )
+                        
                         # more_loss.update({"rmse": math.sqrt(loss)})
                         natoms = int(input_dict["atype"].shape[-1])
                         sum_natoms += natoms
@@ -1449,7 +1516,7 @@ def get_single_model(
 def get_model_for_wrapper(
     _model_params: dict[str, Any],
     resuming: bool = False,
-    _loss_params: dict[str, Any] | None = None,
+    _loss_params: Optional[dict[str, Any]] = None,
 ) -> Any:
     if "model_dict" not in _model_params:
         if _loss_params is not None and whether_hessian(_loss_params):
