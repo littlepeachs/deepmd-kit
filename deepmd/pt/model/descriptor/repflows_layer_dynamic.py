@@ -666,7 +666,7 @@ class RepFlowLayerDynamic(torch.nn.Module):
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         edge_index: torch.Tensor,  # n_edge x 2
         angle_index: torch.Tensor,  # n_angle x 3
-        batch: torch.Tensor,
+        batch: torch.Tensor = None,
         rbf_ebd: Optional[torch.Tensor] = None,  # n_edge x num_b
         
     ):

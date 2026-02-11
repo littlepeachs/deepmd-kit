@@ -52,6 +52,12 @@ from .repflow_layer import (
     RepFlowLayer,
 )
 
+from .repflows_layer_dynamic import (
+    RepFlowLayerDynamic,
+)
+
+import graph_parallel
+
 if not hasattr(torch.ops.deepmd, "border_op"):
 
     def border_op(
@@ -304,7 +310,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         layers = []
         for ii in range(nlayers):
             layers.append(
-                RepFlowLayer(
+                RepFlowLayerDynamic(
                     e_rcut=self.e_rcut,
                     e_rcut_smth=self.e_rcut_smth,
                     e_sel=self.sel,
@@ -318,21 +324,48 @@ class DescrptBlockRepflows(DescriptorBlock):
                     a_compress_rate=self.a_compress_rate,
                     a_compress_use_split=self.a_compress_use_split,
                     a_compress_e_rate=self.a_compress_e_rate,
-                    n_multi_edge_message=self.n_multi_edge_message,
                     axis_neuron=self.axis_neuron,
                     update_angle=self.update_angle,
-                    activation_function=self.activation_function,
-                    update_style=self.update_style,
-                    update_residual=self.update_residual,
-                    update_residual_init=self.update_residual_init,
-                    precision=precision,
                     optim_update=self.optim_update,
                     use_dynamic_sel=self.use_dynamic_sel,
                     sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
+                    activation_function=self.activation_function,
+                    update_style=self.update_style,
+                    update_residual=self.update_residual,
+                    update_residual_init=self.update_residual_init,
+                    precision="float32",
                     seed=child_seed(child_seed(seed, 1), ii),
-                    trainable=trainable,
                 )
+                # RepFlowLayer(
+                #     e_rcut=self.e_rcut,
+                #     e_rcut_smth=self.e_rcut_smth,
+                #     e_sel=self.sel,
+                #     a_rcut=self.a_rcut,
+                #     a_rcut_smth=self.a_rcut_smth,
+                #     a_sel=self.a_sel,
+                #     ntypes=self.ntypes,
+                #     n_dim=self.n_dim,
+                #     e_dim=self.e_dim,
+                #     a_dim=self.a_dim,
+                #     a_compress_rate=self.a_compress_rate,
+                #     a_compress_use_split=self.a_compress_use_split,
+                #     a_compress_e_rate=self.a_compress_e_rate,
+                #     n_multi_edge_message=self.n_multi_edge_message,
+                #     axis_neuron=self.axis_neuron,
+                #     update_angle=self.update_angle,
+                #     activation_function=self.activation_function,
+                #     update_style=self.update_style,
+                #     update_residual=self.update_residual,
+                #     update_residual_init=self.update_residual_init,
+                #     precision=precision,
+                #     optim_update=self.optim_update,
+                #     use_dynamic_sel=self.use_dynamic_sel,
+                #     sel_reduce_factor=self.sel_reduce_factor,
+                #     smooth_edge_update=self.smooth_edge_update,
+                #     seed=child_seed(child_seed(seed, 1), ii),
+                #     trainable=trainable,
+                # )
             )
         self.layers = torch.nn.ModuleList(layers)
 
@@ -431,6 +464,89 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.exclude_types = exclude_types
         self.emask = PairExcludeMask(self.ntypes, exclude_types=exclude_types)
 
+    def simulate_gp_layer_forward(
+        self,
+        ll,
+        node_ebd, edge_ebd, angle_ebd,
+        edge_index, angle_index,
+        h2, sw, a_sw,
+        gp_world_size=4,
+    ):
+        device = node_ebd.device
+        num_nodes = node_ebd.shape[0]
+
+        sizes = graph_parallel._balanced_partition_sizes(num_nodes, gp_world_size)
+        offsets = graph_parallel._build_partition_offsets(sizes, device=device)
+
+        # baseline: full
+        node_full_out, edge_full_out, angle_full_out = ll.forward(
+            node_ebd, edge_ebd, h2, angle_ebd,
+            sw.unsqueeze(-1), a_sw.unsqueeze(-1),
+            edge_index=edge_index,
+            angle_index=angle_index,
+        )
+
+        # gp-simulated
+        node_parts = []
+        edge_parts = []
+        angle_parts = []
+        for gp_rank in range(gp_world_size):
+            start = int(offsets[gp_rank].item())
+            end = start + sizes[gp_rank]
+
+            # edges whose source is in [start, end)
+            gp_edge_mask = (edge_index[0] >= start) & (edge_index[0] < end)
+            gp_edge_index = edge_index[:, gp_edge_mask]
+
+            # angles whose center/source is in [start, end)
+            gp_angle_mask = (angle_index[0] >= start) & (angle_index[0] < end)
+            gp_angle_index = angle_index[:, gp_angle_mask].clone()
+
+            # remap global edge ids -> local edge ids for angle_index rows 1,2
+            num_total_edges = edge_index.shape[1]
+            edge_remap = torch.full((num_total_edges,), -1, device=device, dtype=torch.long)
+            edge_remap[gp_edge_mask] = torch.arange(
+                gp_edge_index.shape[1], device=device, dtype=torch.long
+            )
+            gp_angle_index[1] = edge_remap[gp_angle_index[1]]
+            gp_angle_index[2] = edge_remap[gp_angle_index[2]]
+
+            # slice edge/angle features + attrs if they are global-sized
+            curr_edge_ebd = edge_ebd
+            if edge_ebd is not None and edge_ebd.shape[0] == edge_index.shape[1]:
+                curr_edge_ebd = edge_ebd[gp_edge_mask]
+
+            curr_angle_ebd = angle_ebd
+            if angle_ebd is not None and angle_ebd.shape[0] == angle_index.shape[1]:
+                curr_angle_ebd = angle_ebd[gp_angle_mask]
+
+            gp_h2 = h2[gp_edge_mask]
+            gp_sw = sw.unsqueeze(-1)[gp_edge_mask]
+            gp_a_sw = a_sw.unsqueeze(-1)[gp_angle_mask]
+
+            # IMPORTANT: pass full node_ebd, but only local edges/angles
+            node_out_rank, edge_out_rank, angle_out_rank = ll.forward(
+                node_ebd,
+                curr_edge_ebd,
+                gp_h2,
+                curr_angle_ebd,
+                gp_sw,
+                gp_a_sw,
+                edge_index=gp_edge_index,
+                angle_index=gp_angle_index,
+            )
+
+            # take only nodes this rank is responsible for
+            node_parts.append(node_out_rank[start:end])
+            edge_parts.append(edge_out_rank)
+            angle_parts.append(angle_out_rank)
+
+        node_gp_out = torch.cat(node_parts, dim=0)
+        edge_gp_out = torch.cat(edge_parts, dim=0)
+        angle_gp_out = torch.cat(angle_parts, dim=0)
+        return node_full_out, node_gp_out, edge_full_out, edge_gp_out, angle_full_out, angle_gp_out
+
+
     def forward(
         self,
         nlist: torch.Tensor,
@@ -502,7 +618,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         atype_embd = extended_atype_embd[:, :nloc, :]
         assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
         assert isinstance(atype_embd, torch.Tensor)  # for jit
-        node_ebd = self.act(atype_embd)
+        node_ebd = self.act(atype_embd).reshape(-1,self.n_dim)
         n_dim = node_ebd.shape[-1]
 
         # get edge and angle embedding input
@@ -533,13 +649,15 @@ class DescrptBlockRepflows(DescriptorBlock):
             ).reshape(nlist.shape)
         if self.use_dynamic_sel:
             # get graph index
-            edge_index, angle_index = get_graph_index(
+            
+            node_index,edge_index, angle_index = get_graph_index(
                 nlist,
                 nlist_mask,
                 a_nlist_mask,
                 nall,
                 use_loc_mapping=self.use_loc_mapping,
             )
+            
             # flat all the tensors
             # n_edge x 1
             edge_input = edge_input[nlist_mask]
@@ -565,13 +683,57 @@ class DescrptBlockRepflows(DescriptorBlock):
             edge_ebd = self.edge_embd(edge_input)
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
-
+        
         # nb x nall x n_dim
         if not parallel_mode:
             assert mapping is not None
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
+
+        # Graph Parallel Setup
+        # gp_enabled = graph_parallel.graph_parallel_enabled()
+        gp_enabled = True
+        is_debug = True
+
+        if gp_enabled and self.use_dynamic_sel and not is_debug:
+            gp_rank = graph_parallel.distutils.get_gp_rank()
+            gp_world_size = graph_parallel.distutils.get_gp_world_size()
+            # gp_rank = 1
+            # gp_world_size = 4
+
+            gp_num_nodes = node_ebd.shape[0]
+            gp_sizes = graph_parallel._balanced_partition_sizes(gp_num_nodes, gp_world_size)
+            gp_offsets = graph_parallel._build_partition_offsets(gp_sizes, node_ebd.device)
+            gp_local_start = gp_offsets[gp_rank].item()
+            
+            gp_local_end = gp_local_start + gp_sizes[gp_rank]
+            
+            # Slice indices based on source/center node
+            gp_edge_mask = (edge_index[0] >= gp_local_start) & (edge_index[0] < gp_local_end)
+            gp_edge_index = edge_index[:, gp_edge_mask]
+            
+            gp_angle_mask = (angle_index[0] >= gp_local_start) & (angle_index[0] < gp_local_end)
+            gp_angle_index = angle_index[:, gp_angle_mask].clone()
+            
+            # 建立由全局边索引到局部边索引的映射表 (Index Remapping)
+            # 在图并行模式下，edge_ebd 会被切分，每个 rank 只持有一部分边。
+            # 而 angle_index 中原本存储的是全局的边索引。
+            # 如果不进行重映射，在 repflows_layer_dynamic 中通过 angle_index 去访问
+            # 切分后的 curr_edge_ebd 时，会因为索引越界或指向错误的边而导致计算错误。
+            num_total_edges = edge_index.shape[1]
+            edge_remap = torch.full((num_total_edges,), -1, device=edge_index.device, dtype=torch.long)
+            
+            # 将属于当前 rank 的边（gp_edge_mask 为 True）从全局索引映射到
+            # 新的局部连续索引 (0, 1, 2, ...)，对应它们在 curr_edge_ebd 中的位置。
+            edge_remap[gp_edge_mask] = torch.arange(gp_edge_index.shape[1], device=edge_index.device, dtype=torch.long)
+            
+            # 更新 angle_index 中的边索引（第1行和第2行分别对应边 ij 和 ik），
+            # 使其指向局部 edge_ebd 的正确位置。
+            gp_angle_index[1] = edge_remap[gp_angle_index[1]]
+            gp_angle_index[2] = edge_remap[gp_angle_index[2]]
+
+
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parallel_mode
@@ -640,20 +802,78 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            node_ebd, edge_ebd, angle_ebd = ll.forward(
-                node_ebd_ext,
-                edge_ebd,
-                h2,
-                angle_ebd,
-                nlist,
-                nlist_mask,
-                sw,
-                a_nlist,
-                a_nlist_mask,
-                a_sw,
-                edge_index=edge_index,
-                angle_index=angle_index,
-            )
+
+            # dynamic batch
+            if gp_enabled and self.use_dynamic_sel:
+                if not is_debug:
+                    # 1. 切分输入数据：只保留当前 rank 负责的边和角
+                    # edge_ebd 可能在第一层是全量的，后续层是切分过的，需根据情况处理
+                    curr_edge_ebd = edge_ebd
+                    if edge_ebd is not None and edge_ebd.shape[0] == edge_index.shape[1]:
+                        curr_edge_ebd = edge_ebd[gp_edge_mask]
+
+                    curr_angle_ebd = angle_ebd
+                    if angle_ebd is not None and angle_ebd.shape[0] == angle_index.shape[1]:
+                        curr_angle_ebd = angle_ebd[gp_angle_mask]
+
+                    # h2, sw, a_sw 是边/角的属性，同样根据 mask 切分到局部
+                    gp_h2 = h2[gp_edge_mask]
+                    gp_sw = sw.unsqueeze(-1)[gp_edge_mask]
+                    gp_a_sw = a_sw.unsqueeze(-1)[gp_angle_mask]
+
+                    # 2. 执行局部 forward 计算
+                    # 注意：node_ebd 传入全量数据，因为它作为 Source 节点提供邻居特征。
+                    # 输出的 node_ebd_out 虽然形状与输入相同，但只有 [gp_local_start:gp_local_end] 
+                    # 范围内的节点聚合了有效的局部边信息。
+                    node_ebd_out, ret_edge_ebd, ret_angle_ebd = ll.forward(
+                        node_ebd,
+                        curr_edge_ebd,
+                        gp_h2,
+                        curr_angle_ebd,
+                        gp_sw,
+                        gp_a_sw,
+                        edge_index=gp_edge_index,
+                        angle_index=gp_angle_index,
+                    )
+                    
+                    # 3. 提取结果并同步
+                    # 提取当前 rank 负责更新的有效节点特征
+                    
+                    node_ebd_local = node_ebd_out[gp_local_start:gp_local_end]
+                    
+                    # All-Gather 恢复完整的 node_ebd，供下一网络层作为输入使用
+                    node_ebd = graph_parallel.gather_node_tensor(node_ebd_local)
+                    
+                    # 边和角的特征不需要 Gather，保持切分状态以节省显存，
+                    # 下一层循环逻辑能处理这种切分状态
+                    edge_ebd = ret_edge_ebd
+                    angle_ebd = ret_angle_ebd
+                else:
+                    node_full_out, node_gp_out, edge_full_out, edge_gp_out, angle_full_out, angle_gp_out = self.simulate_gp_layer_forward(
+                        ll,
+                        node_ebd, edge_ebd, angle_ebd,
+                        edge_index, angle_index,
+                        h2, sw, a_sw,
+                    )
+                    assert torch.allclose(node_full_out, node_gp_out, atol=1e-5)
+                    assert torch.allclose(edge_full_out, edge_gp_out, atol=1e-5)
+                    assert torch.allclose(angle_full_out, angle_gp_out, atol=1e-5)
+                    import pdb; pdb.set_trace()
+
+            else:
+                node_ebd, edge_ebd, angle_ebd= ll.forward(
+                    node_ebd,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    sw.unsqueeze(-1),
+                    a_sw.unsqueeze(-1),
+                    edge_index=edge_index,
+                    angle_index=angle_index,
+                )
+                
+
+            
 
         # nb x nloc x 3 x e_dim
         h2g2 = (

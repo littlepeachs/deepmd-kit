@@ -477,11 +477,12 @@ class DescrptBlockRepflowsDynamic(DescriptorBlock):
         edge_ebd = self.act(self.edge_embd(edge_input))
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
-
+        import pdb; pdb.set_trace()
+        
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
-            
+            import pdb; pdb.set_trace()
             node_ebd, edge_ebd, angle_ebd= ll.forward(
                 atype_embedding,
                 edge_ebd,

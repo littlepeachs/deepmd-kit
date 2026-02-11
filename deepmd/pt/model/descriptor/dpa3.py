@@ -115,7 +115,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         exclude_types: list[tuple[int, int]] = [],
         env_protection: float = 0.0,
         trainable: bool = True,
-        seed: int | list[int] | None = None,
+        seed: int | list[int] | None = 0,
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
         use_loc_mapping: bool = True,

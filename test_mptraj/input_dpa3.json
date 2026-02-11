@@ -124,10 +124,10 @@
      "descriptor": {
       "type": "dpa3",
       "repflow": {
-       "n_dim": 256,
-       "e_dim": 128,
+       "n_dim": 128,
+       "e_dim": 64,
        "a_dim": 32,
-       "nlayers": 6,
+       "nlayers": 12,
        "e_rcut": 6.0,
        "e_rcut_smth": 5.3,
        "e_sel": 1200,
@@ -144,6 +144,7 @@
        "use_dynamic_sel": true,
        "sel_reduce_factor": 10.0,
        "use_env_envelope": true,
+       "edge_use_dist": true,
        "update_style": "res_residual",
        "update_residual": 0.1,
        "update_residual_init": "const"

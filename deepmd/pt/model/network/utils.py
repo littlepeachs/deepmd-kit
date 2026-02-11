@@ -54,7 +54,7 @@ def get_graph_index(
     a_nlist_mask: torch.Tensor,
     nall: int,
     use_loc_mapping: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Get the index mapping for edge graph and angle graph, ready in `aggregate` or `index_select`.
 
@@ -134,5 +134,7 @@ def get_graph_index(
 
     edge_index_result = torch.stack([n2e_index, n_ext2e_index], dim=0)
     angle_index_result = torch.stack([n2a_index, eij2a_index, eik2a_index], dim=0)
-
-    return edge_index_result, angle_index_result
+    
+    batch_size, num_nodes = nlist.shape[:2]
+    node_index_result = torch.arange(batch_size, device=nlist.device).repeat_interleave(num_nodes)
+    return node_index_result, edge_index_result, angle_index_result

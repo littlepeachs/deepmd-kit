@@ -148,7 +148,56 @@ def take_deriv(
         avir = None
     return ff, avir
 
+# def fit_output_to_model_output(
+#     fit_ret: dict[str, torch.Tensor],
+#     fit_output_def: FittingOutputDef,
+#     coord_ext: torch.Tensor,
+#     do_atomic_virial: bool = False,
+#     create_graph: bool = True,
+#     mask: torch.Tensor | None = None,
+# ) -> dict[str, torch.Tensor]:
+#     """Transform the output of the fitting network to
+#     the model output.
 
+#     """
+#     redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
+#     model_ret = dict(fit_ret.items())
+#     for kk, vv in fit_ret.items():
+#         vdef = fit_output_def[kk]
+#         shap = vdef.shape
+#         atom_axis = -(len(shap) + 1)
+#         if vdef.reducible:
+#             kk_redu = get_reduce_name(kk)
+#             if vdef.intensive:
+#                 if mask is not None:
+#                     model_ret[kk_redu] = torch.sum(
+#                         vv.to(redu_prec), dim=atom_axis
+#                     ) / torch.sum(mask, dim=-1, keepdim=True)
+#                 else:
+#                     model_ret[kk_redu] = torch.mean(vv.to(redu_prec), dim=atom_axis)
+#             else:
+#                 model_ret[kk_redu] = torch.sum(vv.to(redu_prec), dim=atom_axis)
+#             if vdef.r_differentiable:
+#                 kk_derv_r, kk_derv_c = get_deriv_name(kk)
+#                 dr, dc = take_deriv(
+#                     vv,
+#                     model_ret[kk_redu],
+#                     vdef,
+#                     coord_ext,
+#                     do_virial=vdef.c_differentiable,
+#                     do_atomic_virial=do_atomic_virial,
+#                     create_graph=create_graph,
+#                 )
+#                 model_ret[kk_derv_r] = dr
+#                 if vdef.c_differentiable:
+#                     assert dc is not None
+#                     model_ret[kk_derv_c] = dc
+#                     model_ret[kk_derv_c + "_redu"] = torch.sum(
+#                         model_ret[kk_derv_c].to(redu_prec), dim=1
+#                     )
+#     return model_ret
+
+# dynamic batch
 def fit_output_to_model_output(
     fit_ret: dict[str, torch.Tensor],
     fit_output_def: FittingOutputDef,
