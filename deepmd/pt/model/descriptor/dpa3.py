@@ -455,13 +455,16 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ]
+        | dict[str, Any]
+    ):
         """Compute the descriptor.
 
         Parameters
@@ -506,7 +509,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext = self.type_embedding(extended_atype)
         node_ebd_inp = node_ebd_ext[:, :nloc, :]
         # repflows
-        node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows(
+        repflows_output = self.repflows(
             nlist,
             extended_coord,
             extended_atype,
@@ -514,19 +517,71 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             mapping,
             comm_dict=comm_dict,
         )
-        if self.concat_output_tebd:
-            node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)
-        return (
-            node_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
-            if rot_mat is not None
-            else None,
-            edge_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
-            if edge_ebd is not None
-            else None,
-            h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if h2 is not None else None,
-            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if sw is not None else None,
-        )
+
+        if isinstance(repflows_output, dict) and "gp_partitions" in repflows_output:
+            # GP 模式：返回字典，直接传递给上层
+            if self.concat_output_tebd:
+                # 需要对每个分区的 node_ebd 进行 concat
+                node_ebd_parts = repflows_output["node_ebd_parts"]
+                node_ebd_inp_parts = []
+                for partition in repflows_output["gp_partitions"]:
+                    local_start = partition["local_start"]
+                    local_end = partition["local_end"]
+                    node_ebd_inp_local = node_ebd_inp[:, local_start:local_end, :]
+                    if node_ebd_parts[0].dim() == 2:
+                        node_ebd_inp_local = node_ebd_inp_local.reshape(
+                            -1, node_ebd_inp_local.shape[-1]
+                        )
+                    node_ebd_inp_parts.append(node_ebd_inp_local)
+
+                # Concat 每个分区
+                node_ebd_parts_concat = [
+                    torch.cat([node_ebd_parts[i], node_ebd_inp_parts[i]], dim=-1)
+                    for i in range(len(node_ebd_parts))
+                ]
+                repflows_output["node_ebd_parts"] = node_ebd_parts_concat
+
+            repflows_output["node_ebd_parts"] = [
+                node_part.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                for node_part in repflows_output["node_ebd_parts"]
+            ]
+            if "h2_parts" in repflows_output:
+                repflows_output["h2_parts"] = [
+                    h2_part.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                    if h2_part is not None
+                    else None
+                    for h2_part in repflows_output["h2_parts"]
+                ]
+            if "sw_parts" in repflows_output:
+                repflows_output["sw_parts"] = [
+                    sw_part.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                    if sw_part is not None
+                    else None
+                    for sw_part in repflows_output["sw_parts"]
+                ]
+
+            # 返回 GP 字典（保持原始结构）
+            return repflows_output
+        else:
+            # 非 GP 模式：保持原逻辑
+            node_ebd, edge_ebd, h2, rot_mat, sw = repflows_output
+            if isinstance(node_ebd, list):
+                node_ebd = torch.cat(node_ebd, dim=0)
+            if self.concat_output_tebd:
+                if node_ebd.dim() == 2 and node_ebd_inp.dim() == 3:
+                    node_ebd_inp = node_ebd_inp.reshape(-1, node_ebd_inp.shape[-1])
+                node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)
+            return (
+                node_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+                rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                if rot_mat is not None
+                else None,
+                edge_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                if edge_ebd is not None
+                else None,
+                h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if h2 is not None else None,
+                sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if sw is not None else None,
+            )
 
     @classmethod
     def update_sel(

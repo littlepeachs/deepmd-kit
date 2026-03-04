@@ -255,34 +255,83 @@ class DPAtomicModel(BaseAtomicModel):
         atype = extended_atype[:, :nloc]
         if self.do_grad_r() or self.do_grad_c():
             extended_coord.requires_grad_(True)
-        descriptor, rot_mat, g2, h2, sw = self.descriptor(
+
+        descriptor_output = self.descriptor(
             extended_coord,
             extended_atype,
             nlist,
             mapping=mapping,
             comm_dict=comm_dict,
         )
-        assert descriptor is not None
-        if self.enable_eval_descriptor_hook:
-            self.eval_descriptor_list.append(descriptor.detach())
-        # energy, force
-        fit_ret = self.fitting_net(
-            descriptor,
-            atype,
-            gr=rot_mat,
-            g2=g2,
-            h2=h2,
-            fparam=fparam,
-            aparam=aparam,
-        )
-        if self.enable_eval_fitting_last_layer_hook:
-            assert "middle_output" in fit_ret, (
-                "eval_fitting_last_layer not supported for this fitting net!"
+
+        # ✅ 判断是否是 GP 模式
+        if isinstance(descriptor_output, dict) and 'gp_partitions' in descriptor_output:
+            # GP 模式：循环处理每个分区
+            gp_partitions = descriptor_output['gp_partitions']
+            node_ebd_parts = descriptor_output['node_ebd_parts']
+            rot_mat_parts = descriptor_output['rot_mat_parts']
+            h2_parts = descriptor_output.get('h2_parts')
+            atype_flat = atype.reshape(-1)
+
+            # 对每个分区执行 fitting
+            fit_ret_parts = []
+            for i, partition in enumerate(gp_partitions):
+                local_start = partition['local_start']
+                local_end = partition['local_end']
+
+                # 获取局部数据
+                local_descriptor = node_ebd_parts[i]
+                if local_descriptor.dim() == 3:
+                    local_descriptor = local_descriptor.reshape(
+                        -1, local_descriptor.shape[-1]
+                    )
+                local_atype = atype_flat[local_start:local_end]
+                local_rot_mat = rot_mat_parts[i]
+                local_h2 = h2_parts[i] if h2_parts is not None else None
+
+                # Fitting Net 处理局部节点
+                local_fit_ret = self.fitting_net(
+                    local_descriptor,
+                    local_atype,
+                    gr=local_rot_mat,
+                    g2=None,
+                    h2=local_h2,
+                    fparam=fparam,
+                    aparam=aparam,
+                )
+                fit_ret_parts.append(local_fit_ret)
+
+            # ✅ 返回 GP 结果（包含分区信息）
+            return {
+                'fit_ret_parts': fit_ret_parts,
+                'gp_partitions': gp_partitions,
+                'gp_mode': True,
+            }
+        else:
+            # 非 GP 模式：保持原逻辑
+            descriptor, rot_mat, g2, h2, sw = descriptor_output
+            assert descriptor is not None
+            if self.enable_eval_descriptor_hook:
+                self.eval_descriptor_list.append(descriptor.detach())
+
+            # energy, force
+            fit_ret = self.fitting_net(
+                descriptor,
+                atype,
+                gr=rot_mat,
+                g2=g2,
+                h2=h2,
+                fparam=fparam,
+                aparam=aparam,
             )
-            self.eval_fitting_last_layer_list.append(
-                fit_ret.pop("middle_output").detach()
-            )
-        return fit_ret
+            if self.enable_eval_fitting_last_layer_hook:
+                assert "middle_output" in fit_ret, (
+                    "eval_fitting_last_layer not supported for this fitting net!"
+                )
+                self.eval_fitting_last_layer_list.append(
+                    fit_ret.pop("middle_output").detach()
+                )
+            return fit_ret
 
     def get_out_bias(self) -> torch.Tensor:
         return self.out_bias

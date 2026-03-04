@@ -211,76 +211,176 @@ def fit_output_to_model_output(
 
     """
     redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
-    model_ret = dict(fit_ret.items())
-    for kk, vv in fit_ret.items():
-        if kk == 'batch':
-            continue
-        vdef = fit_output_def[kk]
-        shap = vdef.shape
-        atom_axis = -(len(shap) + 1)
-        if vdef.reducible:
-            kk_redu = get_reduce_name(kk)
-            if vdef.intensive:
-                if mask is not None:
-                    model_ret[kk_redu] = torch.sum(
-                        vv.to(redu_prec), dim=atom_axis
-                    ) / torch.sum(mask, dim=-1, keepdim=True)
+
+    # ✅ 检查是否是 GP 模式
+    if 'gp_mode' in fit_ret and fit_ret['gp_mode']:
+        # GP 模式：处理分区结果
+        fit_ret_parts = fit_ret['fit_ret_parts']
+        gp_partitions = fit_ret['gp_partitions']
+        gp_world_size = len(gp_partitions)
+
+        # 对每个分区分别处理
+        model_ret_parts = []
+        for i, local_fit_ret in enumerate(fit_ret_parts):
+            partition = gp_partitions[i]
+            local_start = partition['local_start']
+            local_end = partition['local_end']
+
+            # 获取局部 coord
+            local_coord_ext = coord_ext[:, local_start:local_end, :]
+
+            # 处理局部 fit_ret
+            local_model_ret = {}
+            for kk, vv in local_fit_ret.items():
+                if kk == 'batch':
+                    continue
+                vdef = fit_output_def[kk]
+                shap = vdef.shape
+                atom_axis = -(len(shap) + 1)
+
+                local_model_ret[kk] = vv
+
+                if vdef.reducible:
+                    kk_redu = get_reduce_name(kk)
+                    if vdef.intensive:
+                        local_model_ret[kk_redu] = torch.mean(vv.to(redu_prec), dim=atom_axis)
+                    else:
+                        batch = local_fit_ret.get("batch")
+                        if batch is not None:
+                            # 按 batch 聚合（局部）
+                            vv_local = vv.squeeze(0)
+                            batch_local = batch.to(device=vv_local.device, dtype=torch.long).unsqueeze(-1)
+                            n_batch = int(batch_local.max().item() + 1)
+                            redu_shape = list(vv_local.shape)
+                            redu_shape[0] = n_batch
+                            base = torch.zeros(redu_shape, dtype=redu_prec, device=vv_local.device)
+                            local_model_ret[kk_redu] = torch.scatter_reduce(
+                                base, 0, batch_local, vv_local.to(redu_prec),
+                                reduce="sum", include_self=True
+                            )
+                        else:
+                            # 直接求和（局部）
+                            local_model_ret[kk_redu] = torch.sum(vv.to(redu_prec), dim=atom_axis)
+
+                    if vdef.r_differentiable:
+                        kk_derv_r, kk_derv_c = get_deriv_name(kk)
+                        dr, dc = take_deriv(
+                            vv,
+                            local_model_ret[kk_redu],
+                            vdef,
+                            local_coord_ext,
+                            do_virial=vdef.c_differentiable,
+                            do_atomic_virial=do_atomic_virial,
+                            create_graph=create_graph,
+                        )
+                        local_model_ret[kk_derv_r] = dr
+                        if vdef.c_differentiable:
+                            assert dc is not None
+                            local_model_ret[kk_derv_c] = dc.squeeze(1)
+
+            model_ret_parts.append(local_model_ret)
+
+        # ✅ All-Reduce 能量（手动求和模拟）
+        model_ret = {}
+        for kk in fit_output_def.keys():
+            vdef = fit_output_def[kk]
+            if vdef.reducible:
+                kk_redu = get_reduce_name(kk)
+                # 收集所有分区的能量并求和
+                energy_parts = [part[kk_redu] for part in model_ret_parts]
+                model_ret[kk_redu] = torch.stack(energy_parts, dim=0).sum(dim=0)
+
+                # 对于 force 和 virial，需要拼接
+                if vdef.r_differentiable:
+                    kk_derv_r, kk_derv_c = get_deriv_name(kk)
+                    # Force: 拼接所有分区
+                    force_parts = [part[kk_derv_r] for part in model_ret_parts]
+                    model_ret[kk_derv_r] = torch.cat(force_parts, dim=1)
+
+                    if vdef.c_differentiable:
+                        # Virial: 求和所有分区
+                        virial_parts = [part[kk_derv_c] for part in model_ret_parts]
+                        model_ret[kk_derv_c] = torch.stack(virial_parts, dim=0).sum(dim=0)
+
+            # 原子级别的量：拼接
+            if kk in model_ret_parts[0]:
+                atom_parts = [part[kk] for part in model_ret_parts]
+                model_ret[kk] = torch.cat(atom_parts, dim=1)
+
+        return model_ret
+
+    else:
+        # 非 GP 模式：保持原逻辑
+        model_ret = dict(fit_ret.items())
+        for kk, vv in fit_ret.items():
+            if kk == 'batch':
+                continue
+            vdef = fit_output_def[kk]
+            shap = vdef.shape
+            atom_axis = -(len(shap) + 1)
+            if vdef.reducible:
+                kk_redu = get_reduce_name(kk)
+                if vdef.intensive:
+                    if mask is not None:
+                        model_ret[kk_redu] = torch.sum(
+                            vv.to(redu_prec), dim=atom_axis
+                        ) / torch.sum(mask, dim=-1, keepdim=True)
+                    else:
+                        model_ret[kk_redu] = torch.mean(vv.to(redu_prec), dim=atom_axis)
                 else:
-                    model_ret[kk_redu] = torch.mean(vv.to(redu_prec), dim=atom_axis)
-            else:
-                batch = fit_ret.get("batch")
-                if batch is not None:
-                    vv = vv.squeeze(0)
-                    
-                    batch = batch.to(device=vv.device, dtype=torch.long).unsqueeze(-1)
-                    
-                    n_batch = int(batch.max().item() + 1)
-                    redu_shape = list(vv.shape)
-                    redu_shape[0] = n_batch
-                    base = torch.zeros(redu_shape, dtype=redu_prec, device=vv.device)
-                    model_ret[kk_redu] = torch.scatter_reduce(
-                        base,
-                        0,
-                        batch,
-                        vv.to(redu_prec),
-                        reduce="sum",
-                        include_self=True,
-                    )
-                else:
-                    model_ret[kk_redu] = torch.sum(vv.to(redu_prec), dim=atom_axis)
-            if vdef.r_differentiable:
-                kk_derv_r, kk_derv_c = get_deriv_name(kk)
-                
-                dr, dc = take_deriv(
-                    vv,
-                    model_ret[kk_redu],
-                    vdef,
-                    coord_ext,
-                    do_virial=vdef.c_differentiable,
-                    do_atomic_virial=do_atomic_virial,
-                    create_graph=create_graph,
-                )
-                model_ret[kk_derv_r] = dr
-                if vdef.c_differentiable:
-                    assert dc is not None
-                    model_ret[kk_derv_c] = dc.squeeze(1)
                     batch = fit_ret.get("batch")
-                    n_batch = int(batch.max().item() + 1)
-                    dc = model_ret[kk_derv_c]
-                    device = dc.device
-                    dtype = redu_prec
-                    batch = batch.to(device=device, dtype=torch.long)
-                    redu_list = []
-                    for ii in range(n_batch):
-                        idx = torch.nonzero(batch == ii, as_tuple=True)[0]
-                        if idx.numel() == 0:
-                            redu_list.append(torch.zeros(dc.shape[-1], device=device, dtype=dtype))
-                            continue
-                        sele = torch.index_select(dc, 0, idx).to(dtype)
-                        redu_list.append(torch.sum(sele, dim=0))
-                    model_ret[kk_derv_c + "_redu"] = torch.stack(redu_list, dim=0)
-                    
-    return model_ret
+                    if batch is not None:
+                        vv = vv.squeeze(0)
+
+                        batch = batch.to(device=vv.device, dtype=torch.long).unsqueeze(-1)
+
+                        n_batch = int(batch.max().item() + 1)
+                        redu_shape = list(vv.shape)
+                        redu_shape[0] = n_batch
+                        base = torch.zeros(redu_shape, dtype=redu_prec, device=vv.device)
+                        model_ret[kk_redu] = torch.scatter_reduce(
+                            base,
+                            0,
+                            batch,
+                            vv.to(redu_prec),
+                            reduce="sum",
+                            include_self=True,
+                        )
+                    else:
+                        model_ret[kk_redu] = torch.sum(vv.to(redu_prec), dim=atom_axis)
+                if vdef.r_differentiable:
+                    kk_derv_r, kk_derv_c = get_deriv_name(kk)
+
+                    dr, dc = take_deriv(
+                        vv,
+                        model_ret[kk_redu],
+                        vdef,
+                        coord_ext,
+                        do_virial=vdef.c_differentiable,
+                        do_atomic_virial=do_atomic_virial,
+                        create_graph=create_graph,
+                    )
+                    model_ret[kk_derv_r] = dr
+                    if vdef.c_differentiable:
+                        assert dc is not None
+                        model_ret[kk_derv_c] = dc.squeeze(1)
+                        batch = fit_ret.get("batch")
+                        n_batch = int(batch.max().item() + 1)
+                        dc = model_ret[kk_derv_c]
+                        device = dc.device
+                        dtype = redu_prec
+                        batch = batch.to(device=device, dtype=torch.long)
+                        redu_list = []
+                        for ii in range(n_batch):
+                            idx = torch.nonzero(batch == ii, as_tuple=True)[0]
+                            if idx.numel() == 0:
+                                redu_list.append(torch.zeros(dc.shape[-1], device=device, dtype=dtype))
+                                continue
+                            sele = torch.index_select(dc, 0, idx).to(dtype)
+                            redu_list.append(torch.sum(sele, dim=0))
+                        model_ret[kk_derv_c + "_redu"] = torch.stack(redu_list, dim=0)
+
+        return model_ret
 
 
 

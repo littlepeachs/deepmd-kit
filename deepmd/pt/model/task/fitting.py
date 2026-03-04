@@ -785,6 +785,7 @@ class GeneralFitting(Fitting):
                 ].call_until_last(xx)
             if xx_zeros is not None:
                 atom_property -= self.filter_layers.networks[0](xx_zeros)
+            
             outs = (
                 outs + atom_property + self.bias_atom_e[atype].to(self.prec)
             )  # Shape is [nframes, natoms[0], net_dim_out]

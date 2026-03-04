@@ -2,7 +2,7 @@
 from typing import (
     Any,
 )
-
+import time
 import torch
 
 from deepmd.pt.model.atomic_model import (
@@ -99,6 +99,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         aparam: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
     ) -> dict[str, torch.Tensor]:
+        start_time = time.time()
         model_ret = self.forward_common(
             coord,
             atype,
@@ -128,6 +129,8 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         else:
             model_predict = model_ret
             model_predict["updated_coord"] += coord
+        end_time = time.time()
+        print("EnergyModel forward time:",end_time-start_time)
         return model_predict
 
     @torch.jit.export

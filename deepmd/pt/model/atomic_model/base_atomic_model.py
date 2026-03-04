@@ -261,6 +261,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             aparam=aparam,
             comm_dict=comm_dict,
         )
+        import pdb; pdb.set_trace()
         ret_dict = self.apply_out_stat(ret_dict, atype)
 
         # nf x nloc

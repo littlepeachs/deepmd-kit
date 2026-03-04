@@ -2,10 +2,11 @@
 from collections.abc import (
     Callable,
 )
+import pickle
 from typing import (
     Any,
 )
-
+import os
 import torch
 
 from deepmd.dpmodel.utils.seed import (
@@ -555,13 +556,16 @@ class DescrptBlockRepflows(DescriptorBlock):
         extended_atype_embd: torch.Tensor | None = None,
         mapping: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ]
+        | dict[str, Any]
+    ):
         parallel_mode = comm_dict is not None
         if not parallel_mode:
             assert mapping is not None
@@ -694,44 +698,54 @@ class DescrptBlockRepflows(DescriptorBlock):
         # Graph Parallel Setup
         # gp_enabled = graph_parallel.graph_parallel_enabled()
         gp_enabled = True
-        is_debug = True
+        is_debug = False  # ✅ False=GP模式, True=全图模式
+        gp_simulate_world_size = 4  # ✅ 模拟 4 个 rank
 
+        # ✅ 添加环境变量控制，方便测试时切换
+        
+        if os.environ.get('DISABLE_GP_MODE', '0') == '1':
+            gp_enabled = False
+            print("✓ GP 模式已禁用（全图模式）")
+
+        gp_partitions = None
         if gp_enabled and self.use_dynamic_sel and not is_debug:
-            gp_rank = graph_parallel.distutils.get_gp_rank()
-            gp_world_size = graph_parallel.distutils.get_gp_world_size()
-            # gp_rank = 1
-            # gp_world_size = 4
-
+            # ✅ 单线程模拟模式：使用固定的 world_size
+            gp_world_size = gp_simulate_world_size
             gp_num_nodes = node_ebd.shape[0]
             gp_sizes = graph_parallel._balanced_partition_sizes(gp_num_nodes, gp_world_size)
             gp_offsets = graph_parallel._build_partition_offsets(gp_sizes, node_ebd.device)
-            gp_local_start = gp_offsets[gp_rank].item()
-            
-            gp_local_end = gp_local_start + gp_sizes[gp_rank]
-            
-            # Slice indices based on source/center node
-            gp_edge_mask = (edge_index[0] >= gp_local_start) & (edge_index[0] < gp_local_end)
-            gp_edge_index = edge_index[:, gp_edge_mask]
-            
-            gp_angle_mask = (angle_index[0] >= gp_local_start) & (angle_index[0] < gp_local_end)
-            gp_angle_index = angle_index[:, gp_angle_mask].clone()
-            
-            # 建立由全局边索引到局部边索引的映射表 (Index Remapping)
-            # 在图并行模式下，edge_ebd 会被切分，每个 rank 只持有一部分边。
-            # 而 angle_index 中原本存储的是全局的边索引。
-            # 如果不进行重映射，在 repflows_layer_dynamic 中通过 angle_index 去访问
-            # 切分后的 curr_edge_ebd 时，会因为索引越界或指向错误的边而导致计算错误。
-            num_total_edges = edge_index.shape[1]
-            edge_remap = torch.full((num_total_edges,), -1, device=edge_index.device, dtype=torch.long)
-            
-            # 将属于当前 rank 的边（gp_edge_mask 为 True）从全局索引映射到
-            # 新的局部连续索引 (0, 1, 2, ...)，对应它们在 curr_edge_ebd 中的位置。
-            edge_remap[gp_edge_mask] = torch.arange(gp_edge_index.shape[1], device=edge_index.device, dtype=torch.long)
-            
-            # 更新 angle_index 中的边索引（第1行和第2行分别对应边 ij 和 ik），
-            # 使其指向局部 edge_ebd 的正确位置。
-            gp_angle_index[1] = edge_remap[gp_angle_index[1]]
-            gp_angle_index[2] = edge_remap[gp_angle_index[2]]
+
+            # ✅ 预先计算所有 rank 的分区信息
+            gp_partitions = []
+            for rank in range(gp_world_size):
+                local_start = int(gp_offsets[rank].item())
+                local_end = local_start + gp_sizes[rank]
+
+                # Slice indices based on source/center node
+                edge_mask = (edge_index[0] >= local_start) & (edge_index[0] < local_end)
+                local_edge_index = edge_index[:, edge_mask]
+
+                angle_mask = (angle_index[0] >= local_start) & (angle_index[0] < local_end)
+                local_angle_index = angle_index[:, angle_mask].clone()
+
+                # Index Remapping
+                num_total_edges = edge_index.shape[1]
+                edge_remap = torch.full((num_total_edges,), -1, device=edge_index.device, dtype=torch.long)
+                edge_remap[edge_mask] = torch.arange(local_edge_index.shape[1], device=edge_index.device, dtype=torch.long)
+
+                local_angle_index[1] = edge_remap[local_angle_index[1]]
+                local_angle_index[2] = edge_remap[local_angle_index[2]]
+
+                gp_partitions.append({
+                    'rank': rank,
+                    'local_start': local_start,
+                    'local_end': local_end,
+                    'local_size': gp_sizes[rank],
+                    'edge_mask': edge_mask,
+                    'edge_index': local_edge_index,
+                    'angle_mask': angle_mask,
+                    'angle_index': local_angle_index,
+                })
 
 
         for idx, ll in enumerate(self.layers):
@@ -803,51 +817,66 @@ class DescrptBlockRepflows(DescriptorBlock):
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
 
-            # dynamic batch
+            # dynamic batch - ✅ 单线程模拟 4-way GP
             if gp_enabled and self.use_dynamic_sel:
+                print('✓ 进入 GP 模式（动态选择）')
                 if not is_debug:
-                    # 1. 切分输入数据：只保留当前 rank 负责的边和角
-                    # edge_ebd 可能在第一层是全量的，后续层是切分过的，需根据情况处理
-                    curr_edge_ebd = edge_ebd
-                    if edge_ebd is not None and edge_ebd.shape[0] == edge_index.shape[1]:
-                        curr_edge_ebd = edge_ebd[gp_edge_mask]
+                    # ✅ 循环模拟每个 rank 的计算
+                    is_last_layer = (idx == len(self.layers) - 1)
+                    node_ebd_parts = []
+                    edge_ebd_parts = []
+                    angle_ebd_parts = []
 
-                    curr_angle_ebd = angle_ebd
-                    if angle_ebd is not None and angle_ebd.shape[0] == angle_index.shape[1]:
-                        curr_angle_ebd = angle_ebd[gp_angle_mask]
+                    for partition in gp_partitions:
+                        rank = partition['rank']
+                        local_start = partition['local_start']
+                        local_end = partition['local_end']
+                        local_edge_mask = partition['edge_mask']
+                        local_edge_index = partition['edge_index']
+                        local_angle_mask = partition['angle_mask']
+                        local_angle_index = partition['angle_index']
 
-                    # h2, sw, a_sw 是边/角的属性，同样根据 mask 切分到局部
-                    gp_h2 = h2[gp_edge_mask]
-                    gp_sw = sw.unsqueeze(-1)[gp_edge_mask]
-                    gp_a_sw = a_sw.unsqueeze(-1)[gp_angle_mask]
+                        # 1. 切分输入数据
+                        curr_edge_ebd = edge_ebd
+                        if edge_ebd is not None and edge_ebd.shape[0] == edge_index.shape[1]:
+                            curr_edge_ebd = edge_ebd[local_edge_mask]
 
-                    # 2. 执行局部 forward 计算
-                    # 注意：node_ebd 传入全量数据，因为它作为 Source 节点提供邻居特征。
-                    # 输出的 node_ebd_out 虽然形状与输入相同，但只有 [gp_local_start:gp_local_end] 
-                    # 范围内的节点聚合了有效的局部边信息。
-                    node_ebd_out, ret_edge_ebd, ret_angle_ebd = ll.forward(
-                        node_ebd,
-                        curr_edge_ebd,
-                        gp_h2,
-                        curr_angle_ebd,
-                        gp_sw,
-                        gp_a_sw,
-                        edge_index=gp_edge_index,
-                        angle_index=gp_angle_index,
-                    )
+                        curr_angle_ebd = angle_ebd
+                        if angle_ebd is not None and angle_ebd.shape[0] == angle_index.shape[1]:
+                            curr_angle_ebd = angle_ebd[local_angle_mask]
+
+                        local_h2 = h2[local_edge_mask]
+                        local_sw = sw.unsqueeze(-1)[local_edge_mask]
+                        local_a_sw = a_sw.unsqueeze(-1)[local_angle_mask]
+                        # 2. 执行局部 forward 计算
+                        node_ebd_out, ret_edge_ebd, ret_angle_ebd = ll.forward(
+                            node_ebd,
+                            curr_edge_ebd,
+                            local_h2,
+                            curr_angle_ebd,
+                            local_sw,
+                            local_a_sw,
+                            edge_index=local_edge_index,
+                            angle_index=local_angle_index,
+                        )
+
+                        # 3. 提取局部节点
+                        node_ebd_local = node_ebd_out[local_start:local_end]
+                        node_ebd_parts.append(node_ebd_local)
+                        edge_ebd_parts.append(ret_edge_ebd)
+                        angle_ebd_parts.append(ret_angle_ebd)
+
+                    # 4. All-Gather 节点特征（除了最后一层）
+                    if not is_last_layer:
+                        node_ebd = torch.cat(node_ebd_parts, dim=0)
+                    else:
+                        # 最后一层保持分区状态，用于后续 fitting
+                        node_ebd = node_ebd_parts  # List of tensors
+
+                    # 边和角保持分区状态
+                    edge_ebd = torch.cat(edge_ebd_parts, dim=0)  # List of tensors
+                    angle_ebd = torch.cat(angle_ebd_parts, dim=0)  # List of tensors
                     
-                    # 3. 提取结果并同步
-                    # 提取当前 rank 负责更新的有效节点特征
-                    
-                    node_ebd_local = node_ebd_out[gp_local_start:gp_local_end]
-                    
-                    # All-Gather 恢复完整的 node_ebd，供下一网络层作为输入使用
-                    node_ebd = graph_parallel.gather_node_tensor(node_ebd_local)
-                    
-                    # 边和角的特征不需要 Gather，保持切分状态以节省显存，
-                    # 下一层循环逻辑能处理这种切分状态
-                    edge_ebd = ret_edge_ebd
-                    angle_ebd = ret_angle_ebd
                 else:
                     node_full_out, node_gp_out, edge_full_out, edge_gp_out, angle_full_out, angle_gp_out = self.simulate_gp_layer_forward(
                         ll,
@@ -858,9 +887,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     assert torch.allclose(node_full_out, node_gp_out, atol=1e-5)
                     assert torch.allclose(edge_full_out, edge_gp_out, atol=1e-5)
                     assert torch.allclose(angle_full_out, angle_gp_out, atol=1e-5)
-                    import pdb; pdb.set_trace()
 
             else:
+                print('✓ 进入全图模式（非动态选择或禁用 GP）')
                 node_ebd, edge_ebd, angle_ebd= ll.forward(
                     node_ebd,
                     edge_ebd,
@@ -871,29 +900,24 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_index=edge_index,
                     angle_index=angle_index,
                 )
-                
+        if (
+            gp_enabled
+            and self.use_dynamic_sel
+            and not is_debug
+            and gp_partitions is not None
+            and isinstance(node_ebd, list)
+        ):
+            h2_parts = [h2[partition["edge_mask"]] for partition in gp_partitions]
+            sw_parts = [sw[partition["edge_mask"]] for partition in gp_partitions]
+            return {
+                "gp_partitions": gp_partitions,
+                "node_ebd_parts": node_ebd,
+                "rot_mat_parts": [None] * len(gp_partitions),
+                "h2_parts": h2_parts,
+                "sw_parts": sw_parts,
+            }
 
-            
-
-        # nb x nloc x 3 x e_dim
-        h2g2 = (
-            RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
-            if not self.use_dynamic_sel
-            else RepFlowLayer._cal_hg_dynamic(
-                edge_ebd,
-                h2,
-                sw,
-                owner=edge_index[0],
-                num_owner=nframes * nloc,
-                nb=nframes,
-                nloc=nloc,
-                scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
-            )
-        )
-        # (nb x nloc) x e_dim x 3
-        rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
-
-        return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
+        return node_ebd, edge_ebd, h2, None, sw
 
     def compute_input_stats(
         self,
