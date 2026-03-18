@@ -43,9 +43,27 @@ from deepmd.utils.data_system import (
     prob_sys_size_ext,
     process_sys_probs,
 )
+from deepmd.utils.local_distutils import get_repo_distutils
 
 log = logging.getLogger(__name__)
 torch.multiprocessing.set_sharing_strategy("file_system")
+
+try:
+    gp_distutils = get_repo_distutils()
+except Exception:
+    gp_distutils = None
+
+
+def _get_data_parallel_rank_world() -> tuple[int, int]:
+    if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
+        try:
+            if gp_distutils.initialized():
+                return gp_distutils.get_data_rank(), gp_distutils.get_data_world_size()
+        except Exception:
+            pass
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
 
 
 def setup_seed(seed: int | list[int] | tuple[int, ...]) -> None:
@@ -98,6 +116,7 @@ class DpLoaderSet(Dataset):
 
         self.systems: list[DeepmdDataSetForLoader] = []
         global_rank = dist.get_rank() if dist.is_initialized() else 0
+        data_rank, data_world_size = _get_data_parallel_rank_world()
         if global_rank == 0:
             log.info(f"Constructing DataLoaders from {len(systems)} systems")
             with Pool(max(1, env.NUM_WORKERS)) as pool:
@@ -157,9 +176,14 @@ class DpLoaderSet(Dataset):
         else:
             self.batch_sizes = batch_size * np.ones(len(systems), dtype=int)
         assert len(self.systems) == len(self.batch_sizes)
+        
         for system, batch_size in zip(self.systems, self.batch_sizes):
-            if dist.is_available() and dist.is_initialized():
-                system_sampler = DistributedSampler(system)
+            if data_world_size > 1:
+                system_sampler = DistributedSampler(
+                    system,
+                    num_replicas=data_world_size,
+                    rank=data_rank,
+                )
                 self.sampler_list.append(system_sampler)
             else:
                 system_sampler = None
@@ -170,7 +194,7 @@ class DpLoaderSet(Dataset):
                 sampler=system_sampler,
                 collate_fn=collate_batch,
                 shuffle=(
-                    not (dist.is_available() and dist.is_initialized())
+                    data_world_size <= 1
                 )  # distributed sampler will do the shuffling by default
                 and shuffle,
             )

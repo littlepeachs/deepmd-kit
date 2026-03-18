@@ -1,10 +1,9 @@
-
+import time
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 from torch_geometric.data import Data, Batch
 import numpy as np
 import torch
 import pickle
-import vesin
 import functools
 
 from deepmd.pt.model.atomic_model import (
@@ -499,8 +498,10 @@ class DPA3DynamicModel(BaseModel):
             forces_gt = batch_data['forces'].to(device)
             stress_gt = batch_data['stress'].to(device)
         else:
+            start_time = time.time()
             nf = coord.shape[0]
             batch_data_list = []
+            print('nf:',nf)
             for ii in range(nf):
                 if torch.max(torch.abs(box[ii])).max() > 1e-6:
                     pbc = torch.tensor([[True,True,True]],device=device)
@@ -512,6 +513,8 @@ class DPA3DynamicModel(BaseModel):
                 }
                 data = compute_neighborlist_(mptraj_data,self.e_rcut,use_angle=True)
                 batch_data_list.append(data)
+            end_time = time.time()
+            print("Neighbor list time:",end_time-start_time)
             batch_data = batched_from_list(batch_data_list)
             coord = batch_data['pos'].to(device)
             coord.requires_grad_(True)
@@ -521,6 +524,7 @@ class DPA3DynamicModel(BaseModel):
             angle_index = batch_data['angle_index'].to(device)
             batch = batch_data['batch'].to(device)
             box = box.to(device)
+
         
         if self.precision == "float32":
             coord = coord.to(dtype=torch.float32)
@@ -546,7 +550,8 @@ class DPA3DynamicModel(BaseModel):
 
         edge_vectors = (r_j - r_i) + shift_real                         # [E,3]
         distances = torch.linalg.norm(edge_vectors, dim=-1)             # [E]
-
+        
+        start_time = time.time()
         descriptor, rot_mat, g2, h2, sw = self.repflows(
             coord,
             atype,
@@ -557,7 +562,10 @@ class DPA3DynamicModel(BaseModel):
             angle_index,
             batch,
         )
+        end_time = time.time()
+        print("Descriptor time:",end_time-start_time)
         
+        start_time = time.time()
         ret_dict = self.fitting_net(
             descriptor,
             atype,
@@ -598,7 +606,8 @@ class DPA3DynamicModel(BaseModel):
         model_predict["force"] = model_ret["energy_derv_r"].squeeze(-2)
         
         model_predict["virial"] = model_ret["energy_derv_c_redu"].squeeze(-2)
-        
+        end_time = time.time()
+        print("Fitting net and post-process time:",end_time-start_time)
         return model_predict
         # return model_predict,(energy_gt,forces_gt,stress_gt)
 

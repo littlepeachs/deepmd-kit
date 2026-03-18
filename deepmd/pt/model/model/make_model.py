@@ -2,14 +2,18 @@
 from collections.abc import (
     Callable,
 )
+import os
 from typing import (
     Any,
 )
 
 import torch
+import graph_parallel
 
 from deepmd.dpmodel import (
     ModelOutputDef,
+    get_deriv_name,
+    get_reduce_name,
 )
 from deepmd.dpmodel.output_def import (
     FittingOutputDef,
@@ -284,6 +288,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
 
             """
             nframes, nall = extended_atype.shape[:2]
+            gp_enabled = os.environ.get("DISABLE_GP_MODE", "0") != "1"
             extended_coord = extended_coord.view(nframes, -1, 3)
             nlist = self.format_nlist(
                 extended_coord, extended_atype, nlist, extra_nlist_sort=extra_nlist_sort
@@ -301,15 +306,147 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 aparam=ap,
                 comm_dict=comm_dict,
             )
-            model_predict = fit_output_to_model_output(
-                atomic_ret,
-                self.atomic_output_def(),
-                cc_ext,
-                do_atomic_virial=do_atomic_virial,
-                create_graph=self.training,
-                mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
+            
+            has_distutils_gp_backend = False
+            distutils_gp_ready = getattr(graph_parallel, "_distutils_gp_ready", None)
+            if callable(distutils_gp_ready):
+                has_distutils_gp_backend = distutils_gp_ready()
+            allow_cross_rank_gp_gather = (
+                graph_parallel.graph_parallel_enabled() and has_distutils_gp_backend
             )
+            if gp_enabled and atomic_ret.get("gp_mode", False):
+                fit_ret_parts = atomic_ret.get("fit_ret_parts", [])
+                mask_parts = atomic_ret.get("mask_parts", [])
+                model_predict_parts: list[dict[str, torch.Tensor]] = []
+
+                for ii, local_fit_ret in enumerate(fit_ret_parts):
+                    local_mask = mask_parts[ii] if ii < len(mask_parts) else None
+                    local_model_predict = fit_output_to_model_output(
+                        local_fit_ret,
+                        self.atomic_output_def(),
+                        cc_ext,
+                        do_atomic_virial=do_atomic_virial,
+                        create_graph=self.training,
+                        mask=local_mask,
+                    )
+                    model_predict_parts.append(local_model_predict)
+
+                model_predict: dict[str, torch.Tensor] = {}
+                if mask_parts:
+                    if mask_parts[0].dim() >= 2 and mask_parts[0].shape[0] == 1:
+                        local_mask = torch.cat(
+                            [mask_part.squeeze(0) for mask_part in mask_parts], dim=0
+                        )
+                        if allow_cross_rank_gp_gather:
+                            local_mask = graph_parallel.gather_node_tensor_no_sum_grad(
+                                local_mask,
+                                dim=0,
+                            )
+                        local_mask = local_mask.unsqueeze(0)
+                    else:
+                        local_mask = torch.cat(mask_parts, dim=1)
+                        if allow_cross_rank_gp_gather:
+                            local_mask = graph_parallel.gather_node_tensor_no_sum_grad(
+                                local_mask,
+                                dim=1,
+                            )
+                    model_predict["mask"] = local_mask.to(torch.int32)
+                output_def = self.atomic_output_def()
+                for kk in output_def.keys():
+                    vdef = output_def[kk]
+
+                    local_atomic_values = [part[kk] for part in model_predict_parts if kk in part]
+                    if local_atomic_values:
+                        if (
+                            local_atomic_values[0].dim() >= 2
+                            and local_atomic_values[0].shape[0] == 1
+                        ):
+                            local_atomic_tensor = torch.cat(
+                                [local_value.squeeze(0) for local_value in local_atomic_values],
+                                dim=0,
+                            )
+                            if allow_cross_rank_gp_gather:
+                                local_atomic_tensor = graph_parallel.gather_node_tensor_no_sum_grad(
+                                    local_atomic_tensor,
+                                    dim=0,
+                                )
+                            local_atomic_tensor = local_atomic_tensor.unsqueeze(0)
+                        else:
+                            atom_axis = local_atomic_values[0].dim() - len(vdef.shape) - 1
+                            local_atomic_tensor = torch.cat(local_atomic_values, dim=atom_axis)
+                            if allow_cross_rank_gp_gather:
+                                local_atomic_tensor = graph_parallel.gather_node_tensor_no_sum_grad(
+                                    local_atomic_tensor,
+                                    dim=atom_axis,
+                                )
+                        model_predict[kk] = local_atomic_tensor
+
+                    if not vdef.reducible:
+                        continue
+
+                    kk_redu = get_reduce_name(kk)
+                    local_redu_values = [
+                        part[kk_redu] for part in model_predict_parts if kk_redu in part
+                    ]
+                    if local_redu_values:
+                        redu_value = torch.stack(local_redu_values, dim=0).sum(dim=0)
+                        if allow_cross_rank_gp_gather:
+                            redu_value = graph_parallel.reduce_graph_tensor(redu_value)
+                        model_predict[kk_redu] = redu_value
+
+                    if not vdef.r_differentiable:
+                        continue
+
+                    kk_derv_r, kk_derv_c = get_deriv_name(kk)
+                    local_force_values = [
+                        part[kk_derv_r] for part in model_predict_parts if kk_derv_r in part
+                    ]
+                    if local_force_values:
+                        force_value = torch.stack(local_force_values, dim=0).sum(dim=0)
+                        if allow_cross_rank_gp_gather:
+                            force_value = graph_parallel.reduce_graph_tensor(force_value)
+                        model_predict[kk_derv_r] = force_value
+
+                    if not vdef.c_differentiable:
+                        continue
+
+                    local_virial_values = [
+                        part[kk_derv_c] for part in model_predict_parts if kk_derv_c in part
+                    ]
+                    if local_virial_values:
+                        virial_value = torch.stack(local_virial_values, dim=0).sum(dim=0)
+                        if allow_cross_rank_gp_gather:
+                            virial_value = graph_parallel.reduce_graph_tensor(virial_value)
+                        model_predict[kk_derv_c] = virial_value
+
+                    kk_derv_c_redu = kk_derv_c + "_redu"
+                    local_virial_redu_values = [
+                        part[kk_derv_c_redu]
+                        for part in model_predict_parts
+                        if kk_derv_c_redu in part
+                    ]
+                    if local_virial_redu_values:
+                        virial_redu_value = torch.stack(
+                            local_virial_redu_values, dim=0
+                        ).sum(dim=0)
+                        if allow_cross_rank_gp_gather:
+                            virial_redu_value = graph_parallel.reduce_graph_tensor(
+                                virial_redu_value
+                            )
+                        model_predict[kk_derv_c_redu] = virial_redu_value
+                
+            
+            else:
+                model_predict = fit_output_to_model_output(
+                    atomic_ret,
+                    self.atomic_output_def(),
+                    cc_ext,
+                    do_atomic_virial=do_atomic_virial,
+                    create_graph=self.training,
+                    mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
+                )
             model_predict = self.output_type_cast(model_predict, input_prec)
+            
             return model_predict
 
         def input_type_cast(

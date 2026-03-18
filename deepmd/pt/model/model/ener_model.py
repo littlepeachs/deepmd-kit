@@ -130,7 +130,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             model_predict = model_ret
             model_predict["updated_coord"] += coord
         end_time = time.time()
-        print("EnergyModel forward time:",end_time-start_time)
+        # print("EnergyModel forward time:",end_time-start_time)
         return model_predict
 
     @torch.jit.export

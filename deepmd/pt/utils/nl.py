@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 import ase.neighborlist
-from matscipy.neighbours import neighbour_list as matscipy_nl
 
 from deepmd.pt.utils.create_graph import Graph,Node
 

@@ -2,7 +2,7 @@
 from typing import (
     Any,
 )
-
+import inspect
 import torch
 import torch.nn.functional as F
 
@@ -216,6 +216,7 @@ class EnergyStdLoss(TaskLoss):
             pref_e = pref_e * find_energy
             if not self.use_l1_all:
                 l2_ener_loss = torch.mean(torch.square(energy_pred - energy_label))
+                
                 if not self.inference:
                     more_loss["l2_ener_loss"] = self.display_if_exist(
                         l2_ener_loss.detach(), find_energy
@@ -353,6 +354,7 @@ class EnergyStdLoss(TaskLoss):
                 )
 
         if self.has_v and "virial" in model_pred and "virial" in label:
+            # print(f'########### In this line {inspect.currentframe().f_lineno} #########')
             find_virial = label.get("find_virial", 0.0)
             pref_v = pref_v * find_virial
             
@@ -407,6 +409,7 @@ class EnergyStdLoss(TaskLoss):
 
         if not self.inference:
             more_loss["rmse"] = torch.sqrt(loss.detach())
+        
         return model_pred, loss, more_loss
 
     @property

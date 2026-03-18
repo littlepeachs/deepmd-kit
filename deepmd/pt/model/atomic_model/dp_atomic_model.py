@@ -4,6 +4,7 @@ import logging
 from collections.abc import (
     Callable,
 )
+import os
 from typing import (
     Any,
     Optional,
@@ -263,19 +264,35 @@ class DPAtomicModel(BaseAtomicModel):
             mapping=mapping,
             comm_dict=comm_dict,
         )
+        is_gp_mode = (
+            isinstance(descriptor_output, dict)
+            and "gp_partitions" in descriptor_output
+        )
 
         # ✅ 判断是否是 GP 模式
-        if isinstance(descriptor_output, dict) and 'gp_partitions' in descriptor_output:
+        if is_gp_mode:
             # GP 模式：循环处理每个分区
             gp_partitions = descriptor_output['gp_partitions']
+            local_partition_indices = descriptor_output.get(
+                'local_partition_indices',
+                list(range(len(gp_partitions))),
+            )
             node_ebd_parts = descriptor_output['node_ebd_parts']
+            node_index_parts = descriptor_output.get('node_index_parts')
             rot_mat_parts = descriptor_output['rot_mat_parts']
             h2_parts = descriptor_output.get('h2_parts')
             atype_flat = atype.reshape(-1)
-
+            aparam_flat = None
+            if aparam is not None:
+                if aparam.dim() >= 3:
+                    aparam_flat = aparam.reshape(-1, aparam.shape[-1])
+                else:
+                    aparam_flat = aparam.reshape(-1)
+            
             # 对每个分区执行 fitting
             fit_ret_parts = []
-            for i, partition in enumerate(gp_partitions):
+            for i, partition_index in enumerate(local_partition_indices):
+                partition = gp_partitions[partition_index]
                 local_start = partition['local_start']
                 local_end = partition['local_end']
 
@@ -286,8 +303,20 @@ class DPAtomicModel(BaseAtomicModel):
                         -1, local_descriptor.shape[-1]
                     )
                 local_atype = atype_flat[local_start:local_end]
+                local_aparam = None
+                if aparam_flat is not None:
+                    local_aparam = aparam_flat[local_start:local_end]
                 local_rot_mat = rot_mat_parts[i]
                 local_h2 = h2_parts[i] if h2_parts is not None else None
+                local_batch = (
+                    node_index_parts[i].to(device=local_descriptor.device, dtype=torch.long)
+                    if node_index_parts is not None
+                    else torch.arange(
+                        nframes,
+                        device=local_descriptor.device,
+                        dtype=torch.long,
+                    ).repeat_interleave(local_end - local_start)
+                )
 
                 # Fitting Net 处理局部节点
                 local_fit_ret = self.fitting_net(
@@ -297,14 +326,23 @@ class DPAtomicModel(BaseAtomicModel):
                     g2=None,
                     h2=local_h2,
                     fparam=fparam,
-                    aparam=aparam,
+                    aparam=local_aparam,
                 )
+                local_fit_ret['batch'] = local_batch
+                local_fit_ret['n_batch'] = nframes
                 fit_ret_parts.append(local_fit_ret)
-
-            # ✅ 返回 GP 结果（包含分区信息）
+            # if int(os.environ.get("RANK", "0")) == 0:
+            #     print('fit_ret_parts[0][energy][0,20:]')
+            #     print(fit_ret_parts[0]['energy'][0,:20])
+            # if int(os.environ.get("RANK", "1")) == 1:
+            #     print('fit_ret_parts[0][energy][0,-20:]')
+            #     print(fit_ret_parts[0]['energy'][0,-20:])
+            
+            
             return {
                 'fit_ret_parts': fit_ret_parts,
                 'gp_partitions': gp_partitions,
+                'local_partition_indices': local_partition_indices,
                 'gp_mode': True,
             }
         else:
@@ -315,15 +353,29 @@ class DPAtomicModel(BaseAtomicModel):
                 self.eval_descriptor_list.append(descriptor.detach())
 
             # energy, force
+            
             fit_ret = self.fitting_net(
                 descriptor,
-                atype,
+                atype.reshape(-1),
                 gr=rot_mat,
                 g2=g2,
                 h2=h2,
                 fparam=fparam,
                 aparam=aparam,
             )
+            # print('fit_ret[energy][0,20:]')
+            # print(fit_ret['energy'][0,:20])
+            # print('fit_ret[energy][0,-20:]')
+            # print(fit_ret['energy'][0,-20:])
+            
+            natoms = nframes * nloc
+            for kk, vv in list(fit_ret.items()):
+                if not torch.is_tensor(vv):
+                    continue
+                if vv.dim() >= 2 and vv.shape[0] == 1 and vv.shape[1] == natoms:
+                    fit_ret[kk] = vv.reshape(nframes, nloc, *vv.shape[2:])
+                elif vv.dim() >= 1 and vv.shape[0] == natoms:
+                    fit_ret[kk] = vv.reshape(nframes, nloc, *vv.shape[1:])
             if self.enable_eval_fitting_last_layer_hook:
                 assert "middle_output" in fit_ret, (
                     "eval_fitting_last_layer not supported for this fitting net!"

@@ -4,6 +4,7 @@ import logging
 from collections.abc import (
     Callable,
 )
+import os
 from typing import (
     NoReturn,
     Optional,
@@ -11,6 +12,7 @@ from typing import (
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from deepmd.dpmodel.atomic_model import (
     make_base_atomic_model,
@@ -42,10 +44,18 @@ from deepmd.utils.finetune import (
 from deepmd.utils.path import (
     DPPath,
 )
+from deepmd.utils.local_distutils import (
+    get_repo_distutils,
+)
 
 log = logging.getLogger(__name__)
 dtype = env.GLOBAL_PT_FLOAT_PRECISION
 device = env.DEVICE
+
+try:
+    _repo_distutils = get_repo_distutils()
+except Exception:
+    _repo_distutils = None
 
 BaseAtomicModel_ = make_base_atomic_model(torch.Tensor)
 
@@ -105,7 +115,6 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         self.register_buffer("out_std", out_std_data)
 
     def set_out_bias(self, out_bias: torch.Tensor) -> None:
-        import pdb; pdb.set_trace()
         self.out_bias = out_bias
 
     def __setitem__(self, key: str, value: torch.Tensor) -> None:
@@ -261,24 +270,87 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             aparam=aparam,
             comm_dict=comm_dict,
         )
-        import pdb; pdb.set_trace()
-        ret_dict = self.apply_out_stat(ret_dict, atype)
+        if ret_dict.get("gp_mode", False):
+            gp_partitions = ret_dict["gp_partitions"]
+            local_partition_indices = ret_dict.get(
+                "local_partition_indices",
+                list(range(len(gp_partitions))),
+            )
+            fit_ret_parts = ret_dict["fit_ret_parts"]
+            self._sync_out_stat_for_gp()
 
+            atom_mask = ext_atom_mask[:, :nloc].to(torch.int32)
+            if self.atom_excl is not None:
+                atom_mask *= self.atom_excl(atype)
+
+            atype_flat = atype.reshape(-1)
+            atom_mask_flat = atom_mask.reshape(-1)
+
+            updated_parts = []
+            mask_parts = []
+            
+            for i, partition_index in enumerate(local_partition_indices):
+                partition = gp_partitions[partition_index]
+                local_start = partition["local_start"]
+                local_end = partition["local_end"]
+                local_atype = atype_flat[local_start:local_end]
+                local_mask = atom_mask_flat[local_start:local_end]
+                local_fit_ret = self.apply_out_stat(fit_ret_parts[i], local_atype)
+
+                for kk in list(local_fit_ret.keys()):
+                    vv = local_fit_ret[kk]
+                    if kk == "batch" or not torch.is_tensor(vv):
+                        continue
+                    local_mask_value = local_mask.to(device=vv.device, dtype=vv.dtype)
+                    if vv.dim() >= 2 and vv.shape[0] == 1 and vv.shape[1] == local_mask.shape[0]:
+                        vv_shape = vv.shape
+                        vv = (
+                            vv.reshape(1, local_mask.shape[0], -1)
+                            * local_mask_value.view(1, -1, 1)
+                        ).view(vv_shape)
+                    elif vv.dim() >= 1 and vv.shape[0] == local_mask.shape[0]:
+                        vv_shape = vv.shape
+                        vv = (
+                            vv.reshape(local_mask.shape[0], -1)
+                            * local_mask_value.view(-1, 1)
+                        ).view(vv_shape)
+                    local_fit_ret[kk] = vv
+
+                updated_parts.append(local_fit_ret)
+                mask_parts.append(local_mask.view(1, -1))
+
+            ret_dict["fit_ret_parts"] = updated_parts
+            ret_dict["mask_parts"] = mask_parts
+            ret_dict["local_partition_indices"] = local_partition_indices
+            # if int(os.environ.get("RANK", "0")) == 0:
+            #     print('updated_parts[0][energy][0,20:]')
+            #     print(updated_parts[0]['energy'][0,:20])
+            # if int(os.environ.get("RANK", "1")) == 1:   
+            #     print('updated_parts[0][energy][0,-20:]')
+            #     print(updated_parts[0]['energy'][0,-20:])
+            
+            return ret_dict
+        
+        ret_dict = self.apply_out_stat(ret_dict, atype)
+        
         # nf x nloc
         atom_mask = ext_atom_mask[:, :nloc].to(torch.int32)
         if self.atom_excl is not None:
             atom_mask *= self.atom_excl(atype)
 
-        for kk in ret_dict.keys():
-            out_shape = ret_dict[kk].shape
+        for kk, vv in list(ret_dict.items()):
+            if kk in {"batch", "n_batch"} or not torch.is_tensor(vv):
+                continue
+            out_shape = vv.shape
             out_shape2 = 1
             for ss in out_shape[2:]:
                 out_shape2 *= ss
             ret_dict[kk] = (
-                ret_dict[kk].reshape([out_shape[0], out_shape[1], out_shape2])
+                vv.reshape([out_shape[0], out_shape[1], out_shape2])
                 * atom_mask[:, :, None]
             ).view(out_shape)
         ret_dict["mask"] = atom_mask
+
 
         return ret_dict
 
@@ -444,6 +516,22 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             # nf x nloc x odims, out_bias: ntypes x odims
             ret[kk] = ret[kk] + out_bias[kk][atype]
         return ret
+
+    def _sync_out_stat_for_gp(self) -> None:
+        if _repo_distutils is None:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        if not hasattr(_repo_distutils, "initialized") or not _repo_distutils.initialized():
+            return
+        if not hasattr(_repo_distutils, "get_gp_group"):
+            return
+        gp_group = _repo_distutils.get_gp_group()
+        src_rank = 0
+        if hasattr(_repo_distutils, "get_gp_group_rank0_global_rank"):
+            src_rank = _repo_distutils.get_gp_group_rank0_global_rank()
+        dist.broadcast(self.out_bias, src=src_rank, group=gp_group)
+        dist.broadcast(self.out_std, src=src_rank, group=gp_group)
 
     def change_out_bias(
         self,

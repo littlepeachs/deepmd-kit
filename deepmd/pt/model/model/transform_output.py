@@ -93,6 +93,7 @@ def task_deriv_one(
         extended_virial = extended_virial.view(list(extended_virial.shape[:-2]) + [9])  # noqa:RUF005
     else:
         extended_virial = None
+    
     return extended_force, extended_virial
 
 
@@ -228,11 +229,10 @@ def fit_output_to_model_output(
 
             # 获取局部 coord
             local_coord_ext = coord_ext[:, local_start:local_end, :]
-
             # 处理局部 fit_ret
             local_model_ret = {}
             for kk, vv in local_fit_ret.items():
-                if kk == 'batch':
+                if kk in {'batch', 'n_batch'}:
                     continue
                 vdef = fit_output_def[kk]
                 shap = vdef.shape
@@ -250,7 +250,7 @@ def fit_output_to_model_output(
                             # 按 batch 聚合（局部）
                             vv_local = vv.squeeze(0)
                             batch_local = batch.to(device=vv_local.device, dtype=torch.long).unsqueeze(-1)
-                            n_batch = int(batch_local.max().item() + 1)
+                            n_batch = int(local_fit_ret.get("n_batch", batch_local.max().item() + 1))
                             redu_shape = list(vv_local.shape)
                             redu_shape[0] = n_batch
                             base = torch.zeros(redu_shape, dtype=redu_prec, device=vv_local.device)
@@ -313,7 +313,7 @@ def fit_output_to_model_output(
         # 非 GP 模式：保持原逻辑
         model_ret = dict(fit_ret.items())
         for kk, vv in fit_ret.items():
-            if kk == 'batch':
+            if kk in {'batch', 'n_batch'}:
                 continue
             vdef = fit_output_def[kk]
             shap = vdef.shape
@@ -334,7 +334,7 @@ def fit_output_to_model_output(
 
                         batch = batch.to(device=vv.device, dtype=torch.long).unsqueeze(-1)
 
-                        n_batch = int(batch.max().item() + 1)
+                        n_batch = int(fit_ret.get("n_batch", batch.max().item() + 1))
                         redu_shape = list(vv.shape)
                         redu_shape[0] = n_batch
                         base = torch.zeros(redu_shape, dtype=redu_prec, device=vv.device)
@@ -363,23 +363,10 @@ def fit_output_to_model_output(
                     model_ret[kk_derv_r] = dr
                     if vdef.c_differentiable:
                         assert dc is not None
-                        model_ret[kk_derv_c] = dc.squeeze(1)
-                        batch = fit_ret.get("batch")
-                        n_batch = int(batch.max().item() + 1)
-                        dc = model_ret[kk_derv_c]
-                        device = dc.device
-                        dtype = redu_prec
-                        batch = batch.to(device=device, dtype=torch.long)
-                        redu_list = []
-                        for ii in range(n_batch):
-                            idx = torch.nonzero(batch == ii, as_tuple=True)[0]
-                            if idx.numel() == 0:
-                                redu_list.append(torch.zeros(dc.shape[-1], device=device, dtype=dtype))
-                                continue
-                            sele = torch.index_select(dc, 0, idx).to(dtype)
-                            redu_list.append(torch.sum(sele, dim=0))
-                        model_ret[kk_derv_c + "_redu"] = torch.stack(redu_list, dim=0)
-
+                        model_ret[kk_derv_c] = dc
+                        model_ret[kk_derv_c + "_redu"] = torch.sum(
+                            model_ret[kk_derv_c].to(redu_prec), dim=1
+                        )
         return model_ret
 
 
@@ -403,15 +390,16 @@ def communicate_extended_output(
         if vdef.reducible:
             kk_redu = get_reduce_name(kk)
             new_ret[kk_redu] = model_ret[kk_redu]
-            # nf x nloc
-            vldims = get_leading_dims(vv, vdef)
             # nf x nall
             mldims = list(mapping.shape)
+            nframes = mldims[0]
+            nloc = int(mapping.max().item()) + 1
+            vldims = [nframes, nloc]
             kk_derv_r, kk_derv_c = get_deriv_name(kk)
             if vdef.r_differentiable:
                 # vdim x 3
                 derv_r_ext_dims = list(vdef.shape) + [3]  # noqa:RUF005
-                mapping = mapping.view(mldims + [1] * len(derv_r_ext_dims)).expand(
+                mapping_r = mapping.view(mldims + [1] * len(derv_r_ext_dims)).expand(
                     [-1] * len(mldims) + derv_r_ext_dims
                 )
                 force = torch.zeros(
@@ -421,7 +409,7 @@ def communicate_extended_output(
                 new_ret[kk_derv_r] = torch.scatter_reduce(
                     force,
                     1,
-                    index=mapping,
+                    index=mapping_r,
                     src=model_ret[kk_derv_r],
                     reduce="sum",
                 )
@@ -429,8 +417,8 @@ def communicate_extended_output(
                 assert vdef.r_differentiable
                 derv_c_ext_dims = list(vdef.shape) + [9]  # noqa:RUF005
                 # nf x nloc x nvar x 3 -> nf x nloc x nvar x 9
-                mapping = torch.tile(
-                    mapping,
+                mapping_c = torch.tile(
+                    mapping_r,
                     [1] * (len(mldims) + len(vdef.shape)) + [3],
                 )
                 virial = torch.zeros(
@@ -440,7 +428,7 @@ def communicate_extended_output(
                 new_ret[kk_derv_c] = torch.scatter_reduce(
                     virial,
                     1,
-                    index=mapping,
+                    index=mapping_c,
                     src=model_ret[kk_derv_c],
                     reduce="sum",
                 )

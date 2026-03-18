@@ -89,8 +89,24 @@ from deepmd.utils.path import (
     DPPath,
 )
 from deepmd.utils.summary import SummaryPrinter as BaseSummaryPrinter
+from deepmd.utils.local_distutils import get_repo_distutils
 
 log = logging.getLogger(__name__)
+
+try:
+    gp_distutils = get_repo_distutils()
+except Exception:
+    gp_distutils = None
+
+
+def _get_data_parallel_rank() -> int:
+    if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
+        try:
+            if gp_distutils.initialized():
+                return gp_distutils.get_data_rank()
+        except Exception:
+            pass
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 
 def get_trainer(
@@ -108,7 +124,8 @@ def get_trainer(
     def prepare_trainer_input_single(
         model_params_single: dict[str, Any],
         data_dict_single: dict[str, Any],
-        rank: int = 0,
+        global_rank: int = 0,
+        data_rank: int = 0,
         seed: int | None = None,
     ) -> tuple[DpLoaderSet, DpLoaderSet | None, DPPath | None]:
         training_dataset_params = data_dict_single["training_data"]
@@ -125,7 +142,7 @@ def get_trainer(
 
         # stat files
         stat_file_path_single = data_dict_single.get("stat_file", None)
-        if rank != 0:
+        if global_rank != 0:
             stat_file_path_single = None
         elif stat_file_path_single is not None:
             if not Path(stat_file_path_single).exists():
@@ -138,7 +155,7 @@ def get_trainer(
 
         # validation and training data
         # avoid the same batch sequence among devices
-        rank_seed = [rank, seed % (2**32)] if seed is not None else None
+        rank_seed = [data_rank, seed % (2**32)] if seed is not None else None
         validation_data_single = (
             DpLoaderSet(
                 validation_systems,
@@ -161,7 +178,8 @@ def get_trainer(
             stat_file_path_single,
         )
 
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    data_rank = _get_data_parallel_rank()
     data_seed = config["training"].get("seed", None)
     if not multi_task:
         (
@@ -171,7 +189,8 @@ def get_trainer(
         ) = prepare_trainer_input_single(
             config["model"],
             config["training"],
-            rank=rank,
+            global_rank=global_rank,
+            data_rank=data_rank,
             seed=data_seed,
         )
     else:
@@ -184,7 +203,8 @@ def get_trainer(
             ) = prepare_trainer_input_single(
                 config["model"]["model_dict"][model_key],
                 config["training"]["data_dict"][model_key],
-                rank=rank,
+                global_rank=global_rank,
+                data_rank=data_rank,
                 seed=data_seed,
             )
 
@@ -337,9 +357,21 @@ def train(
     with open(output, "w") as fp:
         json.dump(config, fp, indent=4)
 
-    # Initialize DDP
-    if os.environ.get("LOCAL_RANK") is not None:
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo")
+    # Initialize DDP (only if not initialized by outer launcher)
+    created_process_group = False
+    if os.environ.get("LOCAL_RANK") is not None and not dist.is_initialized():
+        dist_backend = os.environ.get("DP_PT_DIST_BACKEND")
+        if dist_backend is None:
+            if torch.cuda.is_available():
+                world_size = int(os.environ.get("WORLD_SIZE", "1"))
+                if world_size > 1 and torch.cuda.device_count() <= 1:
+                    dist_backend = "cuda:gloo,cpu:gloo"
+                else:
+                    dist_backend = "cuda:nccl,cpu:gloo"
+            else:
+                dist_backend = "gloo"
+        dist.init_process_group(backend=dist_backend)
+        created_process_group = True
 
     trainer = get_trainer(
         config,
@@ -363,7 +395,7 @@ def train(
                     min_nbor_dist[model_item], dtype=torch.float64, device=DEVICE
                 )
     trainer.run()
-    if dist.is_available() and dist.is_initialized():
+    if created_process_group and dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
 

@@ -2,6 +2,7 @@
 from collections.abc import (
     Callable,
 )
+import os
 from typing import (
     Any,
 )
@@ -517,30 +518,13 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             mapping,
             comm_dict=comm_dict,
         )
+        is_gp_mode = (
+            isinstance(repflows_output, dict)
+            and "gp_partitions" in repflows_output
+        )
 
-        if isinstance(repflows_output, dict) and "gp_partitions" in repflows_output:
+        if is_gp_mode:
             # GP 模式：返回字典，直接传递给上层
-            if self.concat_output_tebd:
-                # 需要对每个分区的 node_ebd 进行 concat
-                node_ebd_parts = repflows_output["node_ebd_parts"]
-                node_ebd_inp_parts = []
-                for partition in repflows_output["gp_partitions"]:
-                    local_start = partition["local_start"]
-                    local_end = partition["local_end"]
-                    node_ebd_inp_local = node_ebd_inp[:, local_start:local_end, :]
-                    if node_ebd_parts[0].dim() == 2:
-                        node_ebd_inp_local = node_ebd_inp_local.reshape(
-                            -1, node_ebd_inp_local.shape[-1]
-                        )
-                    node_ebd_inp_parts.append(node_ebd_inp_local)
-
-                # Concat 每个分区
-                node_ebd_parts_concat = [
-                    torch.cat([node_ebd_parts[i], node_ebd_inp_parts[i]], dim=-1)
-                    for i in range(len(node_ebd_parts))
-                ]
-                repflows_output["node_ebd_parts"] = node_ebd_parts_concat
-
             repflows_output["node_ebd_parts"] = [
                 node_part.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
                 for node_part in repflows_output["node_ebd_parts"]
@@ -571,6 +555,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
                 if node_ebd.dim() == 2 and node_ebd_inp.dim() == 3:
                     node_ebd_inp = node_ebd_inp.reshape(-1, node_ebd_inp.shape[-1])
                 node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)
+            
             return (
                 node_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
                 rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)

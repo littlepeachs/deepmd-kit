@@ -51,7 +51,10 @@ LOCAL_RANK = int(0 if LOCAL_RANK is None else LOCAL_RANK)
 if os.environ.get("DEVICE") == "cpu" or torch.cuda.is_available() is False:
     DEVICE = torch.device("cpu")
 else:
-    DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
+    num_visible_devices = max(torch.cuda.device_count(), 1)
+    local_cuda_index = LOCAL_RANK % num_visible_devices
+    DEVICE = torch.device(f"cuda:{local_cuda_index}")
+    torch.cuda.set_device(local_cuda_index)
 
 JIT = False
 CACHE_PER_SYS = 5  # keep at most so many sets per sys in memory

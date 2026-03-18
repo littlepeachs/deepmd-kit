@@ -7,6 +7,7 @@ from collections.abc import (
     Generator,
     Iterable,
 )
+import os
 from copy import (
     deepcopy,
 )
@@ -87,8 +88,72 @@ from torch.utils.data import (
 from deepmd.utils.path import (
     DPH5Path,
 )
+from deepmd.utils.local_distutils import get_repo_distutils
 
 log = logging.getLogger(__name__)
+
+try:
+    gp_distutils = get_repo_distutils()
+except Exception:
+    gp_distutils = None
+
+
+def _get_data_parallel_world_size() -> int:
+    if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
+        try:
+            if gp_distutils.initialized():
+                return gp_distutils.get_data_world_size()
+        except Exception:
+            pass
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def _get_data_parallel_group():
+    if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
+        try:
+            if gp_distutils.initialized() and hasattr(gp_distutils, "get_data_group"):
+                return gp_distutils.get_data_group()
+        except Exception:
+            pass
+    return None
+
+
+def _maybe_sync_graph_parallel_gradients(model: torch.nn.Module) -> None:
+    if gp_distutils is None or not hasattr(gp_distutils, "initialized"):
+        return
+    try:
+        if not gp_distutils.initialized():
+            return
+        if gp_distutils.get_gp_world_size() <= 1:
+            return
+        actual_model = model.module if isinstance(model, DDP) else model
+        gp_distutils.allreduce_gradients(
+            actual_model,
+            dp_group=gp_distutils.get_gp_group(),
+            world_size=gp_distutils.get_gp_world_size(),
+            average=False,
+        )
+    except Exception:
+        return
+
+
+def _maybe_sync_graph_parallel_parameters(model: torch.nn.Module) -> None:
+    if gp_distutils is None or not hasattr(gp_distutils, "initialized"):
+        return
+    try:
+        if not gp_distutils.initialized():
+            return
+        if gp_distutils.get_gp_world_size() <= 1:
+            return
+        gp_distutils.synchronize_parameters(model, group=gp_distutils.get_gp_group())
+    except Exception:
+        return
+
+
+def _unwrap_training_wrapper(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 
 class Trainer:
@@ -654,15 +719,29 @@ class Trainer:
                 data_stat_protect=_data_stat_protect[0],
             )
 
-        if dist.is_available() and dist.is_initialized():
-            torch.cuda.set_device(LOCAL_RANK)
-            # DDP will guarantee the model parameters are identical across all processes
-            self.wrapper = DDP(
-                self.wrapper,
-                device_ids=[LOCAL_RANK],
-                find_unused_parameters=True,
-                output_device=LOCAL_RANK,
-            )
+        data_world_size = _get_data_parallel_world_size()
+        if dist.is_available() and dist.is_initialized() and data_world_size > 1:
+            data_group = _get_data_parallel_group()
+            if DEVICE.type == "cuda":
+                num_visible_devices = max(torch.cuda.device_count(), 1)
+                local_cuda_index = LOCAL_RANK % num_visible_devices
+                torch.cuda.set_device(local_cuda_index)
+                # DDP keeps parameters/gradients synchronized across data-parallel ranks only.
+                self.wrapper = DDP(
+                    self.wrapper,
+                    device_ids=[local_cuda_index],
+                    find_unused_parameters=True,
+                    output_device=local_cuda_index,
+                    process_group=data_group,
+                )
+            else:
+                self.wrapper = DDP(
+                    self.wrapper,
+                    find_unused_parameters=True,
+                    process_group=data_group,
+                )
+        else:
+            _maybe_sync_graph_parallel_parameters(self.wrapper)
 
         # TODO add lr warmups for multitask
         # author: iProzd
@@ -777,7 +856,11 @@ class Trainer:
                 model_pred, loss, more_loss = self.wrapper(
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                 )
+                # if int(os.environ.get("RANK", "0")) == 0:
+                #     print(self.wrapper.model['Default'].atomic_model.fitting_net.filter_layers.networks[0].layers[0].matrix[:6,:6])
                 loss.backward()
+                
+                _maybe_sync_graph_parallel_gradients(self.wrapper)
                 if self.gradient_max_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(
                         self.wrapper.parameters(),
@@ -787,6 +870,9 @@ class Trainer:
                 with torch.device("cpu"):
                     self.optimizer.step()
                 self.scheduler.step()
+                # if int(os.environ.get("RANK", "0")) == 0:
+                #     print(self.wrapper.model['Default'].atomic_model.fitting_net.filter_layers.networks[0].layers[0].matrix[:6,:6])
+                
             elif self.opt_type == "LKF":
                 if isinstance(self.loss, EnergyStdLoss):
                     KFOptWrapper = KFOptimizerWrapper(
@@ -1095,12 +1181,6 @@ class Trainer:
             ) and (self.rank == 0 or dist.get_rank() == 0):
                 # Handle the case if rank 0 aborted and re-assigned
                 self.latest_model = Path(self.save_ckpt + f"-{display_step_id}.pt")
-
-                module = (
-                    self.wrapper.module
-                    if dist.is_available() and dist.is_initialized()
-                    else self.wrapper
-                )
                 self.save_model(self.latest_model, lr=cur_lr, step=_step_id)
                 log.info(f"Saved model to {self.latest_model}")
                 symlink_prefix_files(self.latest_model.stem, self.save_ckpt)
@@ -1208,16 +1288,13 @@ class Trainer:
                 )
 
     def save_model(self, save_path: str, lr: float = 0.0, step: int = 0) -> None:
-        module = (
-            self.wrapper.module
-            if dist.is_available() and dist.is_initialized()
-            else self.wrapper
-        )
+        module = _unwrap_training_wrapper(self.wrapper)
         module.train_infos["lr"] = float(lr)
         module.train_infos["step"] = step
         optim_state_dict = deepcopy(self.optimizer.state_dict())
         for item in optim_state_dict["param_groups"]:
             item["lr"] = float(item["lr"])
+            
         torch.save(
             {"model": module.state_dict(), "optimizer": optim_state_dict},
             save_path,
