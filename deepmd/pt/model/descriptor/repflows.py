@@ -2,6 +2,7 @@
 from collections.abc import (
     Callable,
 )
+import logging
 import pickle
 from typing import (
     Any,
@@ -59,6 +60,9 @@ from .repflows_layer_dynamic import (
 )
 
 import graph_parallel
+
+log = logging.getLogger(__name__)
+_GP_PARTITION_DEBUG_PRINTED: set[tuple[int, int, int]] = set()
 
 if not hasattr(torch.ops.deepmd, "border_op"):
 
@@ -824,6 +828,25 @@ class DescrptBlockRepflows(DescriptorBlock):
                     'angle_mask': angle_mask,
                     'angle_index': local_angle_index,
                 })
+
+            if os.environ.get("DP_DEBUG_2X2", "0") == "1" and distributed_gp:
+                gp_rank = graph_parallel.get_gp_rank()
+                partition = gp_partitions[gp_rank]
+                debug_key = (int(os.environ.get("RANK", "0")), gp_num_nodes, partition['local_size'])
+                if debug_key not in _GP_PARTITION_DEBUG_PRINTED:
+                    log.info(
+                        "2x2-gp-partition rank=%s gp_rank=%s/%s gp_num_nodes=%s local_start=%s local_end=%s local_size=%s edge_count=%s angle_count=%s",
+                        os.environ.get("RANK", "0"),
+                        gp_rank,
+                        gp_world_size,
+                        gp_num_nodes,
+                        partition['local_start'],
+                        partition['local_end'],
+                        partition['local_size'],
+                        int(partition['edge_mask'].sum().item()),
+                        int(partition['angle_mask'].sum().item()),
+                    )
+                    _GP_PARTITION_DEBUG_PRINTED.add(debug_key)
 
 
         for idx, ll in enumerate(self.layers):

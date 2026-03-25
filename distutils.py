@@ -75,6 +75,29 @@ def divide_and_check_no_remainder(a: int, b: int) -> int:
     return a // b
 
 
+def _manual_mesh_group(mesh, vary_dim_names: tuple[str, ...]):
+    if not dist.is_initialized():
+        return None
+    mesh_tensor = mesh.mesh
+    dim_names = tuple(mesh.mesh_dim_names)
+    vary_dims = tuple(dim_names.index(name) for name in vary_dim_names)
+    fixed_dims = tuple(idx for idx in range(len(dim_names)) if idx not in vary_dims)
+    current_rank = dist.get_rank()
+    selected_group = None
+    fixed_ranges = [range(mesh_tensor.shape[idx]) for idx in fixed_dims]
+
+    for fixed_coords in np.ndindex(*[len(rng) for rng in fixed_ranges] or [1]):
+        selector = [slice(None)] * mesh_tensor.ndim
+        for dim_idx, coord_idx in enumerate(fixed_coords):
+            selector[fixed_dims[dim_idx]] = coord_idx
+        ranks = mesh_tensor[tuple(selector)].reshape(-1).tolist()
+        group = dist.new_group(ranks=ranks)
+        if current_rank in ranks:
+            selected_group = group
+
+    return selected_group
+
+
 def setup_dist_group(
     pp_size: int = 1,
     dp_size: int = 1,
@@ -187,17 +210,16 @@ def setup_dist_group(
             _DP_GP_EP_GROUP = mesh.get_group(mesh_dim="dp_ep_gp")
             _DATA_GROUP = mesh.get_group(mesh_dim="dp_ep")
         except KeyError:
+            # PyTorch 2.3 的 DeviceMesh 不支持 tuple flatten 命名索引时，
+            # 手动按 mesh 维度构造需要的复合 group。
             if dp_size == 1 and ep_size == 1:
-                # PyTorch 2.3 的 DeviceMesh 不支持 tuple flatten 命名索引时，
-                # pure-GP 场景直接退化为：
-                # - DP×GP group == GP group
-                # - DP×EP×GP group == GP group
-                # - Data group == DP group (size 1)
                 _DP_GP_GROUP = _GP_GROUP
                 _DP_GP_EP_GROUP = _GP_GROUP
                 _DATA_GROUP = _DP_GROUP
             else:
-                raise
+                _DP_GP_GROUP = _manual_mesh_group(mesh, ("dp", "gp"))
+                _DP_GP_EP_GROUP = _manual_mesh_group(mesh, ("dp", "ep", "gp"))
+                _DATA_GROUP = _manual_mesh_group(mesh, ("dp", "ep"))
 
     # 日志
     setup_logging()
@@ -208,6 +230,15 @@ def setup_dist_group(
             tuple(mesh.mesh.shape) if getattr(mesh, "mesh", None) is not None else None,
         )
     logging.info(f"Rank {rank} successfully initialized process groups via DeviceMesh.")
+
+
+def _safe_group_info(group):
+    if group is None or not dist.is_initialized():
+        return -1, []
+    try:
+        return dist.get_world_size(group=group), dist.get_process_group_ranks(group)
+    except Exception:
+        return -1, []
 
 
 def setup(
@@ -289,15 +320,38 @@ def setup(
         logging.info(
             f"Rank {global_rank} successfully initialized process groups via DeviceMesh."
         )
-        def _group_info(group):
-            if group is None:
-                return -1, []
-            return dist.get_world_size(group=group), dist.get_process_group_ranks(group)
+        pp_ws, pp_ranks = _safe_group_info(_PP_GROUP)
+        ep_ws, ep_ranks = _safe_group_info(_EP_GROUP)
+        gp_ws, gp_ranks = _safe_group_info(_GP_GROUP)
+        dp_ws, dp_ranks = _safe_group_info(_DP_GROUP)
+        data_ws, data_ranks = _safe_group_info(_DATA_GROUP)
+        dpgp_ws, dpgp_ranks = _safe_group_info(_DP_GP_GROUP)
 
-        pp_ws, pp_ranks = _group_info(_PP_GROUP)
-        ep_ws, ep_ranks = _group_info(_EP_GROUP)
-        gp_ws, gp_ranks = _group_info(_GP_GROUP)
-        dpgp_ws, dpgp_ranks = _group_info(_DP_GP_GROUP)
+        if os.environ.get("DP_DEBUG_2X2", "0") == "1":
+            logging.info(
+                "Rank %d topology summary -> global=%d/%d data=%d/%d gp=%d/%d pp=%d/%d ep=%d/%d",
+                global_rank,
+                global_rank,
+                dist.get_world_size(),
+                get_data_rank(),
+                get_data_world_size(),
+                get_gp_rank(),
+                get_gp_world_size(),
+                get_pp_rank(),
+                get_pp_world_size(),
+                get_ep_rank(),
+                get_ep_world_size(),
+            )
+            logging.info(
+                "Rank %d group members -> DP=%s DATA=%s GP=%s PP=%s EP=%s DPxGP=%s",
+                global_rank,
+                dp_ranks,
+                data_ranks,
+                gp_ranks,
+                pp_ranks,
+                ep_ranks,
+                dpgp_ranks,
+            )
 
         # if has_fsdp:
         #     dp_replica_ws, dp_replica_ranks = _group_info(_DP_REPLICA_GROUP)

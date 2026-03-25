@@ -189,32 +189,30 @@
         "stat_file": "./MP_traj_esen.hdf5",
         "training_data": {
          "systems": [
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/100",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/101",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/102",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/103",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/104",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/105",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/106",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/107",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/108",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/109"
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/101",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/102",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/103",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/104",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/105",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/106",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/107",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/108",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/109"
          ],
          "batch_size": "auto:128",
          "_comment": "that's all"
         },
         "validation_data": {
          "systems": [
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/100",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/101",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/102",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/103",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/104",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/105",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/106",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/107",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/108",
-          "/mnt/data_nas/mptraj_clean_0301/mptraj_energy_0.05/split_clean-mix/first/109"
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/101",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/102",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/103",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/104",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/105",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/106",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/107",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/108",
+          "/aisi-nas/liwentao/deepmd-kit-arch/mptraj_data/109"
          ],
          "batch_size": 1,
          "_comment": "that's all"

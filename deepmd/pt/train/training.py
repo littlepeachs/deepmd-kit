@@ -98,6 +98,32 @@ except Exception:
     gp_distutils = None
 
 
+def _debug_2x2_enabled() -> bool:
+    return os.environ.get("DP_DEBUG_2X2", "0") == "1"
+
+
+def _get_data_parallel_rank() -> int:
+    if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
+        try:
+            if gp_distutils.initialized():
+                return gp_distutils.get_data_rank()
+        except Exception:
+            pass
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _get_graph_parallel_rank() -> int:
+    if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
+        try:
+            if gp_distutils.initialized():
+                return gp_distutils.get_gp_rank()
+        except Exception:
+            pass
+    return 0
+
+
 def _get_data_parallel_world_size() -> int:
     if gp_distutils is not None and hasattr(gp_distutils, "initialized"):
         try:
@@ -203,6 +229,7 @@ class Trainer:
             else 1
         )
         self.num_model = len(self.model_keys)
+        self._logged_2x2_batch = False
 
         # Iteration config
         self.num_steps = training_params["numb_steps"]
@@ -843,6 +870,25 @@ class Trainer:
             input_dict, label_dict, log_dict = self.get_data(
                 is_train=True, task_key=task_key
             )
+            if _debug_2x2_enabled() and not self._logged_2x2_batch:
+                coord = input_dict.get("coord")
+                coord_shape = tuple(coord.shape) if coord is not None else None
+                nframes = int(coord_shape[0]) if coord_shape is not None else -1
+                nloc = int(coord_shape[1]) if coord_shape is not None and len(coord_shape) > 1 else -1
+                log.info(
+                    "2x2-batch rank=%d data_rank=%d/%d gp_rank=%d/%d sid=%s fid=%s coord_shape=%s nframes=%d nloc=%d",
+                    self.rank,
+                    _get_data_parallel_rank(),
+                    _get_data_parallel_world_size(),
+                    _get_graph_parallel_rank(),
+                    gp_distutils.get_gp_world_size() if gp_distutils is not None and hasattr(gp_distutils, "initialized") and gp_distutils.initialized() else 1,
+                    log_dict.get("sid"),
+                    log_dict.get("fid"),
+                    coord_shape,
+                    nframes,
+                    nloc,
+                )
+                self._logged_2x2_batch = True
             if SAMPLER_RECORD:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
