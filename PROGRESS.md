@@ -6,20 +6,23 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 - Date: 2026-05-18
 - Current phase: Phase A
-- Current step: Step 3 (`MoESO2ExpertCollection`)
-- Overall status: Steps 1-3 implementations exist and matching tests pass; Steps 4-10 are not implemented.
+- Current step: Step 4 (`MoESO2Convolution`)
+- Overall status: Steps 1-4 implementations exist and matching tests pass; Steps 5-10 are not implemented.
 
 ## Implemented Files
 
 - `deepmd/pt/model/descriptor/sezm_nn/moe/a2a_ops.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/router.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/experts.py`
+- `deepmd/pt/model/descriptor/sezm_nn/moe/conv.py`
 - `deepmd/pt/model/descriptor/sezm_nn/so2_math.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/__init__.py`
 - `source/tests/pt/test_sezm_moe_a2a.py`
 - `source/tests/pt/test_sezm_moe_a2a_multigpu.py`
 - `source/tests/pt/test_sezm_moe_router.py`
 - `source/tests/pt/test_sezm_moe_experts.py`
+- `source/tests/pt/test_sezm_moe_conv.py`
+- `source/tests/pt/test_sezm_moe_conv_multigpu.py`
 
 ## Validation
 
@@ -55,6 +58,24 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
   - MoE `_ExpertSO2LinearLayer` delegates one-expert and shared-batched SO(2) block math to the same helper
   - `pytest source/tests/pt/model/test_sezm_model.py::TestLoRASO2Adapter -xvs`: 2 tests passed
   - `pytest source/tests/pt/model/test_sezm_model.py::TestSeZMModelCompile::test_forward_backward_double_backward_matches_compile -xvs`: 1 test passed
+- Single-process Step 4 conv tests (milestone B): PASS
+  - Command used: `pytest source/tests/pt/test_sezm_moe_conv.py -xvs`
+  - Result: 11 tests passed, 2 deprecation warnings from `torch.jit.script`
+  - Scope: single-GPU `ep_group=None`.
+- Step 4 multi-GPU path implementation (milestone C): PASS
+  - `_forward_multi_gpu` implemented with sender-side stable sort by global expert id, differentiable token/radial A2A, non-differentiable long expert-id A2A, O(N) receiver gather, expert compute, ungather, reversed-split combine, and sender unsort.
+  - Command used: `pytest source/tests/pt/test_sezm_moe_conv.py -xvs`
+  - Result: 16 tests passed, including 5 single-process `_build_expert_gather_idx` tests.
+  - Multi-GPU torchrun tests are intentionally deferred to milestone D.
+- Step 4 conv ruff check: PASS
+  - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/moe/conv.py source/tests/pt/test_sezm_moe_conv.py`
+- Multi-process Step 4 conv tests (milestone D): PASS
+  - 4 GPU command shape: `torchrun --nproc_per_node=4 ... source/tests/pt/test_sezm_moe_conv_multigpu.py`
+  - 4 GPU result: T_D1-T_D4 passed; T_D5 skipped; `T_D4 max_diff=0.00000000000000000e+00`
+  - 8 GPU command shape: `torchrun --nproc_per_node=8 ... source/tests/pt/test_sezm_moe_conv_multigpu.py`
+  - 8 GPU result: T_D5 passed; T_D1-T_D4 skipped
+- Step 4 final ruff check: PASS
+  - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/moe/conv.py source/tests/pt/test_sezm_moe_conv.py source/tests/pt/test_sezm_moe_conv_multigpu.py`
 - DPA3 reference subagent smoke test: PASS
   - Cursor `dpa3-ref-searcher` can read `deepmd-kit-moe` reference files.
 - Implementer subagent smoke test: PASS
@@ -74,7 +95,6 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Not Started
 
-- Step 4: `MoESO2Convolution`
 - Step 5: `SO2Convolution` MoE branch and validation
 - Step 6: EP/DP groups and gradient sync
 - Step 7: `SeZMInteractionBlock` integration
@@ -85,5 +105,5 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Next Recommended Actions
 
-1. Proceed to Step 4 (`MoESO2Convolution`) with `sezm-moe-implementer`.
+1. Proceed to Step 5 (`SO2Convolution` MoE branch) with `sezm-moe-implementer`.
 1. Keep updating this file after each Step's tests and ruff checks.
