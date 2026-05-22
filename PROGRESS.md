@@ -7,7 +7,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - Date: 2026-05-18
 - Current phase: Phase A
 - Current step: Step 4 (`MoESO2Convolution`)
-- Overall status: Steps 1-5 implementations exist and matching tests pass; Steps 6-10 are not implemented.
+- Overall status: Steps 1-6 implementations exist and matching tests pass; Steps 7-10 are not implemented.
 
 ## Implemented Files
 
@@ -17,6 +17,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `deepmd/pt/model/descriptor/sezm_nn/moe/conv.py`
 - `deepmd/pt/model/descriptor/sezm_nn/so2_math.py`
 - `deepmd/pt/model/descriptor/sezm_nn/so2.py`
+- `deepmd/pt/utils/sezm_moe_ep_dp.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/__init__.py`
 - `source/tests/pt/test_sezm_moe_a2a.py`
 - `source/tests/pt/test_sezm_moe_a2a_multigpu.py`
@@ -25,6 +26,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `source/tests/pt/test_sezm_moe_conv.py`
 - `source/tests/pt/test_sezm_moe_conv_multigpu.py`
 - `source/tests/pt/test_sezm_so2_moe.py`
+- `source/tests/pt/test_sezm_moe_ep_dp_multigpu.py`
 
 ## Validation
 
@@ -87,6 +89,18 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
   - Result: 1 test passed
 - Step 5 ruff check: PASS
   - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/so2.py source/tests/pt/test_sezm_so2_moe.py`
+- Step 6 single-process sanity: PASS
+  - `_is_routing_expert_param` returns True for `.routing_matrix` / `.routing_bias`, False for `.shared_matrix` and router/non-MoE params.
+  - `init_ep_dp_groups(ep_size=4)` without distributed init returns `(None, None, 0, 1, 0, 1)`.
+- Multi-process Step 6 EP/DP gradient sync tests: PASS
+  - 4 GPU command shape: `torchrun --nproc_per_node=4 ... source/tests/pt/test_sezm_moe_ep_dp_multigpu.py`
+  - 4 GPU result: T1-T4 passed; T5 skipped.
+  - T2 magnitude: `routing_matrix_grad=2.00000000000000000e+00 expected=2.00000000000000000e+00`
+  - T4 pure EP magnitude: `routing_matrix_grad=5.00000000000000000e-01 expected=5.00000000000000000e-01`
+  - 8 GPU command shape: `torchrun --nproc_per_node=8 ... source/tests/pt/test_sezm_moe_ep_dp_multigpu.py`
+  - 8 GPU result: T5 passed; T1-T4 skipped.
+- Step 6 ruff check: PASS
+  - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/utils/sezm_moe_ep_dp.py source/tests/pt/test_sezm_moe_ep_dp_multigpu.py`
 - DPA3 reference subagent smoke test: PASS
   - Cursor `dpa3-ref-searcher` can read `deepmd-kit-moe` reference files.
 - Implementer subagent smoke test: PASS
@@ -106,7 +120,6 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Not Started
 
-- Step 6: EP/DP groups and gradient sync
 - Step 7: `SeZMInteractionBlock` integration
 - Step 8: `DescrptSeZM` top-level config
 - Step 9: training loop gradient sync
@@ -115,5 +128,5 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Next Recommended Actions
 
-1. Proceed to Step 6 (`init_ep_dp_groups` + `sync_moe_gradients`) with `sezm-moe-implementer`.
+1. Proceed to Step 7 (`SeZMInteractionBlock` integration) with `sezm-moe-implementer`.
 1. Keep updating this file after each Step's tests and ruff checks.
