@@ -210,6 +210,9 @@ class SeZMInteractionBlock(nn.Module):
         dtype: torch.dtype,
         seed: int | list[int] | None,
         trainable: bool,
+        use_moe: bool = False,
+        moe_config: dict[str, Any] | None = None,
+        use_compile: bool = False,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -329,6 +332,9 @@ class SeZMInteractionBlock(nn.Module):
             dtype=dtype,
             seed=seed_so2_conv,
             trainable=trainable,
+            use_moe=use_moe,
+            moe_config=moe_config,
+            use_compile=use_compile,
         )
 
         # === Step 2. FFN subblock sequence ===
@@ -469,6 +475,8 @@ class SeZMInteractionBlock(nn.Module):
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
         unit_history: list[torch.Tensor] | None = None,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -502,7 +510,14 @@ class SeZMInteractionBlock(nn.Module):
             - full AttnRes path returns `(block_output, None, so2_unit_output, ffn_unit_outputs)`
             - block AttnRes path returns `(block_output, block_summary, None, None)`
         """
-        return self._forward_impl(x, edge_cache, radial_feat, unit_history)
+        return self._forward_impl(
+            x,
+            edge_cache,
+            radial_feat,
+            unit_history,
+            type_embedding,
+            ep_group,
+        )
 
     def _extract_l0_from_canonical(self, value: torch.Tensor) -> torch.Tensor:
         """
@@ -525,6 +540,8 @@ class SeZMInteractionBlock(nn.Module):
         x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> torch.Tensor:
         """
         Run the SO(2) unit without an outer block-level residual shortcut.
@@ -548,7 +565,11 @@ class SeZMInteractionBlock(nn.Module):
         channels = self.channels
         x_pre = self.pre_so2_norm(x)
         so2_unit_output = self.so2_conv(
-            x_pre.reshape(n_node, ebed_dim, channels), edge_cache, radial_feat
+            x_pre.reshape(n_node, ebed_dim, channels),
+            edge_cache,
+            radial_feat,
+            type_embedding=type_embedding,
+            ep_group=ep_group,
         )
         return self.post_so2_norm(so2_unit_output.unsqueeze(2))
 
@@ -585,6 +606,8 @@ class SeZMInteractionBlock(nn.Module):
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
         unit_history: list[torch.Tensor] | None = None,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -611,7 +634,13 @@ class SeZMInteractionBlock(nn.Module):
             Tuple `(block_output, None, None, None)`.
         """
         with nvtx_range("so2_conv"):
-            so2_unit_output = self._run_so2_unit(x, edge_cache, radial_feat)
+            so2_unit_output = self._run_so2_unit(
+                x,
+                edge_cache,
+                radial_feat,
+                type_embedding,
+                ep_group,
+            )
             so2_state = x + so2_unit_output
 
         with nvtx_range("ffn"):
@@ -629,6 +658,8 @@ class SeZMInteractionBlock(nn.Module):
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
         unit_history: list[torch.Tensor] | None = None,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -662,7 +693,13 @@ class SeZMInteractionBlock(nn.Module):
                     scalar_extractor=self._extract_l0_from_canonical,
                     current_x=x,
                 )
-            so2_unit_output = self._run_so2_unit(so2_input, edge_cache, radial_feat)
+            so2_unit_output = self._run_so2_unit(
+                so2_input,
+                edge_cache,
+                radial_feat,
+                type_embedding,
+                ep_group,
+            )
 
         with nvtx_range("ffn"):
             completed_units = [*unit_history, so2_unit_output]
@@ -689,6 +726,8 @@ class SeZMInteractionBlock(nn.Module):
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
         unit_history: list[torch.Tensor] | None = None,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -722,7 +761,13 @@ class SeZMInteractionBlock(nn.Module):
                     scalar_extractor=self._extract_l0_from_canonical,
                     current_x=x,
                 )
-            so2_unit_output = self._run_so2_unit(so2_input, edge_cache, radial_feat)
+            so2_unit_output = self._run_so2_unit(
+                so2_input,
+                edge_cache,
+                radial_feat,
+                type_embedding,
+                ep_group,
+            )
 
         with nvtx_range("ffn"):
             partial_block = so2_unit_output
