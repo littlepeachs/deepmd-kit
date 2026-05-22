@@ -53,6 +53,9 @@ from .indexing import (
     project_D_to_m,
     project_Dt_from_m,
 )
+from .moe.conv import (
+    MoESO2Convolution,
+)
 from .norm import (
     ReducedEquivariantRMSNorm,
     ScalarRMSNorm,
@@ -511,6 +514,9 @@ class SO2Convolution(nn.Module):
         dtype: torch.dtype,
         seed: int | list[int] | None,
         trainable: bool,
+        use_moe: bool = False,
+        moe_config: dict[str, Any] | None = None,
+        use_compile: bool = False,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -618,6 +624,7 @@ class SO2Convolution(nn.Module):
         seed_gate = child_seed(seed, 4)
         seed_depth_attn = child_seed(seed, 5)
         seed_radial_hidden = child_seed(seed, 6)
+        seed_moe = child_seed(seed, 7)
 
         # === Step 3. Multiple SO2Linear layers ===
         self.so2_linears = nn.ModuleList(
@@ -911,6 +918,79 @@ class SO2Convolution(nn.Module):
                 trainable=trainable,
             )
 
+        # === Step 8.5. Optional SeZM MoE inner SO(2) stack replacement ===
+        self.use_moe = bool(use_moe)
+        self.moe_conv: MoESO2Convolution | None = None
+        if self.use_moe:
+            if self.so2_norm:
+                raise ValueError("use_moe=True requires so2_norm=False, got True")
+            if self.use_so2_attn_res:
+                raise ValueError(
+                    "use_moe=True requires so2_attn_res='none', got "
+                    f"{self.so2_attn_res_mode!r}"
+                )
+            if bool(use_compile):
+                raise ValueError("use_moe=True requires use_compile=False")
+            if moe_config is None:
+                raise ValueError("use_moe=True requires moe_config")
+            required_keys = (
+                "n_routing_experts",
+                "topk",
+                "n_shared_experts",
+                "ep_size",
+                "routing_input",
+                "type_embedding_dim",
+            )
+            missing = [key for key in required_keys if key not in moe_config]
+            if missing:
+                raise ValueError(f"moe_config missing required keys: {missing}")
+
+            n_routing_experts = int(moe_config["n_routing_experts"])
+            topk = int(moe_config["topk"])
+            n_shared_experts = int(moe_config["n_shared_experts"])
+            ep_size = int(moe_config["ep_size"])
+            routing_input = str(moe_config["routing_input"])
+            type_embedding_dim = int(moe_config["type_embedding_dim"])
+            if type_embedding_dim <= 0:
+                raise ValueError("use_moe=True requires type_embedding_dim > 0")
+            if self.n_focus != topk + n_shared_experts:
+                raise ValueError(
+                    "use_moe requires n_focus == topk + n_shared_experts, got "
+                    f"n_focus={self.n_focus}, topk={topk}, "
+                    f"n_shared_experts={n_shared_experts}"
+                )
+            if routing_input == "src+dst":
+                routing_key_dim = 2 * type_embedding_dim
+            elif routing_input in {"dst", "src"}:
+                routing_key_dim = type_embedding_dim
+            else:
+                raise ValueError(
+                    f"routing_input must be dst/src/src+dst, got {routing_input!r}"
+                )
+
+            self.routing_input = routing_input
+            self.moe_conv = MoESO2Convolution(
+                lmax=self.lmax,
+                mmax=self.mmax,
+                focus_dim=self.so2_focus_dim,
+                n_routing_experts=n_routing_experts,
+                topk=topk,
+                n_shared_experts=n_shared_experts,
+                ep_size=ep_size,
+                routing_input=routing_input,
+                routing_key_dim=routing_key_dim,
+                so2_layers=int(moe_config.get("so2_layers", self.so2_layers)),
+                activation_function=str(
+                    moe_config.get("activation_function", self.activation_function)
+                ),
+                mlp_bias=self.mlp_bias,
+                use_layer_scale=bool(
+                    moe_config.get("use_layer_scale", self.layer_scale)
+                ),
+                precision=self.precision,
+                seed=seed_moe,
+            )
+
         # === Step 9. Pre-focus channel mixing ===
         # This projects the full channel width before the SO(2) focus split.
         self.pre_focus_mix = SO3Linear(
@@ -942,6 +1022,8 @@ class SO2Convolution(nn.Module):
         x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -1010,99 +1092,135 @@ class SO2Convolution(nn.Module):
             if self.focus_compete and self.n_focus > 1:
                 focus_gate_src = x_local[:, :, 0, :]
 
-        # === Step 5. Multi-layer SO(2) mixing (pre-norm + residual) ===
-        with nvtx_range("SO2Conv/so2_layers"):
+        if not self.use_moe:
+            # === Step 5. Multi-layer SO(2) mixing (pre-norm + residual) ===
+            with nvtx_range("SO2Conv/so2_layers"):
 
-            def so2_l0_extractor(v: torch.Tensor) -> torch.Tensor:
-                """Extract scalar features from SO(2) reduced layout."""
-                return v[:, :, 0, :].reshape(v.shape[0], self.hidden_channels)
+                def so2_l0_extractor(v: torch.Tensor) -> torch.Tensor:
+                    """Extract scalar features from SO(2) reduced layout."""
+                    return v[:, :, 0, :].reshape(v.shape[0], self.hidden_channels)
 
-            def apply_bias_correction(
-                x_local: torch.Tensor,
-                so2_linear: SO2Linear,
-                layer_idx: int,
-            ) -> None:
-                if layer_idx != 0 or so2_linear.bias0 is None:
-                    return
-                bias0 = so2_linear.bias0.view(
-                    self.n_focus, so2_linear.out_channels
-                ).unsqueeze(0)
-                if so2_linear.out_channels == self.so2_focus_dim:
-                    radial_factor = rad_feat_l0_focus
-                elif so2_linear.out_channels == 2 * self.so2_focus_dim:
-                    radial_factor = torch.cat(
-                        [rad_feat_l0_focus, rad_feat_l0_focus], dim=-1
-                    )
-                else:
-                    raise RuntimeError(
-                        "Unexpected SO2Linear output width in bias correction"
-                    )
-                bias_correction = bias0 * (
-                    radial_factor * edge_cache.edge_env.reshape(-1, 1, 1) - 1.0
-                )
-                x_local[:, :, 0, :].add_(bias_correction)
-
-            if self.use_so2_attn_res:
-                so2_depth_sources = [x_local]
-                for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
-                    zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
-                ):
-                    x_local: torch.Tensor = self.so2_layer_attn_res[layer_idx](
-                        sources=so2_depth_sources,
-                        scalar_extractor=so2_l0_extractor,
-                        current_x=x_local,
-                    )
-                    residual = x_local
-                    x_local = inter_norm(x_local)
-                    x_local = so2_linear(x_local)
-                    apply_bias_correction(x_local, so2_linear, layer_idx)
-
-                    x_local = non_linear(x_local)
-
-                    if self.layer_scale:
-                        scale: torch.Tensor = self.adam_so2_layer_scales[
-                            layer_idx
-                        ].reshape(1, self.n_focus, 1, self.so2_focus_dim)
-                        x_local = residual + scale * x_local
-                    else:
-                        x_local = residual + x_local
-                    so2_depth_sources.append(x_local - residual)
-            else:
-                for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
-                    zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
-                ):
-                    residual = x_local
-                    x_local = inter_norm(x_local)
-                    x_local = so2_linear(x_local)
-                    apply_bias_correction(x_local, so2_linear, layer_idx)
-
-                    x_local = non_linear(x_local)
-
-                    if self.layer_scale:
-                        scale = self.adam_so2_layer_scales[layer_idx].reshape(
-                            1, self.n_focus, 1, self.so2_focus_dim
+                def apply_bias_correction(
+                    x_local: torch.Tensor,
+                    so2_linear: SO2Linear,
+                    layer_idx: int,
+                ) -> None:
+                    if layer_idx != 0 or so2_linear.bias0 is None:
+                        return
+                    bias0 = so2_linear.bias0.view(
+                        self.n_focus, so2_linear.out_channels
+                    ).unsqueeze(0)
+                    if so2_linear.out_channels == self.so2_focus_dim:
+                        radial_factor = rad_feat_l0_focus
+                    elif so2_linear.out_channels == 2 * self.so2_focus_dim:
+                        radial_factor = torch.cat(
+                            [rad_feat_l0_focus, rad_feat_l0_focus], dim=-1
                         )
-                        x_local = residual + scale * x_local
                     else:
-                        x_local = residual + x_local
+                        raise RuntimeError(
+                            "Unexpected SO2Linear output width in bias correction"
+                        )
+                    bias_correction = bias0 * (
+                        radial_factor * edge_cache.edge_env.reshape(-1, 1, 1) - 1.0
+                    )
+                    x_local[:, :, 0, :].add_(bias_correction)
 
-        # === Step 6. Cross-focus softmax competition ===
-        if self.focus_compete and self.n_focus > 1:
-            focus_gate_src = focus_gate_src.to(dtype=self.compute_dtype)
-            focus_logits = torch.einsum(
-                "efi,if->ef",
-                self.focus_compete_norm(focus_gate_src),
-                self.adamw_focus_compete_w,
-            )
+                if self.use_so2_attn_res:
+                    so2_depth_sources = [x_local]
+                    for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
+                        zip(
+                            self.so2_linears,
+                            self.so2_inter_norms,
+                            self.non_linearities,
+                        )
+                    ):
+                        x_local: torch.Tensor = self.so2_layer_attn_res[layer_idx](
+                            sources=so2_depth_sources,
+                            scalar_extractor=so2_l0_extractor,
+                            current_x=x_local,
+                        )
+                        residual = x_local
+                        x_local = inter_norm(x_local)
+                        x_local = so2_linear(x_local)
+                        apply_bias_correction(x_local, so2_linear, layer_idx)
+
+                        x_local = non_linear(x_local)
+
+                        if self.layer_scale:
+                            scale: torch.Tensor = self.adam_so2_layer_scales[
+                                layer_idx
+                            ].reshape(1, self.n_focus, 1, self.so2_focus_dim)
+                            x_local = residual + scale * x_local
+                        else:
+                            x_local = residual + x_local
+                        so2_depth_sources.append(x_local - residual)
+                else:
+                    for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
+                        zip(
+                            self.so2_linears,
+                            self.so2_inter_norms,
+                            self.non_linearities,
+                        )
+                    ):
+                        residual = x_local
+                        x_local = inter_norm(x_local)
+                        x_local = so2_linear(x_local)
+                        apply_bias_correction(x_local, so2_linear, layer_idx)
+
+                        x_local = non_linear(x_local)
+
+                        if self.layer_scale:
+                            scale = self.adam_so2_layer_scales[layer_idx].reshape(
+                                1, self.n_focus, 1, self.so2_focus_dim
+                            )
+                            x_local = residual + scale * x_local
+                        else:
+                            x_local = residual + x_local
+
+            # === Step 6. Cross-focus softmax competition ===
+            if self.focus_compete and self.n_focus > 1:
+                focus_gate_src = focus_gate_src.to(dtype=self.compute_dtype)
+                focus_logits = torch.einsum(
+                    "efi,if->ef",
+                    self.focus_compete_norm(focus_gate_src),
+                    self.adamw_focus_compete_w,
+                )
+                if self.mlp_bias:
+                    focus_logits = focus_logits + self.focus_compete_bias.unsqueeze(0)
+                alpha = torch.softmax(focus_logits / self.focus_softmax_tau, dim=1).to(
+                    dtype=x_local.dtype
+                )
+                alpha = alpha * (1.0 - self.focus_label_smoothing) + (
+                    self.focus_label_smoothing / float(self.n_focus)
+                )
+                x_local = x_local * alpha.unsqueeze(-1).unsqueeze(-1)
+        else:
+            if type_embedding is None:
+                raise ValueError("use_moe=True requires type_embedding in forward")
+            if self.routing_input == "dst":
+                routing_key = type_embedding.index_select(0, dst)
+            elif self.routing_input == "src":
+                routing_key = type_embedding.index_select(0, src)
+            else:
+                routing_key = torch.cat(
+                    [
+                        type_embedding.index_select(0, src),
+                        type_embedding.index_select(0, dst),
+                    ],
+                    dim=-1,
+                )
             if self.mlp_bias:
-                focus_logits = focus_logits + self.focus_compete_bias.unsqueeze(0)
-            alpha = torch.softmax(focus_logits / self.focus_softmax_tau, dim=1).to(
-                dtype=x_local.dtype
+                rad_factor = (
+                    rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1) - 1.0
+                )
+            else:
+                rad_factor = None
+            x_local = self.moe_conv(
+                x_local,
+                routing_key,
+                rad_factor=rad_factor,
+                ep_group=ep_group,
             )
-            alpha = alpha * (1.0 - self.focus_label_smoothing) + (
-                self.focus_label_smoothing / float(self.n_focus)
-            )
-            x_local = x_local * alpha.unsqueeze(-1).unsqueeze(-1)
 
         # Restore reduced global layout for inverse rotation
         x_local = x_local.transpose(1, 2).contiguous()  # (E, D_m, F, Cf)

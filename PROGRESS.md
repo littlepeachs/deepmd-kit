@@ -7,7 +7,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - Date: 2026-05-18
 - Current phase: Phase A
 - Current step: Step 4 (`MoESO2Convolution`)
-- Overall status: Steps 1-4 implementations exist and matching tests pass; Steps 5-10 are not implemented.
+- Overall status: Steps 1-5 implementations exist and matching tests pass; Steps 6-10 are not implemented.
 
 ## Implemented Files
 
@@ -16,6 +16,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `deepmd/pt/model/descriptor/sezm_nn/moe/experts.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/conv.py`
 - `deepmd/pt/model/descriptor/sezm_nn/so2_math.py`
+- `deepmd/pt/model/descriptor/sezm_nn/so2.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/__init__.py`
 - `source/tests/pt/test_sezm_moe_a2a.py`
 - `source/tests/pt/test_sezm_moe_a2a_multigpu.py`
@@ -23,6 +24,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `source/tests/pt/test_sezm_moe_experts.py`
 - `source/tests/pt/test_sezm_moe_conv.py`
 - `source/tests/pt/test_sezm_moe_conv_multigpu.py`
+- `source/tests/pt/test_sezm_so2_moe.py`
 
 ## Validation
 
@@ -76,6 +78,15 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
   - 8 GPU result: T_D5 passed; T_D1-T_D4 skipped
 - Step 4 final ruff check: PASS
   - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/moe/conv.py source/tests/pt/test_sezm_moe_conv.py source/tests/pt/test_sezm_moe_conv_multigpu.py`
+- Single-process Step 5 SO2Convolution MoE integration tests: PASS
+  - Command used: `pytest source/tests/pt/test_sezm_so2_moe.py -xvs`
+  - Result: 10 pytest cases passed, including `use_moe=False` bit-exact regression, MoE config validation, routing input variants, backward, second backward, and `mlp_bias=True` smoke.
+  - `use_moe=False` default path remains bit-exact against explicit `use_moe=False` construction.
+- Existing SeZM regression after Step 5: PASS
+  - Command used: `pytest source/tests/pt/model/test_sezm_model.py::TestSeZMModelCompile::test_forward_backward_double_backward_matches_compile -xvs`
+  - Result: 1 test passed
+- Step 5 ruff check: PASS
+  - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/so2.py source/tests/pt/test_sezm_so2_moe.py`
 - DPA3 reference subagent smoke test: PASS
   - Cursor `dpa3-ref-searcher` can read `deepmd-kit-moe` reference files.
 - Implementer subagent smoke test: PASS
@@ -95,7 +106,6 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Not Started
 
-- Step 5: `SO2Convolution` MoE branch and validation
 - Step 6: EP/DP groups and gradient sync
 - Step 7: `SeZMInteractionBlock` integration
 - Step 8: `DescrptSeZM` top-level config
@@ -105,5 +115,5 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Next Recommended Actions
 
-1. Proceed to Step 5 (`SO2Convolution` MoE branch) with `sezm-moe-implementer`.
+1. Proceed to Step 6 (`init_ep_dp_groups` + `sync_moe_gradients`) with `sezm-moe-implementer`.
 1. Keep updating this file after each Step's tests and ruff checks.
