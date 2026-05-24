@@ -62,6 +62,9 @@ from deepmd.pt.utils.env import (
 from deepmd.pt.utils.exclude_mask import (
     PairExcludeMask,
 )
+from deepmd.pt.utils.sezm_moe_ep_dp import (
+    init_ep_dp_groups,
+)
 from deepmd.pt.utils.update_sel import (
     UpdateSel,
 )
@@ -366,6 +369,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         inner_clamp_r_outer: float | None = None,
         add_chg_spin_ebd: bool = False,
         default_chg_spin: list[float] | None = None,
+        use_moe: bool = False,
+        n_routing_experts: int = 0,
+        topk: int = 1,
+        n_shared_experts: int = 0,
+        ep_size: int = 1,
+        routing_input: str = "dst",
+        use_compile: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -460,6 +470,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.layer_scale = bool(layer_scale)
         self.use_amp = bool(use_amp)  # and self.training
         self.trainable = bool(trainable)
+        self.use_moe = bool(use_moe)
+        self.n_routing_experts = int(n_routing_experts)
+        self.topk = int(topk)
+        self.n_shared_experts = int(n_shared_experts)
+        self.ep_size = int(ep_size)
+        self.routing_input = str(routing_input)
+        self.use_compile = bool(use_compile)
         self.use_triton = os.environ.get("DP_TRITON", "0").lower() in (
             "1",
             "true",
@@ -538,6 +555,55 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             raise ValueError(
                 "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
             )
+        if self.use_moe:
+            if self.use_compile:
+                raise ValueError("use_moe=True requires use_compile=False")
+            if self.so2_norm:
+                raise ValueError("use_moe=True requires so2_norm=False")
+            if self.so2_attn_res_mode != "none":
+                raise ValueError("use_moe=True requires so2_attn_res='none'")
+            if self.n_shared_experts < 0:
+                raise ValueError("n_shared_experts must be >= 0")
+            if self.topk < 1:
+                raise ValueError("topk must be >= 1")
+            if self.n_routing_experts < self.topk:
+                raise ValueError("n_routing_experts must be >= topk")
+            if self.ep_size < 1:
+                raise ValueError("ep_size must be >= 1")
+            if self.n_routing_experts % self.ep_size != 0:
+                raise ValueError("n_routing_experts must be divisible by ep_size")
+            if self.routing_input not in {"dst", "src", "src+dst"}:
+                raise ValueError("routing_input must be dst/src/src+dst")
+            if self.n_focus != self.topk + self.n_shared_experts:
+                raise ValueError(
+                    "use_moe requires n_focus == topk + n_shared_experts, got "
+                    f"n_focus={self.n_focus}, topk={self.topk}, "
+                    f"n_shared_experts={self.n_shared_experts}"
+                )
+            self.moe_config: dict[str, int | str] | None = {
+                "n_routing_experts": self.n_routing_experts,
+                "topk": self.topk,
+                "n_shared_experts": self.n_shared_experts,
+                "ep_size": self.ep_size,
+                "routing_input": self.routing_input,
+                "type_embedding_dim": self.channels,
+            }
+            (
+                self.moe_ep_group,
+                self.moe_dp_group,
+                self.moe_ep_rank,
+                self.moe_ep_size,
+                self.moe_dp_rank,
+                self.moe_dp_size,
+            ) = init_ep_dp_groups(self.ep_size)
+        else:
+            self.moe_config = None
+            self.moe_ep_group = None
+            self.moe_dp_group = None
+            self.moe_ep_rank = 0
+            self.moe_ep_size = 1
+            self.moe_dp_rank = 0
+            self.moe_dp_size = 1
         self.ffn_neurons = int(ffn_neurons)
         self.block_ffn_neurons = self._resolve_ffn_neurons(
             self.ffn_neurons,
@@ -745,6 +811,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     dtype=self.dtype,
                     seed=child_seed(seed_blocks, block_idx),
                     trainable=self.trainable,
+                    use_moe=self.use_moe,
+                    moe_config=self.moe_config,
+                    use_compile=self.use_compile,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -1040,7 +1109,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             if edge_cache.src.numel() > 0:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
-                    x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
+                    x = self._forward_blocks(
+                        x,
+                        edge_cache,
+                        rad_feat_per_block,
+                        type_embedding=type_ebed.to(dtype=self.dtype),
+                        ep_group=self.moe_ep_group,
+                    )
 
         # === Step 11. Final l=0 output mixing ===
         # Extract l=0 scalar features and apply FFN in promoted dtype.
@@ -1205,7 +1280,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 x = x + force_embedding.to(dtype=self.dtype)
             edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
             with self._compute_mode_ctx(extended_coord.device):
-                x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
+                x = self._forward_blocks(
+                    x,
+                    edge_cache,
+                    rad_feat_per_block,
+                    type_embedding=type_ebed.to(dtype=self.dtype),
+                    ep_group=self.moe_ep_group,
+                )
 
         # === Step 10. Final l=0 output mixing ===
         with nvtx_range("output_ffn"):
@@ -1225,6 +1306,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
         radial_feat_per_block: list[torch.Tensor],
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
     ) -> torch.Tensor:
         """
         Run the interaction blocks with optional depth attention.
@@ -1249,7 +1332,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 x = x[:, : self.ebed_dims[i], :, :]
                 blk_radial = radial_feat_per_block[i]
                 with nvtx_range(f"block_{i}"):
-                    x, _, _, _ = block(x, edge_cache, blk_radial)
+                    x, _, _, _ = block(
+                        x,
+                        edge_cache,
+                        blk_radial,
+                        type_embedding=type_embedding,
+                        ep_group=ep_group,
+                    )
             return x
 
         n_node = x.shape[0]
@@ -1276,6 +1365,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                         edge_cache,
                         blk_radial,
                         unit_history=truncated_unit_history,
+                        type_embedding=type_embedding,
+                        ep_group=ep_group,
                     )
                 unit_history.append(so2_unit_output)
                 unit_history.extend(ffn_unit_outputs)
@@ -1308,6 +1399,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     edge_cache,
                     blk_radial,
                     unit_history=truncated_block_history,
+                    type_embedding=type_embedding,
+                    ep_group=ep_group,
                 )
             block_history.append(block_summary)
             x = block_output
@@ -1795,6 +1888,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "inner_clamp_r_outer": self.inner_clamp_r_outer,
                 "add_chg_spin_ebd": self.add_chg_spin_ebd,
                 "default_chg_spin": self.default_chg_spin,
+                "use_moe": self.use_moe,
+                "n_routing_experts": self.n_routing_experts,
+                "topk": self.topk,
+                "n_shared_experts": self.n_shared_experts,
+                "ep_size": self.ep_size,
+                "routing_input": self.routing_input,
+                "use_compile": self.use_compile,
             },
             "@variables": {key: np_safe(value) for key, value in state.items()},
             "env_mat": DPEnvMat(self.rcut, self.rcut, self.eps).serialize(),
