@@ -521,6 +521,12 @@ def descrpt_se_zm_args() -> list[Argument]:
         "the model-level `pair_exclude_types`; if both fields are provided, they "
         "must match."
     )
+    doc_use_moe = "Enable SeZM MoE expert-parallel SO(2) convolution."
+    doc_n_routing_experts = "Total number of SeZM MoE routing experts."
+    doc_topk = "Number of routing experts selected per edge."
+    doc_n_shared_experts = "Number of local shared experts used by SeZM MoE."
+    doc_ep_size = "Expert-parallel group size for SeZM MoE."
+    doc_routing_input = "Routing key source for SeZM MoE: `dst`, `src`, or `src+dst`."
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
     doc_eps = "Small epsilon for numerical stability in division and normalization."
     doc_trainable = "If the parameters in the descriptor are trainable."
@@ -729,6 +735,32 @@ def descrpt_se_zm_args() -> list[Argument]:
             optional=True,
             default=[],
             doc=doc_exclude_types,
+        ),
+        Argument("use_moe", bool, optional=True, default=False, doc=doc_use_moe),
+        Argument(
+            "n_routing_experts",
+            int,
+            optional=True,
+            default=0,
+            doc=doc_n_routing_experts,
+        ),
+        Argument("topk", int, optional=True, default=1, doc=doc_topk),
+        Argument(
+            "n_shared_experts",
+            int,
+            optional=True,
+            default=0,
+            doc=doc_n_shared_experts,
+        ),
+        Argument("ep_size", int, optional=True, default=1, doc=doc_ep_size),
+        Argument(
+            "routing_input",
+            str,
+            optional=True,
+            default="dst",
+            extra_check=lambda x: x in {"dst", "src", "src+dst"},
+            extra_check_errmsg="must be one of 'dst', 'src', or 'src+dst'",
+            doc=doc_routing_input,
         ),
         Argument("precision", str, optional=True, default="float32", doc=doc_precision),
         Argument(

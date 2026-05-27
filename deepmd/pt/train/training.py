@@ -105,6 +105,13 @@ from deepmd.pt.utils.lmdb_dataset import (
     _collate_lmdb_batch,
     _SameNlocBatchSamplerTorch,
 )
+from deepmd.pt.utils.sezm_moe_checkpoint import (
+    gather_state_dict_for_ep_save,
+    slice_state_dict_for_ep_load,
+)
+from deepmd.pt.utils.sezm_moe_ep_dp import (
+    sync_moe_gradients,
+)
 from deepmd.pt.utils.stat import (
     make_stat_input,
 )
@@ -733,6 +740,15 @@ class Trainer:
 
         # Model Wrapper
         self.wrapper = ModelWrapper(self.model, self.loss, model_params=model_params)
+        (
+            self.moe_ep_group,
+            self.moe_dp_group,
+            self.moe_ep_rank,
+            self.moe_ep_size,
+            self.moe_dp_size,
+            self.moe_n_routing_experts,
+            self.use_moe_ep,
+        ) = self._find_sezm_moe_runtime(self.wrapper)
         self.start_step = 0
 
         # resuming and finetune
@@ -758,7 +774,7 @@ class Trainer:
                 if self.restart_training
                 else 0
             )
-            if self.rank == 0:
+            if self.rank == 0 or self.use_moe_ep:
                 if force_load:
                     input_keys = list(state_dict.keys())
                     target_keys = list(self.wrapper.state_dict().keys())
@@ -878,6 +894,13 @@ class Trainer:
                 # Always use current model_params so newly added fields
                 # (e.g. bridging_method) are persisted in checkpoints.
                 state_dict["_extra_state"] = self.wrapper.state_dict()["_extra_state"]
+                if self.use_moe_ep:
+                    state_dict = slice_state_dict_for_ep_load(
+                        state_dict,
+                        ep_rank=self.moe_ep_rank,
+                        ep_size=self.moe_ep_size,
+                        n_routing_experts=self.moe_n_routing_experts,
+                    )
                 self.wrapper.load_state_dict(state_dict)
 
                 # change bias for fine-tuning
@@ -1309,6 +1332,26 @@ class Trainer:
             return self.wrapper.module
         return self.wrapper
 
+    @staticmethod
+    def _find_sezm_moe_runtime(
+        module: torch.nn.Module,
+    ) -> tuple[object | None, object | None, int, int, int, int, bool]:
+        """Find SeZM MoE DP group metadata in a model tree."""
+        for submodule in module.modules():
+            if bool(getattr(submodule, "use_moe", False)) and hasattr(
+                submodule, "moe_dp_size"
+            ):
+                return (
+                    getattr(submodule, "moe_ep_group", None),
+                    getattr(submodule, "moe_dp_group", None),
+                    int(getattr(submodule, "moe_ep_rank", 0)),
+                    int(getattr(submodule, "moe_ep_size", 1)),
+                    int(getattr(submodule, "moe_dp_size", 1)),
+                    int(getattr(submodule, "n_routing_experts", 0)),
+                    True,
+                )
+        return None, None, 0, 1, 1, 0, False
+
     def _load_optimizer_state(
         self, optimizer_state_dict: dict[str, Any] | None
     ) -> None:
@@ -1406,7 +1449,20 @@ class Trainer:
                 model_pred, loss, more_loss = self.wrapper(
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                 )
-                loss.backward()
+                if self.use_moe_ep:
+                    no_sync = getattr(self.wrapper, "no_sync", None)
+                    sync_context = no_sync() if no_sync is not None else nullcontext()
+                    with sync_context:
+                        loss.backward()
+                    sync_moe_gradients(
+                        self.wrapper,
+                        self.moe_dp_group,
+                        None,
+                        self.moe_dp_size,
+                        self.world_size,
+                    )
+                else:
+                    loss.backward()
                 # === Initialize gradient diagnostics variables ===
                 total_norm: torch.Tensor | None = None
                 pre_clip_named_norms: list[tuple[str, float]] = []
@@ -1773,7 +1829,12 @@ class Trainer:
                     and _step_id != self.start_step
                 )
                 or (display_step_id) == self.num_steps
-            ) and (self.zero_stage > 0 or self.rank == 0 or dist.get_rank() == 0):
+            ) and (
+                self.use_moe_ep
+                or self.zero_stage > 0
+                or self.rank == 0
+                or dist.get_rank() == 0
+            ):
                 # Handle the case if rank 0 aborted and re-assigned
                 self.latest_model = Path(self.save_ckpt + f"-{display_step_id}.pt")
                 self.save_model(self.latest_model, lr=cur_lr, step=_step_id)
@@ -2010,6 +2071,14 @@ class Trainer:
                     # Same storage-sharing issue as zero_stage == 1.
                     model_state = deepcopy(model_state)
                 optim_state = self.optimizer.state_dict() if include_optimizer else None
+        if self.use_moe_ep and self.moe_ep_size > 1:
+            model_state = gather_state_dict_for_ep_save(
+                model_state,
+                ep_group=self.moe_ep_group,
+                ep_rank=self.moe_ep_rank,
+                ep_size=self.moe_ep_size,
+                n_routing_experts=self.moe_n_routing_experts,
+            )
         return model_state, optim_state
 
     @staticmethod

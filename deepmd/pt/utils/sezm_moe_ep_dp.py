@@ -66,7 +66,11 @@ def sync_moe_gradients(
         if param.grad is None:
             continue
         if _is_routing_expert_param(name):
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
+            # In pure EP (dp_size == 1), A2A backward has already accumulated
+            # all ep_size contributions. Skip the size-1 NCCL all-reduce to avoid
+            # unnecessary CUDA/NCCL allocation, but still divide by world_size.
+            if dp_size > 1:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
         else:
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=world_group)
         param.grad.div_(world_size)

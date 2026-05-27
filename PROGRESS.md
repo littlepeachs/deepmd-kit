@@ -7,7 +7,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - Date: 2026-05-18
 - Current phase: Phase A
 - Current step: Step 4 (`MoESO2Convolution`)
-- Overall status: Steps 1-8 implementations exist and matching tests pass; Steps 9-10 are not implemented.
+- Overall status: Steps 1-10 implementations exist and matching tests pass; 8-GPU EP=8/DP=1 training smoke passes.
 
 ## Implemented Files
 
@@ -20,6 +20,9 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `deepmd/pt/model/descriptor/sezm_nn/block.py`
 - `deepmd/pt/model/descriptor/sezm.py`
 - `deepmd/pt/utils/sezm_moe_ep_dp.py`
+- `deepmd/pt/utils/sezm_moe_checkpoint.py`
+- `deepmd/utils/argcheck.py`
+- `deepmd/pt/train/training.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/__init__.py`
 - `source/tests/pt/test_sezm_moe_a2a.py`
 - `source/tests/pt/test_sezm_moe_a2a_multigpu.py`
@@ -31,6 +34,8 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `source/tests/pt/test_sezm_moe_ep_dp_multigpu.py`
 - `source/tests/pt/test_sezm_block_moe.py`
 - `source/tests/pt/test_sezm_descriptor_moe.py`
+- `source/tests/pt/test_sezm_moe_checkpoint.py`
+- `source/tests/pt/test_sezm_moe_checkpoint_multigpu.py`
 
 ## Validation
 
@@ -121,6 +126,24 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
   - Result: 1 test passed
 - Step 8 ruff check: PASS
   - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm.py source/tests/pt/test_sezm_descriptor_moe.py`
+- Step 9 training loop gradient sync integration: PASS
+  - Training loop uses DDP `no_sync()` for SeZM MoE and calls `sync_moe_gradients(...)` before clipping/optimizer step.
+  - Existing Step 6 4/8 GPU gradient sync tests still pass after integration.
+- Step 10 checkpoint resharding: PASS
+  - `deepmd/pt/utils/sezm_moe_checkpoint.py` slices full routing tensors to local EP shards on load and gathers local shards to global tensors on save.
+  - `pytest source/tests/pt/test_sezm_moe_checkpoint.py -q`: 4 tests passed.
+  - `torchrun --nproc_per_node=4 ... source/tests/pt/test_sezm_moe_checkpoint_multigpu.py`: passed.
+- 8-GPU EP=8/DP=1 training smoke: PASS
+  - Input: `/mnt/data_nas/zhangd/workplace/dev26/0515_dev_dpa4_moe/multi/input_sezm_moe_ep8_smoke.json`
+  - Command shape: `torchrun --nproc_per_node=8 ... dp --pt train input_sezm_moe_ep8_smoke.json --skip-neighbor-stat`
+  - Result: 20 training steps completed and checkpoint `sezm_moe_ep8_smoke.ckpt-20.pt` saved.
+  - Local parameter count: 6,457,544; local routing shard: 1,671,168; estimated global routing: 13,369,344; estimated global total: 18,155,720.
+  - Average training time: 1.1123 s/batch (first batch excluded).
+- Final focused regression: PASS
+  - `pytest source/tests/pt/test_sezm_moe_checkpoint.py source/tests/pt/test_sezm_descriptor_moe.py -q`: 10 tests passed.
+  - `pytest source/tests/pt/model/test_sezm_model.py::TestSeZMModelCompile::test_forward_backward_double_backward_matches_compile -q`: 1 test passed.
+- Final finish ruff check: PASS
+  - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/train/training.py deepmd/pt/utils/sezm_moe_checkpoint.py deepmd/pt/utils/sezm_moe_ep_dp.py deepmd/utils/argcheck.py source/tests/pt/test_sezm_moe_checkpoint.py source/tests/pt/test_sezm_moe_checkpoint_multigpu.py`
 - DPA3 reference subagent smoke test: PASS
   - Cursor `dpa3-ref-searcher` can read `deepmd-kit-moe` reference files.
 - Implementer subagent smoke test: PASS
@@ -140,11 +163,9 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Not Started
 
-- Step 9: training loop gradient sync
-- Step 10: checkpoint resharding
-- Phase D end-to-end validation
+- Phase D full formal validation matrix beyond the completed 8-GPU smoke.
 
 ## Next Recommended Actions
 
-1. Proceed to Step 9 (training loop gradient sync) with `sezm-moe-implementer`.
+1. Promote the 8-GPU smoke into the formal Phase D validation matrix as needed.
 1. Keep updating this file after each Step's tests and ruff checks.
