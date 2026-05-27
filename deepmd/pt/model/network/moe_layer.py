@@ -18,10 +18,6 @@ and runs a simple per-expert for-loop with weighted aggregation.
 
 from __future__ import annotations
 
-from typing import (
-    Optional,
-)
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -48,11 +44,50 @@ from deepmd.pt.model.network.moe_pack_dispatch_cuda import (
     fused_pack_for_dispatch,
 )
 
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import record_function
 
-USE_ULTRA_OPTIMIZED = True  # Enable ultra optimizations (embed expert IDs, overlap compute)
+USE_ULTRA_OPTIMIZED = (
+    True  # Enable ultra optimizations (embed expert IDs, overlap compute)
+)
 USE_FUSED_TOPK_SORT = True  # Use fused CUDA kernel for topk-expand-sort
 USE_FUSED_PACK = True  # Use fused CUDA kernel for pack-for-dispatch
+
+
+def _new_zeros_with_grad(
+    reference: torch.Tensor,
+    shape: tuple[int, ...],
+    *deps: torch.Tensor,
+) -> torch.Tensor:
+    """Create zeros while preserving autograd edges to empty inputs."""
+    out = reference.new_zeros(shape)
+    for dep in (reference, *deps):
+        if dep.is_floating_point() or dep.is_complex():
+            out = out + dep.sum() * 0
+    return out
+
+
+def _zero_dependency(*deps: torch.Tensor) -> torch.Tensor:
+    """Scalar zero that keeps full-tensor autograd edges alive."""
+    zero: torch.Tensor | None = None
+    for dep in deps:
+        if not (dep.is_floating_point() or dep.is_complex()):
+            continue
+        dep_zero = dep.sum() * 0
+        zero = dep_zero if zero is None else zero + dep_zero
+    if zero is None:
+        raise ValueError("_zero_dependency requires a floating-point tensor")
+    return zero
+
+
+def _has_global_tokens(
+    local_count: int,
+    group: dist.ProcessGroup,
+    device: torch.device,
+) -> bool:
+    """Return whether any rank in the group has tokens for this collective."""
+    has_tokens = torch.tensor([int(local_count > 0)], dtype=torch.int32, device=device)
+    dist.all_reduce(has_tokens, op=dist.ReduceOp.MAX, group=group)
+    return bool(has_tokens.item())
 
 
 def _topk_expand_sort(
@@ -117,11 +152,20 @@ def _topk_expand_sort(
 
     # Counts per GPU via bincount on target_gpu.
     sorted_target_gpu = sorted_expert_ids // experts_per_gpu
-    ep_size_inferred = int(sorted_target_gpu.max().item()) + 1 if len(sorted_target_gpu) > 0 else 1
+    ep_size_inferred = (
+        int(sorted_target_gpu.max().item()) + 1 if len(sorted_target_gpu) > 0 else 1
+    )
     gpu_counts = torch.bincount(sorted_target_gpu, minlength=ep_size_inferred)
     counts_per_gpu = gpu_counts.tolist()
 
-    return sorted_features, sorted_expert_ids, sorted_weights, unsort_idx, counts_per_gpu, ep_size_inferred
+    return (
+        sorted_features,
+        sorted_expert_ids,
+        sorted_weights,
+        unsort_idx,
+        counts_per_gpu,
+        ep_size_inferred,
+    )
 
 
 def _weighted_sum_topk(
@@ -214,7 +258,7 @@ class MoEDispatchCombine(nn.Module):
         n_routing_experts: int,
         topk: int,
         n_shared_experts: int = 0,
-        ep_group: Optional[dist.ProcessGroup] = None,
+        ep_group: dist.ProcessGroup | None = None,
         ep_rank: int = 0,
         ep_size: int = 1,
         experts_per_gpu: int = 1,
@@ -243,34 +287,46 @@ class MoEDispatchCombine(nn.Module):
         self.packer = MoEPacker(a_dim)
 
         # Output dimensions.
-        self.node_out_dim = n_dim           # M1 output = nd
-        self.node_sym_out_dim = n_dim       # M2 output = nd
-        self.edge_out_dim = n_dim + e_dim   # merged M3+M4 output = nd+ne
+        self.node_out_dim = n_dim  # M1 output = nd
+        self.node_sym_out_dim = n_dim  # M2 output = nd
+        self.edge_out_dim = n_dim + e_dim  # merged M3+M4 output = nd+ne
         self.angle_out_dim = e_dim + a_dim  # merged M5+M7 output = ne+na
 
         # 4 MoE Expert Collections.
         self.node_self_experts = MoEExpertCollection(
-            n_dim, self.node_out_dim,
-            experts_per_gpu, n_shared_experts,
-            activation_function, precision,
+            n_dim,
+            self.node_out_dim,
+            experts_per_gpu,
+            n_shared_experts,
+            activation_function,
+            precision,
             seed=child_seed(seed, 0),
         )
         self.node_sym_experts = MoEExpertCollection(
-            n_sym_dim, self.node_sym_out_dim,
-            experts_per_gpu, n_shared_experts,
-            activation_function, precision,
+            n_sym_dim,
+            self.node_sym_out_dim,
+            experts_per_gpu,
+            n_shared_experts,
+            activation_function,
+            precision,
             seed=child_seed(seed, 1),
         )
         self.edge_experts = MoEExpertCollection(
-            edge_info_dim, self.edge_out_dim,
-            experts_per_gpu, n_shared_experts,
-            activation_function, precision,
+            edge_info_dim,
+            self.edge_out_dim,
+            experts_per_gpu,
+            n_shared_experts,
+            activation_function,
+            precision,
             seed=child_seed(seed, 2),
         )
         self.angle_experts = MoEExpertCollection(
-            angle_dim, self.angle_out_dim,
-            experts_per_gpu, n_shared_experts,
-            activation_function, precision,
+            angle_dim,
+            self.angle_out_dim,
+            experts_per_gpu,
+            n_shared_experts,
+            activation_function,
+            precision,
             seed=child_seed(seed, 3),
         )
 
@@ -321,15 +377,27 @@ class MoEDispatchCombine(nn.Module):
         with record_function("moe_combine"):
             if self.ep_group is None:
                 return self._forward_single_gpu(
-                    node_m1_input, node_m2_input, edge_input, angle_input,
-                    node_router_out, edge_router_out, angle_router_out,
-                    n2e_index, n2a_index,
+                    node_m1_input,
+                    node_m2_input,
+                    edge_input,
+                    angle_input,
+                    node_router_out,
+                    edge_router_out,
+                    angle_router_out,
+                    n2e_index,
+                    n2a_index,
                 )
             else:
                 return self._forward_multi_gpu(
-                    node_m1_input, node_m2_input, edge_input, angle_input,
-                    node_router_out, edge_router_out, angle_router_out,
-                    n2e_index, n2a_index,
+                    node_m1_input,
+                    node_m2_input,
+                    edge_input,
+                    angle_input,
+                    node_router_out,
+                    edge_router_out,
+                    angle_router_out,
+                    n2e_index,
+                    n2a_index,
                 )
 
     # ------------------------------------------------------------------
@@ -363,32 +431,44 @@ class MoEDispatchCombine(nn.Module):
         N_angle = angle_input.shape[0]
         topk = self.topk
 
-        node_weights, node_indices = node_router_out   # [N_node, topk]
+        node_weights, node_indices = node_router_out  # [N_node, topk]
         edge_weights_node, edge_indices_node = edge_router_out
         angle_weights_node, angle_indices_node = angle_router_out
 
         # Broadcast node-level routing to edge/angle tokens.
-        edge_weights = edge_weights_node[n2e_index]   # [N_edge, topk]
+        edge_weights = edge_weights_node[n2e_index]  # [N_edge, topk]
         edge_indices = edge_indices_node[n2e_index]
         angle_weights = angle_weights_node[n2a_index]  # [N_angle, topk]
         angle_indices = angle_indices_node[n2a_index]
 
         # ── Node M1 + M2 ──
         node_m1_out, node_m2_out = self._sort_split_forward_node(
-            node_m1_input, node_m2_input, node_indices, node_weights,
-            N_node, topk,
+            node_m1_input,
+            node_m2_input,
+            node_indices,
+            node_weights,
+            N_node,
+            topk,
         )
 
         # ── Edge ──
         edge_out = self._sort_split_forward_feature(
-            edge_input, edge_indices, edge_weights,
-            N_edge, topk, self.edge_experts,
+            edge_input,
+            edge_indices,
+            edge_weights,
+            N_edge,
+            topk,
+            self.edge_experts,
         )
 
         # ── Angle ──
         angle_out = self._sort_split_forward_feature(
-            angle_input, angle_indices, angle_weights,
-            N_angle, topk, self.angle_experts,
+            angle_input,
+            angle_indices,
+            angle_weights,
+            N_angle,
+            topk,
+            self.angle_experts,
         )
 
         # Add shared expert contribution.
@@ -401,10 +481,10 @@ class MoEDispatchCombine(nn.Module):
 
     def _sort_split_forward_node(
         self,
-        m1_input: torch.Tensor,      # [N, nd]
-        m2_input: torch.Tensor,      # [N, n_sym_dim]
-        indices: torch.Tensor,       # [N, topk]
-        weights: torch.Tensor,       # [N, topk]
+        m1_input: torch.Tensor,  # [N, nd]
+        m2_input: torch.Tensor,  # [N, n_sym_dim]
+        indices: torch.Tensor,  # [N, topk]
+        weights: torch.Tensor,  # [N, topk]
         N: int,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -420,16 +500,20 @@ class MoEDispatchCombine(nn.Module):
 
         if N == 0:
             return (
-                m1_input.new_zeros(0, self.node_out_dim),
-                m2_input.new_zeros(0, self.node_sym_out_dim),
+                _new_zeros_with_grad(m1_input, (0, self.node_out_dim)),
+                _new_zeros_with_grad(m2_input, (0, self.node_sym_out_dim)),
             )
 
         m1_out_dim = self.node_out_dim
         m2_out_dim = self.node_sym_out_dim
 
         # Build token_idx, slot_idx, expert_idx (matches old code pattern).
-        token_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, topk).reshape(-1)  # [N*topk]
-        slot_idx = torch.arange(topk, device=device).unsqueeze(0).expand(N, topk).reshape(-1)  # [N*topk]
+        token_idx = (
+            torch.arange(N, device=device).unsqueeze(1).expand(N, topk).reshape(-1)
+        )  # [N*topk]
+        slot_idx = (
+            torch.arange(topk, device=device).unsqueeze(0).expand(N, topk).reshape(-1)
+        )  # [N*topk]
         expert_idx = indices.reshape(-1)  # [N*topk]
 
         # Sort by expert.
@@ -439,7 +523,9 @@ class MoEDispatchCombine(nn.Module):
         expert_idx_sorted = expert_idx[order]
 
         counts = torch.bincount(expert_idx_sorted, minlength=self.n_routing_experts)
-        offsets = torch.zeros(self.n_routing_experts + 1, device=device, dtype=counts.dtype)
+        offsets = torch.zeros(
+            self.n_routing_experts + 1, device=device, dtype=counts.dtype
+        )
         offsets[1:] = counts.cumsum(0)
         offsets_cpu = offsets.tolist()
 
@@ -475,15 +561,15 @@ class MoEDispatchCombine(nn.Module):
         m2_out_3d[token_idx_sorted, :, slot_idx_sorted] = all_m2_y
 
         # Weighted sum via einsum: [N, O, topk] x [N, topk] -> [N, O]
-        m1_out = torch.einsum('ijk,ik->ij', m1_out_3d, weights)
-        m2_out = torch.einsum('ijk,ik->ij', m2_out_3d, weights)
+        m1_out = torch.einsum("ijk,ik->ij", m1_out_3d, weights)
+        m2_out = torch.einsum("ijk,ik->ij", m2_out_3d, weights)
         return m1_out, m2_out
 
     def _sort_split_forward_feature(
         self,
-        features: torch.Tensor,         # [N, feat_dim]
-        indices: torch.Tensor,          # [N, topk]
-        weights: torch.Tensor,          # [N, topk]
+        features: torch.Tensor,  # [N, feat_dim]
+        indices: torch.Tensor,  # [N, topk]
+        weights: torch.Tensor,  # [N, topk]
         N: int,
         topk: int,
         expert_collection: MoEExpertCollection,
@@ -500,11 +586,15 @@ class MoEDispatchCombine(nn.Module):
         out_dim = expert_collection.num_out
 
         if N == 0:
-            return features.new_zeros(0, out_dim)
+            return _new_zeros_with_grad(features, (0, out_dim))
 
         # Build token_idx, slot_idx, expert_idx.
-        token_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, topk).reshape(-1)
-        slot_idx = torch.arange(topk, device=device).unsqueeze(0).expand(N, topk).reshape(-1)
+        token_idx = (
+            torch.arange(N, device=device).unsqueeze(1).expand(N, topk).reshape(-1)
+        )
+        slot_idx = (
+            torch.arange(topk, device=device).unsqueeze(0).expand(N, topk).reshape(-1)
+        )
         expert_idx = indices.reshape(-1)
 
         # Sort by expert.
@@ -514,7 +604,9 @@ class MoEDispatchCombine(nn.Module):
         expert_idx_sorted = expert_idx[order]
 
         counts = torch.bincount(expert_idx_sorted, minlength=self.n_routing_experts)
-        offsets = torch.zeros(self.n_routing_experts + 1, device=device, dtype=counts.dtype)
+        offsets = torch.zeros(
+            self.n_routing_experts + 1, device=device, dtype=counts.dtype
+        )
         offsets[1:] = counts.cumsum(0)
         offsets_cpu = offsets.tolist()
 
@@ -540,7 +632,7 @@ class MoEDispatchCombine(nn.Module):
         out_3d[token_idx_sorted, :, slot_idx_sorted] = all_y
 
         # Weighted sum via einsum.
-        return torch.einsum('ijk,ik->ij', out_3d, weights)
+        return torch.einsum("ijk,ik->ij", out_3d, weights)
 
     # ------------------------------------------------------------------
     # Multi-GPU path (topk expand -> sort -> Pack -> A2A -> Expert -> A2A -> Unpack -> weighted sum)
@@ -572,41 +664,70 @@ class MoEDispatchCombine(nn.Module):
             angle_weights_node, angle_indices_node = angle_router_out
 
             # Broadcast node-level routing to edge/angle.
-            edge_weights = edge_weights_node[n2e_index]   # [N_edge, topk]
-            edge_indices = edge_indices_node[n2e_index]   # [N_edge, topk]
+            edge_weights = edge_weights_node[n2e_index]  # [N_edge, topk]
+            edge_indices = edge_indices_node[n2e_index]  # [N_edge, topk]
             angle_weights = angle_weights_node[n2a_index]  # [N_angle, topk]
             angle_indices = angle_indices_node[n2a_index]  # [N_angle, topk]
 
             # ── Step 3a: topk expand + sort ──
             # Concatenate node M1 and M2 inputs for packing: [N_node, nd + n_sym_dim] = [N_node, 28a]
-            node_combined = torch.cat([node_m1_input, node_m2_input], dim=-1)  # [N_node, 28a]
+            node_combined = torch.cat(
+                [node_m1_input, node_m2_input], dim=-1
+            )  # [N_node, 28a]
 
             if USE_FUSED_TOPK_SORT and node_combined.is_cuda:
                 _expand_sort = fused_topk_expand_sort
-                _expand_sort_kwargs = dict(
-                    n_routing_experts=self.n_routing_experts,
-                    ep_size=self.ep_size,
-                )
+                _expand_sort_kwargs = {
+                    "n_routing_experts": self.n_routing_experts,
+                    "ep_size": self.ep_size,
+                }
             else:
                 _expand_sort = _topk_expand_sort
                 _expand_sort_kwargs = {}
-            
+
             with record_function("sort_and_expand_node"):
-                (node_sorted, node_expert_ids_sorted, node_weights_sorted,
-                node_unsort_idx, node_counts, _) = _expand_sort(
-                    node_combined, node_indices, node_weights, self.experts_per_gpu,
+                (
+                    node_sorted,
+                    node_expert_ids_sorted,
+                    node_weights_sorted,
+                    node_unsort_idx,
+                    node_counts,
+                    _,
+                ) = _expand_sort(
+                    node_combined,
+                    node_indices,
+                    node_weights,
+                    self.experts_per_gpu,
                     **_expand_sort_kwargs,
                 )
             with record_function("sort_and_expand_edge"):
-                (edge_sorted, edge_expert_ids_sorted, edge_weights_sorted,
-                edge_unsort_idx, edge_counts, _) = _expand_sort(
-                    edge_input, edge_indices, edge_weights, self.experts_per_gpu,
+                (
+                    edge_sorted,
+                    edge_expert_ids_sorted,
+                    edge_weights_sorted,
+                    edge_unsort_idx,
+                    edge_counts,
+                    _,
+                ) = _expand_sort(
+                    edge_input,
+                    edge_indices,
+                    edge_weights,
+                    self.experts_per_gpu,
                     **_expand_sort_kwargs,
                 )
             with record_function("sort_and_expand_angle"):
-                (angle_sorted, angle_expert_ids_sorted, angle_weights_sorted,
-                angle_unsort_idx, angle_counts, _) = _expand_sort(
-                    angle_input, angle_indices, angle_weights, self.experts_per_gpu,
+                (
+                    angle_sorted,
+                    angle_expert_ids_sorted,
+                    angle_weights_sorted,
+                    angle_unsort_idx,
+                    angle_counts,
+                    _,
+                ) = _expand_sort(
+                    angle_input,
+                    angle_indices,
+                    angle_weights,
+                    self.experts_per_gpu,
                     **_expand_sort_kwargs,
                 )
 
@@ -624,15 +745,24 @@ class MoEDispatchCombine(nn.Module):
         with record_function("Pack_for_dispatch"):
             if USE_FUSED_PACK and node_sorted.is_cuda:
                 packed, send_splits = fused_pack_for_dispatch(
-                    node_sorted, edge_sorted, angle_sorted,
-                    node_counts, edge_counts, angle_counts,
-                    self.packer.edge_concat_in, self.packer.angle_concat_in,
+                    node_sorted,
+                    edge_sorted,
+                    angle_sorted,
+                    node_counts,
+                    edge_counts,
+                    angle_counts,
+                    self.packer.edge_concat_in,
+                    self.packer.angle_concat_in,
                     self.packer.D_packed_in,
                 )
             else:
                 packed, send_splits = self.packer.pack_for_dispatch(
-                    node_sorted, edge_sorted, angle_sorted,
-                    node_counts, edge_counts, angle_counts,
+                    node_sorted,
+                    edge_sorted,
+                    angle_sorted,
+                    node_counts,
+                    edge_counts,
+                    angle_counts,
                 )
 
         # ── Step 3c: Exchange metadata ──
@@ -649,7 +779,9 @@ class MoEDispatchCombine(nn.Module):
             recv_angle_counts = recv_info[:, 2].tolist()
 
             recv_splits = counts_to_packed_rows(
-                recv_node_counts, recv_edge_counts, recv_angle_counts,
+                recv_node_counts,
+                recv_edge_counts,
+                recv_angle_counts,
                 edge_group_size=self.packer.edge_concat_in,
                 angle_group_size=self.packer.angle_concat_in,
             )
@@ -657,7 +789,11 @@ class MoEDispatchCombine(nn.Module):
         # ── Step 3d: Dispatch A2A ──
         with record_function("Dispatch_A2A"):
             recv_tensor = all_to_all_differentiable(
-                packed, send_splits, recv_splits, self.ep_group,
+                packed,
+                send_splits,
+                recv_splits,
+                self.ep_group,
+                label="dispatch",
             )
 
         # Ultra-optimized: Start shared expert computation on separate stream
@@ -665,64 +801,90 @@ class MoEDispatchCombine(nn.Module):
         if USE_ULTRA_OPTIMIZED and torch.cuda.is_available():
             with record_function("overlap_shared_experts"):
                 # Create stream if not exists
-                if not hasattr(self, '_shared_stream'):
+                if not hasattr(self, "_shared_stream"):
                     self._shared_stream = torch.cuda.Stream()
 
                 # Launch shared expert computation on separate stream
                 with torch.cuda.stream(self._shared_stream):
                     self._shared_results = {
-                        'node_m1': self.node_self_experts.forward_shared(node_m1_input),
-                        'node_m2': self.node_sym_experts.forward_shared(node_m2_input),
-                        'edge': self.edge_experts.forward_shared(edge_input),
-                        'angle': self.angle_experts.forward_shared(angle_input),
+                        "node_m1": self.node_self_experts.forward_shared(node_m1_input),
+                        "node_m2": self.node_sym_experts.forward_shared(node_m2_input),
+                        "edge": self.edge_experts.forward_shared(edge_input),
+                        "angle": self.angle_experts.forward_shared(angle_input),
                     }
                 # Don't synchronize yet - let it run in parallel
 
         # ── Step 3e: Unpack + Expert Compute ──
         with record_function("unpack_from_dispatch"):
             node_recv, edge_recv, angle_recv = self.packer.unpack_from_dispatch(
-                recv_tensor, recv_node_counts, recv_edge_counts, recv_angle_counts,
+                recv_tensor,
+                recv_node_counts,
+                recv_edge_counts,
+                recv_angle_counts,
             )
 
         # Exchange expert IDs via A2A (non-differentiable, int).
         # Ultra-optimized: merge 3 separate A2A calls into 1 batched call.
         if USE_ULTRA_OPTIMIZED:
             with record_function("batched_expert_id_A2A"):
-                node_eid_recv, edge_eid_recv, angle_eid_recv = self._exchange_expert_ids_batched(
-                    node_expert_ids_sorted, edge_expert_ids_sorted, angle_expert_ids_sorted,
-                    node_counts, edge_counts, angle_counts,
-                    recv_node_counts, recv_edge_counts, recv_angle_counts,
-                    device,
+                node_eid_recv, edge_eid_recv, angle_eid_recv = (
+                    self._exchange_expert_ids_batched(
+                        node_expert_ids_sorted,
+                        edge_expert_ids_sorted,
+                        angle_expert_ids_sorted,
+                        node_counts,
+                        edge_counts,
+                        angle_counts,
+                        recv_node_counts,
+                        recv_edge_counts,
+                        recv_angle_counts,
+                        device,
+                    )
                 )
         else:
             with record_function("non-diff_A2A"):
                 node_eid_recv = self._exchange_expert_ids(
-                    node_expert_ids_sorted, node_counts,
-                    recv_node_counts, device,
+                    node_expert_ids_sorted,
+                    node_counts,
+                    recv_node_counts,
+                    device,
                 )
                 edge_eid_recv = self._exchange_expert_ids(
-                    edge_expert_ids_sorted, edge_counts,
-                    recv_edge_counts, device,
+                    edge_expert_ids_sorted,
+                    edge_counts,
+                    recv_edge_counts,
+                    device,
                 )
                 angle_eid_recv = self._exchange_expert_ids(
-                    angle_expert_ids_sorted, angle_counts,
-                    recv_angle_counts, device,
+                    angle_expert_ids_sorted,
+                    angle_counts,
+                    recv_angle_counts,
+                    device,
                 )
-        
+
         with record_function("split_and_compute"):
             # Split node_recv into M1 and M2 inputs.
-            node_m1_recv = node_recv[:, :self.n_dim]       # [N_node_recv, nd]
-            node_m2_recv = node_recv[:, self.n_dim:]        # [N_node_recv, n_sym_dim]
+            node_m1_recv = node_recv[:, : self.n_dim]  # [N_node_recv, nd]
+            node_m2_recv = node_recv[:, self.n_dim :]  # [N_node_recv, n_sym_dim]
 
             # Compute experts: for each local expert, process its tokens.
             node_m1_output, node_m2_output = self._compute_node_experts(
-                node_m1_recv, node_m2_recv, node_eid_recv, recv_node_counts,
+                node_m1_recv,
+                node_m2_recv,
+                node_eid_recv,
+                recv_node_counts,
             )
             edge_output = self._compute_feature_experts(
-                edge_recv, edge_eid_recv, self.edge_experts, recv_edge_counts,
+                edge_recv,
+                edge_eid_recv,
+                self.edge_experts,
+                recv_edge_counts,
             )
             angle_output = self._compute_feature_experts(
-                angle_recv, angle_eid_recv, self.angle_experts, recv_angle_counts,
+                angle_recv,
+                angle_eid_recv,
+                self.angle_experts,
+                recv_angle_counts,
             )
 
         with record_function("pack_for_combine"):
@@ -731,26 +893,38 @@ class MoEDispatchCombine(nn.Module):
             node_output_combined = torch.cat([node_m1_output, node_m2_output], dim=-1)
 
             packed_out = self.packer.pack_for_combine(
-                node_output_combined, edge_output, angle_output,
-                recv_node_counts, recv_edge_counts, recv_angle_counts,
+                node_output_combined,
+                edge_output,
+                angle_output,
+                recv_node_counts,
+                recv_edge_counts,
+                recv_angle_counts,
             )
+            packed_out = packed_out + _zero_dependency(recv_tensor)
 
         with record_function("combine_A2A"):
             # ── Step 3g: Combine A2A (reverse direction) ──
             returned = all_to_all_differentiable(
-                packed_out, recv_splits, send_splits, self.ep_group,
+                packed_out,
+                recv_splits,
+                send_splits,
+                self.ep_group,
+                label="combine",
             )
 
         with record_function("unpack_from_combine"):
             # ── Step 3h: Unpack + Unsort + Weighted Sum ──
             node_ret, edge_ret, angle_ret = self.packer.unpack_from_combine(
-                returned, node_counts, edge_counts, angle_counts,
+                returned,
+                node_counts,
+                edge_counts,
+                angle_counts,
             )
 
         with record_function("process_output"):
             # Split node output back into M1 and M2.
-            node_m1_ret = node_ret[:, :self.n_dim]   # [N_node_exp, nd]
-            node_m2_ret = node_ret[:, self.n_dim:]   # [N_node_exp, nd]
+            node_m1_ret = node_ret[:, : self.n_dim]  # [N_node_exp, nd]
+            node_m2_ret = node_ret[:, self.n_dim :]  # [N_node_exp, nd]
 
             # Unsort to restore original token order.
             with record_function("unsort_tokens"):
@@ -766,30 +940,48 @@ class MoEDispatchCombine(nn.Module):
 
             # Weighted sum: [N_orig*topk, dim] -> [N_orig, topk, dim] -> sum.
             with record_function("weighted_sum_all"):
-                node_m1_out = _weighted_sum_topk(node_m1_ret, node_weights_orig, N_node, topk)
-                node_m2_out = _weighted_sum_topk(node_m2_ret, node_weights_orig, N_node, topk)
+                node_m1_out = _weighted_sum_topk(
+                    node_m1_ret, node_weights_orig, N_node, topk
+                )
+                node_m2_out = _weighted_sum_topk(
+                    node_m2_ret, node_weights_orig, N_node, topk
+                )
                 edge_out = _weighted_sum_topk(edge_ret, edge_weights_orig, N_edge, topk)
-                angle_out = _weighted_sum_topk(angle_ret, angle_weights_orig, N_angle, topk)
+                angle_out = _weighted_sum_topk(
+                    angle_ret, angle_weights_orig, N_angle, topk
+                )
 
             # Add shared expert contribution (on original inputs).
             # Ultra-optimized: This was computed in parallel with A2A, just add the results.
             with record_function("add_shared_experts"):
-                if USE_ULTRA_OPTIMIZED and hasattr(self, '_shared_results'):
+                if USE_ULTRA_OPTIMIZED and hasattr(self, "_shared_results"):
                     # Synchronize shared stream before using results
-                    if hasattr(self, '_shared_stream'):
+                    if hasattr(self, "_shared_stream"):
                         self._shared_stream.synchronize()
                     # Use pre-computed results from overlap
-                    node_m1_out = node_m1_out + self._shared_results['node_m1']
-                    node_m2_out = node_m2_out + self._shared_results['node_m2']
-                    edge_out = edge_out + self._shared_results['edge']
-                    angle_out = angle_out + self._shared_results['angle']
-                    delattr(self, '_shared_results')  # Clean up
+                    node_m1_out = node_m1_out + self._shared_results["node_m1"]
+                    node_m2_out = node_m2_out + self._shared_results["node_m2"]
+                    edge_out = edge_out + self._shared_results["edge"]
+                    angle_out = angle_out + self._shared_results["angle"]
+                    delattr(self, "_shared_results")  # Clean up
                 else:
                     # Baseline: compute shared experts now
-                    node_m1_out = node_m1_out + self.node_self_experts.forward_shared(node_m1_input)
-                    node_m2_out = node_m2_out + self.node_sym_experts.forward_shared(node_m2_input)
+                    node_m1_out = node_m1_out + self.node_self_experts.forward_shared(
+                        node_m1_input
+                    )
+                    node_m2_out = node_m2_out + self.node_sym_experts.forward_shared(
+                        node_m2_input
+                    )
                     edge_out = edge_out + self.edge_experts.forward_shared(edge_input)
-                    angle_out = angle_out + self.angle_experts.forward_shared(angle_input)
+                    angle_out = angle_out + self.angle_experts.forward_shared(
+                        angle_input
+                    )
+
+            collective_dep = _zero_dependency(returned)
+            node_m1_out = node_m1_out + collective_dep
+            node_m2_out = node_m2_out + collective_dep
+            edge_out = edge_out + collective_dep
+            angle_out = angle_out + collective_dep
 
         return node_m1_out, node_m2_out, edge_out, angle_out
 
@@ -822,11 +1014,7 @@ class MoEDispatchCombine(nn.Module):
             Global expert IDs received, which can be converted to local
             expert IDs via ``% self.experts_per_gpu``.
         """
-        total_send = sum(send_counts)
         total_recv = sum(recv_counts)
-
-        if total_send == 0 and total_recv == 0:
-            return torch.empty(0, dtype=torch.long, device=device)
 
         # Use int64 tensor for exchange.
         send_tensor = expert_ids_sorted.long().contiguous()
@@ -834,9 +1022,15 @@ class MoEDispatchCombine(nn.Module):
         if self.ep_group is None:
             return send_tensor
 
+        if not _has_global_tokens(
+            total_recv + send_tensor.shape[0], self.ep_group, device
+        ):
+            return torch.empty(0, dtype=torch.long, device=device)
+
         recv_tensor = torch.empty(total_recv, dtype=torch.long, device=device)
         dist.all_to_all_single(
-            recv_tensor, send_tensor,
+            recv_tensor,
+            send_tensor,
             output_split_sizes=recv_counts,
             input_split_sizes=send_counts,
             group=self.ep_group,
@@ -890,11 +1084,11 @@ class MoEDispatchCombine(nn.Module):
             nc, ec, ac = node_send_counts[g], edge_send_counts[g], angle_send_counts[g]
             parts = []
             if nc > 0:
-                parts.append(node_eids[node_off:node_off + nc])
+                parts.append(node_eids[node_off : node_off + nc])
             if ec > 0:
-                parts.append(edge_eids[edge_off:edge_off + ec])
+                parts.append(edge_eids[edge_off : edge_off + ec])
             if ac > 0:
-                parts.append(angle_eids[angle_off:angle_off + ac])
+                parts.append(angle_eids[angle_off : angle_off + ac])
             node_off += nc
             edge_off += ec
             angle_off += ac
@@ -917,9 +1111,10 @@ class MoEDispatchCombine(nn.Module):
         total_recv = sum(recv_splits)
         recv_tensor = torch.empty(total_recv, dtype=torch.long, device=device)
 
-        if total_send > 0 or total_recv > 0:
+        if _has_global_tokens(total_send + total_recv, self.ep_group, device):
             dist.all_to_all_single(
-                recv_tensor, send_tensor,
+                recv_tensor,
+                send_tensor,
                 output_split_sizes=recv_splits,
                 input_split_sizes=send_splits,
                 group=self.ep_group,
@@ -935,18 +1130,30 @@ class MoEDispatchCombine(nn.Module):
             ec = edge_recv_counts[g]
             ac = angle_recv_counts[g]
             if nc > 0:
-                node_parts.append(recv_tensor[recv_off:recv_off + nc])
+                node_parts.append(recv_tensor[recv_off : recv_off + nc])
             recv_off += nc
             if ec > 0:
-                edge_parts.append(recv_tensor[recv_off:recv_off + ec])
+                edge_parts.append(recv_tensor[recv_off : recv_off + ec])
             recv_off += ec
             if ac > 0:
-                angle_parts.append(recv_tensor[recv_off:recv_off + ac])
+                angle_parts.append(recv_tensor[recv_off : recv_off + ac])
             recv_off += ac
 
-        node_eid_recv = torch.cat(node_parts) if node_parts else torch.empty(0, dtype=torch.long, device=device)
-        edge_eid_recv = torch.cat(edge_parts) if edge_parts else torch.empty(0, dtype=torch.long, device=device)
-        angle_eid_recv = torch.cat(angle_parts) if angle_parts else torch.empty(0, dtype=torch.long, device=device)
+        node_eid_recv = (
+            torch.cat(node_parts)
+            if node_parts
+            else torch.empty(0, dtype=torch.long, device=device)
+        )
+        edge_eid_recv = (
+            torch.cat(edge_parts)
+            if edge_parts
+            else torch.empty(0, dtype=torch.long, device=device)
+        )
+        angle_eid_recv = (
+            torch.cat(angle_parts)
+            if angle_parts
+            else torch.empty(0, dtype=torch.long, device=device)
+        )
 
         return node_eid_recv, edge_eid_recv, angle_eid_recv
 
@@ -1027,9 +1234,7 @@ class MoEDispatchCombine(nn.Module):
                 cnt = sender_counts[s][eid]
                 if cnt > 0:
                     start = sender_offsets[s][eid]
-                    gather_parts.append(
-                        torch.arange(start, start + cnt, device=device)
-                    )
+                    gather_parts.append(torch.arange(start, start + cnt, device=device))
                     expert_total += cnt
             split_sizes.append(expert_total)
 
@@ -1076,13 +1281,15 @@ class MoEDispatchCombine(nn.Module):
 
         if N == 0:
             return (
-                node_m1_input.new_zeros(0, self.node_out_dim),
-                node_m2_input.new_zeros(0, self.node_sym_out_dim),
+                _new_zeros_with_grad(node_m1_input, (0, self.node_out_dim)),
+                _new_zeros_with_grad(node_m2_input, (0, self.node_sym_out_dim)),
             )
 
         local_eids = expert_ids % self.experts_per_gpu
         gather_idx, split_sizes, ungather_idx = self._build_expert_gather_idx(
-            local_eids, recv_counts, device,
+            local_eids,
+            recv_counts,
+            device,
         )
 
         # Gather into expert-contiguous layout.
@@ -1092,10 +1299,14 @@ class MoEDispatchCombine(nn.Module):
         # Batched forward using shared 3D tensor.
         eids_gathered = local_eids[gather_idx]
         m1_cat = self.node_self_experts.forward_expert_batched(
-            m1_gathered, eids_gathered, split_sizes,
+            m1_gathered,
+            eids_gathered,
+            split_sizes,
         )
         m2_cat = self.node_sym_experts.forward_expert_batched(
-            m2_gathered, eids_gathered, split_sizes,
+            m2_gathered,
+            eids_gathered,
+            split_sizes,
         )
 
         # Ungather back to recv order.
@@ -1131,11 +1342,13 @@ class MoEDispatchCombine(nn.Module):
         out_dim = expert_collection.num_out
 
         if N == 0:
-            return features.new_zeros(0, out_dim)
+            return _new_zeros_with_grad(features, (0, out_dim))
 
         local_eids = expert_ids % self.experts_per_gpu
         gather_idx, split_sizes, ungather_idx = self._build_expert_gather_idx(
-            local_eids, recv_counts, device,
+            local_eids,
+            recv_counts,
+            device,
         )
 
         # Gather into expert-contiguous layout.
@@ -1144,7 +1357,9 @@ class MoEDispatchCombine(nn.Module):
         # Batched forward using shared 3D tensor.
         eids_gathered = local_eids[gather_idx]
         cat_out = expert_collection.forward_expert_batched(
-            feat_gathered, eids_gathered, split_sizes,
+            feat_gathered,
+            eids_gathered,
+            split_sizes,
         )
 
         # Ungather back to recv order.

@@ -20,7 +20,7 @@ def init_ep_dp_groups(
 
     The world of ``world_size`` GPUs is viewed as a 2-D grid::
 
-        world_size = ep_size × dp_size
+        world_size = ep_size x dp_size
 
         GPU layout (ep_size=2, dp_size=2, world_size=4):
 
@@ -118,6 +118,8 @@ def sync_moe_gradients(
     world_group: object | None,
     dp_size: int,
     world_size: int,
+    *,
+    non_routing_divisor: float | None = None,
 ) -> None:
     """All-reduce gradients with the correct group and divisor.
 
@@ -137,10 +139,34 @@ def sync_moe_gradients(
         Number of ranks in the DP group.
     world_size : int
         Total number of ranks.
+    non_routing_divisor : int or float, optional
+        Divisor applied after all-reducing non-routing/shared gradients.
+        Defaults to ``world_size`` for the original EP+DP averaging semantics.
+        Graph parallelism passes ``1`` because ranks hold graph shards of the
+        same sample and their shared-parameter gradients must be summed.
     """
     # Early return: if world_size == 1, no synchronization needed
     if world_size == 1:
         return
+    if non_routing_divisor is None:
+        non_routing_divisor = world_size
+
+    def _ensure_grad_for_collective(
+        param: torch.nn.Parameter,
+        group: object | None,
+    ) -> bool:
+        local_has_grad = param.grad is not None
+        flag = torch.tensor(
+            [int(local_has_grad)],
+            dtype=torch.int32,
+            device=param.device,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+        if flag.item() == 0:
+            return False
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        return True
 
     # Early return: if dp_size == 1 and world_size == ep_size,
     # only routing experts need sync (already done by A2A backward)
@@ -150,21 +176,19 @@ def sync_moe_gradients(
         # and need world-group all-reduce. Routing expert grads are already
         # synced via A2A backward across EP group.
         for name, param in model.named_parameters():
-            if param.grad is None:
-                continue
             if not _is_routing_expert_param(name):
+                if not _ensure_grad_for_collective(param, world_group):
+                    continue
                 # Non-routing params: all-reduce across world
-                dist.all_reduce(
-                    param.grad, op=dist.ReduceOp.SUM, group=world_group
-                )
-                param.grad.div_(world_size)
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=world_group)
+                param.grad.div_(non_routing_divisor)
         return
 
     # General case: both EP and DP are active
     for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
         if _is_routing_expert_param(name):
+            if not _ensure_grad_for_collective(param, dp_group):
+                continue
             # Routing expert grads: all-reduce across DP group only (same expert
             # exists only on dp_size ranks in the same DP column).
             # Divide by world_size (not dp_size) because All-to-All backward
@@ -172,7 +196,7 @@ def sync_moe_gradients(
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
             param.grad.div_(world_size)
         else:
-            dist.all_reduce(
-                param.grad, op=dist.ReduceOp.SUM, group=world_group
-            )
-            param.grad.div_(world_size)
+            if not _ensure_grad_for_collective(param, world_group):
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=world_group)
+            param.grad.div_(non_routing_divisor)

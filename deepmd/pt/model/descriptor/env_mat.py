@@ -90,3 +90,61 @@ def prod_env_mat(
     t_std = stddev[atype]  # [n_atom, dim, 4 or 1]
     env_mat_se_a = (_env_mat_se_a - t_avg) / t_std
     return env_mat_se_a, diff, switch
+
+
+def prod_env_mat_flat(
+    extended_coord_flat: torch.Tensor,
+    nlist_flat: torch.Tensor,
+    atype_flat: torch.Tensor,
+    mean: torch.Tensor,
+    stddev: torch.Tensor,
+    rcut: float,
+    rcut_smth: float,
+    radial_only: bool = False,
+    protection: float = 0.0,
+    use_exp_switch: bool = False,
+    coord_flat: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate smooth environment matrix in flat format."""
+    nloc, nnei = nlist_flat.shape
+    nall = extended_coord_flat.shape[0]
+
+    mask = nlist_flat >= 0
+    nlist_safe = torch.where(mask, nlist_flat, nall)
+
+    if coord_flat is not None:
+        coord_l = coord_flat.view(nloc, 1, 3)
+    else:
+        coord_l = extended_coord_flat[:nloc].view(nloc, 1, 3)
+
+    index = nlist_safe.view(-1).unsqueeze(-1).expand(-1, 3)
+    coord_pad = torch.cat(
+        [extended_coord_flat, extended_coord_flat[-1:, :] + rcut], dim=0
+    )
+    coord_r = torch.gather(coord_pad, 0, index)
+    coord_r = coord_r.view(nloc, nnei, 3)
+
+    diff = coord_r - coord_l
+    length = torch.linalg.norm(diff, dim=-1, keepdim=True)
+    length = length + ~mask.unsqueeze(-1)
+
+    t0 = 1 / (length + protection)
+    t1 = diff / (length + protection) ** 2
+
+    weight = (
+        compute_smooth_weight(length, rcut_smth, rcut)
+        if not use_exp_switch
+        else compute_exp_sw(length, rcut_smth, rcut)
+    )
+    weight = weight * mask.unsqueeze(-1)
+
+    if radial_only:
+        env_mat = t0 * weight
+    else:
+        env_mat = torch.cat([t0, t1], dim=-1) * weight
+
+    diff = diff * mask.unsqueeze(-1)
+    t_avg = mean[atype_flat]
+    t_std = stddev[atype_flat]
+    env_mat = (env_mat - t_avg) / t_std
+    return env_mat, diff, weight

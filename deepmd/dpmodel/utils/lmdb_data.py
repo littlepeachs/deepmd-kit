@@ -281,24 +281,29 @@ class LmdbDataReader:
         # Safe because we use num_workers=0 in DataLoader.
         self._txn = self._env.begin()
 
-        # Scan per-frame nloc only when needed for same-nloc batching.
-        # For mixed_batch=True, skip the scan entirely (future: padding handles it).
-        if not mixed_batch:
-            # Fast path: use pre-computed frame_nlocs from metadata if available.
-            # Falls back to scanning each frame's atom_types shape (~10 us/frame).
-            meta_nlocs = meta.get("frame_nlocs")
-            if meta_nlocs is not None:
-                self._frame_nlocs = [int(n) for n in meta_nlocs]
-            else:
+        # Keep per-frame nloc groups for both batching modes.  The mixed-batch
+        # training loader does not use them, but statistics still need
+        # same-nloc dataloaders so make_stat_input can concatenate samples.
+        meta_nlocs = meta.get("frame_nlocs")
+        if meta_nlocs is not None:
+            self._frame_nlocs = [int(n) for n in meta_nlocs]
+            if len(self._frame_nlocs) != self.nframes:
+                log.warning(
+                    "LMDB metadata frame_nlocs length %d does not match nframes %d; "
+                    "falling back to frame scan.",
+                    len(self._frame_nlocs),
+                    self.nframes,
+                )
                 self._frame_nlocs = _scan_frame_nlocs(
                     self._env, self.nframes, self._frame_fmt, self._natoms
                 )
-            self._nloc_groups: dict[int, list[int]] = {}
-            for idx, nloc in enumerate(self._frame_nlocs):
-                self._nloc_groups.setdefault(nloc, []).append(idx)
         else:
-            self._frame_nlocs = []
-            self._nloc_groups = {}
+            self._frame_nlocs = _scan_frame_nlocs(
+                self._env, self.nframes, self._frame_fmt, self._natoms
+            )
+        self._nloc_groups: dict[int, list[int]] = {}
+        for idx, nloc in enumerate(self._frame_nlocs):
+            self._nloc_groups.setdefault(nloc, []).append(idx)
 
         # Parse frame_system_ids for auto_prob support
         meta_sys_ids = meta.get("frame_system_ids")

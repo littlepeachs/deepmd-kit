@@ -214,6 +214,372 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             model_predict = self._output_type_cast(model_predict, input_prec)
             return model_predict
 
+        def forward_common_flat_native(
+            self,
+            coord: torch.Tensor,
+            atype: torch.Tensor,
+            batch: torch.Tensor,
+            ptr: torch.Tensor,
+            box: torch.Tensor | None = None,
+            fparam: torch.Tensor | None = None,
+            aparam: torch.Tensor | None = None,
+            do_atomic_virial: bool = False,
+            extended_atype: torch.Tensor | None = None,
+            extended_batch: torch.Tensor | None = None,
+            extended_image: torch.Tensor | None = None,
+            extended_ptr: torch.Tensor | None = None,
+            mapping: torch.Tensor | None = None,
+            central_ext_index: torch.Tensor | None = None,
+            nlist: torch.Tensor | None = None,
+            nlist_ext: torch.Tensor | None = None,
+            a_nlist: torch.Tensor | None = None,
+            a_nlist_ext: torch.Tensor | None = None,
+            nlist_mask: torch.Tensor | None = None,
+            a_nlist_mask: torch.Tensor | None = None,
+            edge_index: torch.Tensor | None = None,
+            angle_index: torch.Tensor | None = None,
+            flat_graph_partition: Any | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Forward pass for mixed-nloc batches with a precomputed flat graph."""
+            if do_atomic_virial:
+                raise NotImplementedError(
+                    "Atomic virial is not implemented for flat mixed-batch forward."
+                )
+            coord, box, fparam, aparam, input_prec = self._input_type_cast(
+                coord, box=box, fparam=fparam, aparam=aparam
+            )
+            if self.do_grad_r("energy"):
+                coord = coord.clone().detach().requires_grad_(True)
+            if self.do_grad_c("energy") and box is not None:
+                box = box.clone().detach().requires_grad_(True)
+            if (
+                extended_atype is not None
+                and extended_batch is not None
+                and extended_image is not None
+                and mapping is not None
+                and nlist is not None
+                and nlist_ext is not None
+                and a_nlist is not None
+                and a_nlist_ext is not None
+                and nlist_mask is not None
+                and a_nlist_mask is not None
+                and central_ext_index is not None
+            ):
+                from deepmd.pt.utils.nlist import rebuild_extended_coord_from_flat_graph
+
+                extended_coord = rebuild_extended_coord_from_flat_graph(
+                    coord,
+                    box,
+                    mapping,
+                    extended_batch,
+                    extended_image,
+                )
+            else:
+                raise RuntimeError(
+                    "Flat mixed-batch forward requires precomputed graph fields from "
+                    "the LMDB collate_fn."
+                )
+
+            assert extended_atype is not None
+            assert extended_batch is not None
+            assert mapping is not None
+            assert nlist is not None
+            model_predict_lower = self.forward_common_lower_flat(
+                extended_coord,
+                extended_atype,
+                extended_batch,
+                nlist,
+                mapping,
+                batch,
+                ptr,
+                do_atomic_virial=do_atomic_virial,
+                fparam=fparam,
+                aparam=aparam,
+                extended_ptr=extended_ptr,
+                central_ext_index=central_ext_index,
+                nlist_ext=nlist_ext,
+                a_nlist=a_nlist,
+                a_nlist_ext=a_nlist_ext,
+                nlist_mask=nlist_mask,
+                a_nlist_mask=a_nlist_mask,
+                edge_index=edge_index,
+                angle_index=angle_index,
+                flat_graph_partition=flat_graph_partition,
+            )
+
+            if self.do_grad_r("energy") or self.do_grad_c("energy"):
+                model_predict_lower = self._compute_derivatives_flat(
+                    model_predict_lower,
+                    extended_coord,
+                    extended_atype,
+                    extended_batch,
+                    coord,
+                    atype,
+                    batch,
+                    ptr,
+                    box,
+                    do_atomic_virial,
+                )
+
+            return self._output_type_cast(model_predict_lower, input_prec)
+
+        def forward_common_lower_flat(
+            self,
+            extended_coord: torch.Tensor,
+            extended_atype: torch.Tensor,
+            extended_batch: torch.Tensor,
+            nlist: torch.Tensor,
+            mapping: torch.Tensor,
+            batch: torch.Tensor,
+            ptr: torch.Tensor,
+            do_atomic_virial: bool = False,
+            fparam: torch.Tensor | None = None,
+            aparam: torch.Tensor | None = None,
+            extended_ptr: torch.Tensor | None = None,
+            central_ext_index: torch.Tensor | None = None,
+            nlist_ext: torch.Tensor | None = None,
+            a_nlist: torch.Tensor | None = None,
+            a_nlist_ext: torch.Tensor | None = None,
+            nlist_mask: torch.Tensor | None = None,
+            a_nlist_mask: torch.Tensor | None = None,
+            edge_index: torch.Tensor | None = None,
+            angle_index: torch.Tensor | None = None,
+            flat_graph_partition: Any | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Lower interface for flat batch format."""
+            model_ret = self.atomic_model.forward_common_atomic_flat(
+                extended_coord,
+                extended_atype,
+                extended_batch,
+                nlist,
+                mapping,
+                batch,
+                ptr,
+                fparam=fparam,
+                aparam=aparam,
+                extended_ptr=extended_ptr,
+                central_ext_index=central_ext_index,
+                nlist_ext=nlist_ext,
+                a_nlist=a_nlist,
+                a_nlist_ext=a_nlist_ext,
+                nlist_mask=nlist_mask,
+                a_nlist_mask=a_nlist_mask,
+                edge_index=edge_index,
+                angle_index=angle_index,
+                flat_graph_partition=flat_graph_partition,
+            )
+
+            nframes = ptr.numel() - 1
+            if "energy" in model_ret:
+                energy_atomic = model_ret["energy"]
+                reduce_batch = batch
+                if flat_graph_partition is not None:
+                    from deepmd.pt.utils.graph_parallel import (
+                        gather_node_tensor,
+                        graph_reduce_backward_enabled,
+                        reduce_graph_tensor,
+                    )
+
+                    if isinstance(flat_graph_partition, dict):
+                        local_start = int(flat_graph_partition["local_start"])
+                        local_end = int(flat_graph_partition["local_end"])
+                        local_batch = flat_graph_partition.get("batch")
+                    else:
+                        local_start = int(flat_graph_partition.local_start)
+                        local_end = int(flat_graph_partition.local_end)
+                        local_batch = flat_graph_partition.batch
+                    reduce_batch = (
+                        local_batch
+                        if isinstance(local_batch, torch.Tensor)
+                        else batch[local_start:local_end]
+                    )
+                    reduce_batch = reduce_batch.to(
+                        device=energy_atomic.device,
+                        dtype=torch.long,
+                    )
+                    output_backward = graph_reduce_backward_enabled()
+                    model_ret["energy_local"] = energy_atomic
+                    model_ret["energy"] = gather_node_tensor(
+                        energy_atomic,
+                        dim=0,
+                        backward=output_backward,
+                    )
+                    if "mask" in model_ret:
+                        model_ret["mask_local"] = model_ret["mask"]
+                        model_ret["mask"] = gather_node_tensor(
+                            model_ret["mask"],
+                            dim=0,
+                            backward=output_backward,
+                        )
+                energy_redu = energy_atomic.new_zeros(
+                    (nframes, energy_atomic.shape[-1])
+                )
+                energy_redu.index_add_(0, reduce_batch, energy_atomic)
+                if flat_graph_partition is not None:
+                    energy_redu = reduce_graph_tensor(energy_redu)
+                model_ret["energy_redu"] = energy_redu
+
+            return model_ret
+
+        def _compute_derivatives_flat(
+            self,
+            fit_ret: dict[str, torch.Tensor],
+            extended_coord: torch.Tensor,
+            extended_atype: torch.Tensor,
+            extended_batch: torch.Tensor,
+            coord: torch.Tensor,
+            atype: torch.Tensor,
+            batch: torch.Tensor,
+            ptr: torch.Tensor,
+            box: torch.Tensor | None,
+            do_atomic_virial: bool,
+        ) -> dict[str, torch.Tensor]:
+            """Compute force and virial derivatives for flat batch format."""
+            begin_moe_capture = None
+            end_moe_capture = None
+            if "energy_local" in fit_ret:
+                try:
+                    from deepmd.pt.model.network.moe_ep_ops import (
+                        begin_higher_order_dependency_capture,
+                        end_higher_order_dependency_capture,
+                    )
+
+                    begin_moe_capture = begin_higher_order_dependency_capture
+                    end_moe_capture = end_higher_order_dependency_capture
+                except ImportError:
+                    begin_moe_capture = None
+                    end_moe_capture = None
+
+            if self.do_grad_r("energy"):
+                energy_atomic = fit_ret.get("energy_local", fit_ret["energy"])
+                energy_sum = energy_atomic.sum()
+                if "energy_local" in fit_ret and energy_atomic.numel() == 0:
+                    energy_sum = energy_sum + coord.sum() * 0.0
+                dep_token = (
+                    begin_moe_capture() if begin_moe_capture is not None else None
+                )
+                moe_dep = None
+                try:
+                    energy_derv_r = torch.autograd.grad(
+                        outputs=energy_sum,
+                        inputs=coord,
+                        create_graph=True,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                finally:
+                    if dep_token is not None and end_moe_capture is not None:
+                        moe_dep = end_moe_capture(dep_token, coord)
+                if energy_derv_r is None:
+                    energy_derv_r = coord.new_zeros(coord.shape)
+                if moe_dep is not None:
+                    energy_derv_r = energy_derv_r + moe_dep
+                if "energy_local" in fit_ret:
+                    from deepmd.pt.utils.graph_parallel import reduce_graph_tensor
+
+                    energy_derv_r = reduce_graph_tensor(energy_derv_r)
+                fit_ret["energy_derv_r"] = -energy_derv_r.unsqueeze(-2)
+                fit_ret["dforce"] = -energy_derv_r
+
+            if self.do_grad_c("energy"):
+                energy_atomic = fit_ret.get("energy_local", fit_ret["energy"])
+                energy_sum = energy_atomic.sum()
+                if "energy_local" in fit_ret and energy_atomic.numel() == 0:
+                    energy_sum = energy_sum + extended_coord.sum() * 0.0
+                dep_token = (
+                    begin_moe_capture() if begin_moe_capture is not None else None
+                )
+                moe_dep = None
+                try:
+                    energy_derv_ext = torch.autograd.grad(
+                        outputs=energy_sum,
+                        inputs=extended_coord,
+                        create_graph=True,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                finally:
+                    if dep_token is not None and end_moe_capture is not None:
+                        moe_dep = end_moe_capture(dep_token, extended_coord)
+                if energy_derv_ext is None:
+                    energy_derv_ext = extended_coord.new_zeros(extended_coord.shape)
+                extended_force = -energy_derv_ext
+                extended_virial = torch.einsum(
+                    "ik,ij->ikj",
+                    extended_force,
+                    extended_coord,
+                ).reshape(extended_coord.shape[0], 9)
+                nframes = ptr.numel() - 1
+                energy_derv_c_redu = extended_virial.new_zeros((nframes, 9))
+                energy_derv_c_redu.index_add_(0, extended_batch, extended_virial)
+                if moe_dep is not None:
+                    energy_derv_c_redu = energy_derv_c_redu + moe_dep
+                if "energy_local" in fit_ret:
+                    from deepmd.pt.utils.graph_parallel import reduce_graph_tensor
+
+                    energy_derv_c_redu = reduce_graph_tensor(energy_derv_c_redu)
+                fit_ret["energy_derv_c_redu"] = energy_derv_c_redu.unsqueeze(1)
+
+                if do_atomic_virial:
+                    raise NotImplementedError(
+                        "Atomic virial is not implemented for flat mixed-batch forward."
+                    )
+
+            return fit_ret
+
+        def forward_common_flat(
+            self,
+            coord: torch.Tensor,
+            atype: torch.Tensor,
+            batch: torch.Tensor,
+            ptr: torch.Tensor,
+            box: torch.Tensor | None = None,
+            fparam: torch.Tensor | None = None,
+            aparam: torch.Tensor | None = None,
+            do_atomic_virial: bool = False,
+            extended_atype: torch.Tensor | None = None,
+            extended_batch: torch.Tensor | None = None,
+            extended_image: torch.Tensor | None = None,
+            extended_ptr: torch.Tensor | None = None,
+            mapping: torch.Tensor | None = None,
+            central_ext_index: torch.Tensor | None = None,
+            nlist: torch.Tensor | None = None,
+            nlist_ext: torch.Tensor | None = None,
+            a_nlist: torch.Tensor | None = None,
+            a_nlist_ext: torch.Tensor | None = None,
+            nlist_mask: torch.Tensor | None = None,
+            a_nlist_mask: torch.Tensor | None = None,
+            edge_index: torch.Tensor | None = None,
+            angle_index: torch.Tensor | None = None,
+            flat_graph_partition: Any | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Forward pass for flat mixed-nloc batch."""
+            return self.forward_common_flat_native(
+                coord=coord,
+                atype=atype,
+                batch=batch,
+                ptr=ptr,
+                box=box,
+                fparam=fparam,
+                aparam=aparam,
+                do_atomic_virial=do_atomic_virial,
+                extended_atype=extended_atype,
+                extended_batch=extended_batch,
+                extended_image=extended_image,
+                extended_ptr=extended_ptr,
+                mapping=mapping,
+                central_ext_index=central_ext_index,
+                nlist=nlist,
+                nlist_ext=nlist_ext,
+                a_nlist=a_nlist,
+                a_nlist_ext=a_nlist_ext,
+                nlist_mask=nlist_mask,
+                a_nlist_mask=a_nlist_mask,
+                edge_index=edge_index,
+                angle_index=angle_index,
+                flat_graph_partition=flat_graph_partition,
+            )
+
         def get_out_bias(self) -> torch.Tensor:
             return self.atomic_model.get_out_bias()
 

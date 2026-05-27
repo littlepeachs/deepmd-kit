@@ -167,10 +167,12 @@ def get_trainer(
         # LMDB path: single string → LmdbDataset
         if isinstance(training_systems, str) and is_lmdb(training_systems):
             auto_prob = training_dataset_params.get("auto_prob", None)
+            mixed_batch = training_dataset_params.get("mixed_batch", False)
             train_data_single = LmdbDataset(
                 training_systems,
                 model_params_single["type_map"],
                 training_dataset_params["batch_size"],
+                mixed_batch=mixed_batch,
                 auto_prob_style=auto_prob,
             )
             if (
@@ -178,10 +180,12 @@ def get_trainer(
                 and isinstance(validation_systems, str)
                 and is_lmdb(validation_systems)
             ):
+                val_mixed_batch = validation_dataset_params.get("mixed_batch", False)
                 validation_data_single = LmdbDataset(
                     validation_systems,
                     model_params_single["type_map"],
                     validation_dataset_params["batch_size"],
+                    mixed_batch=val_mixed_batch,
                 )
             elif validation_systems is not None:
                 validation_data_single = _make_dp_loader_set(
@@ -207,11 +211,18 @@ def get_trainer(
 
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
-    # MoE EP+DP group initialization (must be done before data loading)
+    # MoE EP+DP group initialization (must be done before data loading).
+    # GP uses the same rank set as EP in the first GP+EP mode, but with
+    # a separate process group so collective ordering can be controlled.
     use_moe_ep = False
-    ep_group, dp_group = None, None
+    use_graph_parallel = training.validate_graph_parallel_config(config)
+    ep_group, dp_group, gp_group = None, None, None
     ep_rank, ep_size = 0, 1
     dp_rank, dp_size = 0, 1
+    if use_graph_parallel and not (dist.is_available() and dist.is_initialized()):
+        raise ValueError(
+            "training.graph_parallel=True requires distributed launch via torchrun."
+        )
 
     if dist.is_available() and dist.is_initialized():
         # Set CUDA device BEFORE creating process groups (NCCL requirement)
@@ -224,16 +235,64 @@ def get_trainer(
                 repflow_params = descriptor_params.get("repflow", {})
                 use_moe = repflow_params.get("use_moe", False)
                 ep_size_config = config["training"].get("moe_ep_size", 1)
-                if use_moe and ep_size_config > 1:
-                    use_moe_ep = True
+                gp_size_config = config["training"].get("graph_parallel_size", 0)
+                if not gp_size_config:
+                    gp_size_config = ep_size_config
+                if use_graph_parallel:
+                    world_size = dist.get_world_size()
+                    if ep_size_config != world_size:
+                        raise ValueError(
+                            "training.graph_parallel=True currently requires "
+                            "training.moe_ep_size == world_size. "
+                            f"Got moe_ep_size={ep_size_config}, "
+                            f"world_size={world_size}."
+                        )
+                    if gp_size_config != ep_size_config:
+                        raise ValueError(
+                            "training.graph_parallel_size must equal "
+                            "training.moe_ep_size in the first GP+EP mode. "
+                            f"Got graph_parallel_size={gp_size_config}, "
+                            f"moe_ep_size={ep_size_config}."
+                        )
+                if (use_moe and ep_size_config > 1) or use_graph_parallel:
+                    if ep_size_config <= 1:
+                        raise ValueError(
+                            "training.graph_parallel=True requires "
+                            "training.moe_ep_size > 1."
+                        )
+                    if use_moe and ep_size_config > 1:
+                        use_moe_ep = True
                     from deepmd.pt.utils.moe_ep_dp import init_ep_dp_groups
                     import logging as _logging
+
                     _moe_log = _logging.getLogger(__name__)
-                    (ep_group, dp_group, ep_rank, ep_size, dp_rank, dp_size) = init_ep_dp_groups(ep_size_config)
+                    (ep_group, dp_group, ep_rank, ep_size, dp_rank, dp_size) = (
+                        init_ep_dp_groups(ep_size_config)
+                    )
                     _moe_log.info(
                         f"Rank {rank}: MoE EP+DP initialized — "
                         f"EP rank {ep_rank}/{ep_size}, DP rank {dp_rank}/{dp_size}"
                     )
+                    if use_graph_parallel:
+                        from deepmd.pt.utils.graph_parallel import (
+                            set_graph_parallel_context,
+                        )
+
+                        gp_ranks = [
+                            dist.get_rank() - ep_rank + idx for idx in range(ep_size)
+                        ]
+                        gp_group = dist.new_group(gp_ranks)
+                        set_graph_parallel_context(
+                            True,
+                            gp_group,
+                            ep_rank,
+                            ep_size,
+                            reduce_backward=False,
+                        )
+                        _moe_log.info(
+                            f"Rank {rank}: Graph parallel initialized — "
+                            f"GP rank {ep_rank}/{ep_size}"
+                        )
 
     data_seed = config["training"].get("seed", None)
     if not multi_task:
@@ -280,6 +339,10 @@ def get_trainer(
         ep_size=ep_size,
         dp_rank=dp_rank,
         dp_size=dp_size,
+        use_graph_parallel=use_graph_parallel,
+        gp_group=gp_group if use_graph_parallel else None,
+        gp_rank=ep_rank if use_graph_parallel else 0,
+        gp_size=ep_size if use_graph_parallel else 1,
     )
     return trainer
 
@@ -394,6 +457,13 @@ def train(
     # argcheck
     config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
     config = normalize(config, multi_task=multi_task)
+    if training.validate_graph_parallel_config(config):
+        world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+        if os.environ.get("LOCAL_RANK") is None or world_size_env <= 1:
+            raise ValueError(
+                "training.graph_parallel=True requires distributed launch with "
+                "WORLD_SIZE > 1 via torchrun."
+            )
 
     # do neighbor stat
     min_nbor_dist = None

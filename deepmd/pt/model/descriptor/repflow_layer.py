@@ -41,7 +41,7 @@ from deepmd.utils.version import (
     check_version_compatibility,
 )
 
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import record_function
 
 
 class RepFlowLayer(torch.nn.Module):
@@ -78,7 +78,7 @@ class RepFlowLayer(torch.nn.Module):
         n_routing_experts: int = 0,
         moe_topk: int = 0,
         n_shared_experts: int = 0,
-        ep_group=None,
+        ep_group: object | None = None,
         ep_rank: int = 0,
         ep_size: int = 1,
     ) -> None:
@@ -284,39 +284,60 @@ class RepFlowLayer(torch.nn.Module):
         if not self.use_moe:
             # M1: node self mlp
             self.node_self_mlp = MLPLayer(
-                n_dim, n_dim,
-                precision=precision, seed=child_seed(seed, 0), trainable=trainable,
+                n_dim,
+                n_dim,
+                precision=precision,
+                seed=child_seed(seed, 0),
+                trainable=trainable,
             )
             # M2: node sym linear
             self.node_sym_linear = MLPLayer(
-                self.n_sym_dim, n_dim,
-                precision=precision, seed=child_seed(seed, 2), trainable=trainable,
+                self.n_sym_dim,
+                n_dim,
+                precision=precision,
+                seed=child_seed(seed, 2),
+                trainable=trainable,
             )
             # M3: node edge linear
             self.node_edge_linear = MLPLayer(
-                self.edge_info_dim, self.n_multi_edge_message * n_dim,
-                precision=precision, seed=child_seed(seed, 4), trainable=trainable,
+                self.edge_info_dim,
+                self.n_multi_edge_message * n_dim,
+                precision=precision,
+                seed=child_seed(seed, 4),
+                trainable=trainable,
             )
             # M4: edge self linear
             self.edge_self_linear = MLPLayer(
-                self.edge_info_dim, e_dim,
-                precision=precision, seed=child_seed(seed, 6), trainable=trainable,
+                self.edge_info_dim,
+                e_dim,
+                precision=precision,
+                seed=child_seed(seed, 6),
+                trainable=trainable,
             )
             if self.update_angle:
                 # M5: edge angle linear1
                 self.edge_angle_linear1 = MLPLayer(
-                    self.angle_dim, self.e_dim,
-                    precision=precision, seed=child_seed(seed, 10), trainable=trainable,
+                    self.angle_dim,
+                    self.e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 10),
+                    trainable=trainable,
                 )
                 # M6: edge angle linear2
                 self.edge_angle_linear2 = MLPLayer(
-                    self.e_dim, self.e_dim,
-                    precision=precision, seed=child_seed(seed, 11), trainable=trainable,
+                    self.e_dim,
+                    self.e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 11),
+                    trainable=trainable,
                 )
                 # M7: angle self linear
                 self.angle_self_linear = MLPLayer(
-                    self.angle_dim, self.a_dim,
-                    precision=precision, seed=child_seed(seed, 13), trainable=trainable,
+                    self.angle_dim,
+                    self.a_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 13),
+                    trainable=trainable,
                 )
             else:
                 self.edge_angle_linear1 = None
@@ -342,16 +363,25 @@ class RepFlowLayer(torch.nn.Module):
 
             # 3 independent routers (node, edge, angle).
             self.node_router = MoERouter(
-                n_dim, n_routing_experts, moe_topk,
-                precision=precision, seed=child_seed(seed, 200),
+                n_dim,
+                n_routing_experts,
+                moe_topk,
+                precision=precision,
+                seed=child_seed(seed, 200),
             )
             self.edge_router = MoERouter(
-                n_dim, n_routing_experts, moe_topk,
-                precision=precision, seed=child_seed(seed, 201),
+                n_dim,
+                n_routing_experts,
+                moe_topk,
+                precision=precision,
+                seed=child_seed(seed, 201),
             )
             self.angle_router = MoERouter(
-                n_dim, n_routing_experts, moe_topk,
-                precision=precision, seed=child_seed(seed, 202),
+                n_dim,
+                n_routing_experts,
+                moe_topk,
+                precision=precision,
+                seed=child_seed(seed, 202),
             )
 
             # MoE dispatch-compute-combine for Phase 1 MLPs.
@@ -376,8 +406,11 @@ class RepFlowLayer(torch.nn.Module):
 
             # M6 (edge_angle_linear2): not MoE, local shared param.
             self.edge_angle_linear2_moe = MLPLayer(
-                e_dim, e_dim,
-                precision=precision, seed=child_seed(seed, 220), trainable=trainable,
+                e_dim,
+                e_dim,
+                precision=precision,
+                seed=child_seed(seed, 220),
+                trainable=trainable,
             )
 
     @staticmethod
@@ -801,9 +834,19 @@ class RepFlowLayer(torch.nn.Module):
                 )
                 with record_function("forward_moe"):
                     return self.forward_moe(
-                        node_ebd_ext, edge_ebd, h2, angle_ebd,
-                        nlist, nlist_mask, sw, a_nlist, a_nlist_mask, a_sw,
-                        edge_index, angle_index, type_embedding,
+                        node_ebd_ext,
+                        edge_ebd,
+                        h2,
+                        angle_ebd,
+                        nlist,
+                        nlist_mask,
+                        sw,
+                        a_nlist,
+                        a_nlist_mask,
+                        a_sw,
+                        edge_index,
+                        angle_index,
+                        type_embedding,
                     )
         """
         Parameters
@@ -1274,16 +1317,24 @@ class RepFlowLayer(torch.nn.Module):
 
         # Symmetrization: grrg from edge_ebd, drrd from nei_node_ebd.
         grrg = self.symmetrization_op_dynamic(
-            edge_ebd, h2, sw,
-            owner=n2e_index, num_owner=nb * nloc,
-            nb=nb, nloc=nloc,
+            edge_ebd,
+            h2,
+            sw,
+            owner=n2e_index,
+            num_owner=nb * nloc,
+            nb=nb,
+            nloc=nloc,
             scale_factor=self.dynamic_e_sel ** (-0.5),
             axis_neuron=self.axis_neuron,
         )
         drrd = self.symmetrization_op_dynamic(
-            nei_node_ebd, h2, sw,
-            owner=n2e_index, num_owner=nb * nloc,
-            nb=nb, nloc=nloc,
+            nei_node_ebd,
+            h2,
+            sw,
+            owner=n2e_index,
+            num_owner=nb * nloc,
+            nb=nb,
+            nloc=nloc,
             scale_factor=self.dynamic_e_sel ** (-0.5),
             axis_neuron=self.axis_neuron,
         )
@@ -1293,17 +1344,13 @@ class RepFlowLayer(torch.nn.Module):
         node_m1_input = node_ebd.reshape(N_node, self.n_dim)
 
         # M2 input: cat(grrg, drrd) flat, [N_node, n_sym_dim].
-        node_m2_input = torch.cat([grrg, drrd], dim=-1).reshape(
-            N_node, self.n_sym_dim
-        )
+        node_m2_input = torch.cat([grrg, drrd], dim=-1).reshape(N_node, self.n_sym_dim)
 
         # Edge info for merged M3+M4: cat(node_i, node_j, edge_ebd).
         # n_edge x (n_dim + n_dim + e_dim) = n_edge x edge_info_dim.
         edge_info = torch.cat(
             [
-                torch.index_select(
-                    node_ebd.reshape(-1, self.n_dim), 0, n2e_index
-                ),
+                torch.index_select(node_ebd.reshape(-1, self.n_dim), 0, n2e_index),
                 nei_node_ebd,
                 edge_ebd,
             ],
@@ -1317,15 +1364,12 @@ class RepFlowLayer(torch.nn.Module):
         # n_angle x n_a_compress_dim.
         node_for_angle_info = torch.index_select(
             node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
-            0, n2a_index,
+            0,
+            n2a_index,
         )
         # n_angle x e_a_compress_dim.
-        edge_for_angle_k = torch.index_select(
-            edge_ebd_for_angle, 0, eik2a_index
-        )
-        edge_for_angle_j = torch.index_select(
-            edge_ebd_for_angle, 0, eij2a_index
-        )
+        edge_for_angle_k = torch.index_select(edge_ebd_for_angle, 0, eik2a_index)
+        edge_for_angle_j = torch.index_select(edge_ebd_for_angle, 0, eij2a_index)
         # n_angle x angle_dim.
         angle_info = torch.cat(
             [angle_ebd, node_for_angle_info, edge_for_angle_k, edge_for_angle_j],
@@ -1383,12 +1427,479 @@ class RepFlowLayer(torch.nn.Module):
             eij2a_index,
             average=False,
             num_owner=n_edge,
-        ) / (self.dynamic_a_sel ** 0.5)
+        ) / (self.dynamic_a_sel**0.5)
 
         # ---- Step 6: M6 (local, not MoE) ----
         edge_angle2_out = self.act(self.edge_angle_linear2_moe(edge_angle_agg))
 
         # ---- Step 7: list_update ----
+        n_update_list: list[torch.Tensor] = [
+            node_ebd,
+            node_m1_out.reshape(nb, nloc, self.n_dim),
+            node_m2_out.reshape(nb, nloc, self.n_dim),
+            node_edge_agg,
+        ]
+        e_update_list: list[torch.Tensor] = [
+            edge_ebd,
+            edge_self_out,
+            edge_angle2_out,
+        ]
+        a_update_list: list[torch.Tensor] = [
+            angle_ebd,
+            angle_self_out,
+        ]
+
+        n_updated = self.list_update(n_update_list, "node")
+        e_updated = self.list_update(e_update_list, "edge")
+        a_updated = self.list_update(a_update_list, "angle")
+        return n_updated, e_updated, a_updated
+
+    @torch.jit.unused
+    def forward_gp(
+        self,
+        node_ebd_ext: torch.Tensor,  # 1 x n_global x n_dim
+        edge_ebd: torch.Tensor,  # n_local_edge x e_dim
+        h2: torch.Tensor,  # n_local_edge x 3
+        angle_ebd: torch.Tensor,  # n_local_angle x a_dim
+        sw: torch.Tensor,  # n_local_edge
+        a_sw: torch.Tensor,  # n_local_angle
+        edge_index: torch.Tensor,  # 2 x n_local_edge
+        angle_index: torch.Tensor,  # 3 x n_local_angle
+        local_start: int,
+        local_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Graph-parallel non-MoE forward over one rank's local node tokens."""
+        if self.use_moe:
+            raise RuntimeError("Non-MoE GP forward was called on a MoE layer.")
+        if not self.use_dynamic_sel:
+            raise NotImplementedError(
+                "GP RepFlowLayer forward requires use_dynamic_sel=True."
+            )
+        if not self.smooth_edge_update:
+            raise NotImplementedError(
+                "GP RepFlowLayer forward requires smooth_edge_update=True."
+            )
+        if node_ebd_ext.dim() != 3 or node_ebd_ext.shape[0] != 1:
+            raise RuntimeError(
+                "GP forward expects node_ebd_ext with shape [1, N, n_dim]."
+            )
+        if edge_index.dim() != 2 or edge_index.shape[0] != 2:
+            raise RuntimeError("GP forward expects edge_index with shape [2, n_edge].")
+        if angle_index.dim() != 2 or angle_index.shape[0] != 3:
+            raise RuntimeError(
+                "GP forward expects angle_index with shape [3, n_angle]."
+            )
+        if node_ebd_ext.shape[-1] != self.n_dim:
+            raise RuntimeError("GP forward node_ebd_ext has an unexpected feature dim.")
+        if edge_ebd.dim() != 2 or edge_ebd.shape[-1] != self.e_dim:
+            raise RuntimeError("GP forward edge_ebd must have shape [n_edge, e_dim].")
+        if h2.dim() != 2 or h2.shape[-1] != 3:
+            raise RuntimeError("GP forward h2 must have shape [n_edge, 3].")
+        if angle_ebd.dim() != 2 or angle_ebd.shape[-1] != self.a_dim:
+            raise RuntimeError("GP forward angle_ebd must have shape [n_angle, a_dim].")
+        if h2.shape[0] != edge_ebd.shape[0] or sw.shape[0] != edge_ebd.shape[0]:
+            raise RuntimeError(
+                "GP forward edge tensors have inconsistent leading sizes."
+            )
+        if edge_index.shape[1] != edge_ebd.shape[0]:
+            raise RuntimeError("GP forward edge_index and edge tensors disagree.")
+        if (
+            angle_index.shape[1] != angle_ebd.shape[0]
+            or a_sw.shape[0] != angle_ebd.shape[0]
+        ):
+            raise RuntimeError(
+                "GP forward angle tensors have inconsistent leading sizes."
+            )
+
+        nb = 1
+        nloc = int(local_size)
+        nall = node_ebd_ext.shape[1]
+        if local_start < 0 or nloc < 0 or local_start + nloc > nall:
+            raise RuntimeError("GP forward local node range is outside node_ebd_ext.")
+        node_ebd = node_ebd_ext[:, local_start : local_start + nloc, :]
+        n_edge = edge_ebd.shape[0]
+        n_angle = angle_ebd.shape[0]
+
+        n2e_index = edge_index[0] - local_start
+        n_ext2e_index = edge_index[1]
+        n2a_index = angle_index[0] - local_start
+        eij2a_index = angle_index[1]
+        eik2a_index = angle_index[2]
+
+        if n_edge > 0:
+            if torch.any(n2e_index < 0) or torch.any(n2e_index >= nloc):
+                raise RuntimeError(
+                    "GP forward local edge owners are outside local nodes."
+                )
+            if torch.any(n_ext2e_index < 0) or torch.any(n_ext2e_index >= nall):
+                raise RuntimeError(
+                    "GP forward edge neighbors are outside node_ebd_ext."
+                )
+        if n_angle > 0:
+            if torch.any(n2a_index < 0) or torch.any(n2a_index >= nloc):
+                raise RuntimeError(
+                    "GP forward local angle owners are outside local nodes."
+                )
+            if torch.any(eij2a_index < 0) or torch.any(eij2a_index >= n_edge):
+                raise RuntimeError(
+                    "GP forward angle eij indices are outside local edges."
+                )
+            if torch.any(eik2a_index < 0) or torch.any(eik2a_index >= n_edge):
+                raise RuntimeError(
+                    "GP forward angle eik indices are outside local edges."
+                )
+
+        assert self.node_self_mlp is not None
+        assert self.node_sym_linear is not None
+        assert self.node_edge_linear is not None
+        assert self.edge_self_linear is not None
+
+        nei_node_ebd = torch.index_select(
+            node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
+        )
+
+        n_update_list: list[torch.Tensor] = [node_ebd]
+        e_update_list: list[torch.Tensor] = [edge_ebd]
+        a_update_list: list[torch.Tensor] = [angle_ebd]
+
+        node_self_mlp = self.act(self.node_self_mlp(node_ebd))
+        n_update_list.append(node_self_mlp)
+
+        grrg = self.symmetrization_op_dynamic(
+            edge_ebd,
+            h2,
+            sw,
+            owner=n2e_index,
+            num_owner=nloc,
+            nb=nb,
+            nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+        drrd = self.symmetrization_op_dynamic(
+            nei_node_ebd,
+            h2,
+            sw,
+            owner=n2e_index,
+            num_owner=nloc,
+            nb=nb,
+            nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+        node_sym = self.act(self.node_sym_linear(torch.cat([grrg, drrd], dim=-1)))
+        n_update_list.append(node_sym)
+
+        if not self.optim_update:
+            edge_info = torch.cat(
+                [
+                    torch.index_select(node_ebd.reshape(-1, self.n_dim), 0, n2e_index),
+                    nei_node_ebd,
+                    edge_ebd,
+                ],
+                dim=-1,
+            )
+            node_edge_update = self.act(
+                self.node_edge_linear(edge_info)
+            ) * sw.unsqueeze(-1)
+            edge_self_update = self.act(self.edge_self_linear(edge_info))
+        else:
+            node_edge_update = self.act(
+                self.optim_edge_update_dynamic(
+                    node_ebd,
+                    node_ebd_ext,
+                    edge_ebd,
+                    n2e_index,
+                    n_ext2e_index,
+                    "node",
+                )
+            ) * sw.unsqueeze(-1)
+            edge_self_update = self.act(
+                self.optim_edge_update_dynamic(
+                    node_ebd,
+                    node_ebd_ext,
+                    edge_ebd,
+                    n2e_index,
+                    n_ext2e_index,
+                    "edge",
+                )
+            )
+
+        node_edge_update = (
+            aggregate(
+                node_edge_update,
+                n2e_index,
+                average=False,
+                num_owner=nloc,
+            ).reshape(nb, nloc, node_edge_update.shape[-1])
+            / self.dynamic_e_sel
+        )
+
+        if self.n_multi_edge_message > 1:
+            node_edge_update_mul_head = node_edge_update.view(
+                nb, nloc, self.n_multi_edge_message, self.n_dim
+            )
+            for head_index in range(self.n_multi_edge_message):
+                n_update_list.append(node_edge_update_mul_head[..., head_index, :])
+        else:
+            n_update_list.append(node_edge_update)
+
+        n_updated = self.list_update(n_update_list, "node")
+        e_update_list.append(edge_self_update)
+
+        if self.update_angle:
+            assert self.angle_self_linear is not None
+            assert self.edge_angle_linear1 is not None
+            assert self.edge_angle_linear2 is not None
+
+            if self.a_compress_rate != 0:
+                if not self.a_compress_use_split:
+                    assert self.a_compress_n_linear is not None
+                    assert self.a_compress_e_linear is not None
+                    node_ebd_for_angle = self.a_compress_n_linear(node_ebd)
+                    edge_ebd_for_angle = self.a_compress_e_linear(edge_ebd)
+                else:
+                    node_ebd_for_angle = node_ebd[..., : self.n_a_compress_dim]
+                    edge_ebd_for_angle = edge_ebd[..., : self.e_a_compress_dim]
+            else:
+                node_ebd_for_angle = node_ebd
+                edge_ebd_for_angle = edge_ebd
+
+            if not self.optim_update:
+                node_for_angle_info = torch.index_select(
+                    node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
+                    0,
+                    n2a_index,
+                )
+                edge_for_angle_k = torch.index_select(
+                    edge_ebd_for_angle, 0, eik2a_index
+                )
+                edge_for_angle_j = torch.index_select(
+                    edge_ebd_for_angle, 0, eij2a_index
+                )
+                angle_info = torch.cat(
+                    [
+                        angle_ebd,
+                        node_for_angle_info,
+                        edge_for_angle_k,
+                        edge_for_angle_j,
+                    ],
+                    dim=-1,
+                )
+                edge_angle_update = self.act(self.edge_angle_linear1(angle_info))
+                angle_self_update = self.act(self.angle_self_linear(angle_info))
+            else:
+                edge_angle_update = self.act(
+                    self.optim_angle_update_dynamic(
+                        angle_ebd,
+                        node_ebd_for_angle,
+                        edge_ebd_for_angle,
+                        n2a_index,
+                        eij2a_index,
+                        eik2a_index,
+                        "edge",
+                    )
+                )
+                angle_self_update = self.act(
+                    self.optim_angle_update_dynamic(
+                        angle_ebd,
+                        node_ebd_for_angle,
+                        edge_ebd_for_angle,
+                        n2a_index,
+                        eij2a_index,
+                        eik2a_index,
+                        "angle",
+                    )
+                )
+
+            weighted_edge_angle_update = edge_angle_update * a_sw.unsqueeze(-1)
+            padding_edge_angle_update = aggregate(
+                weighted_edge_angle_update,
+                eij2a_index,
+                average=False,
+                num_owner=n_edge,
+            ) / (self.dynamic_a_sel**0.5)
+            e_update_list.append(
+                self.act(self.edge_angle_linear2(padding_edge_angle_update))
+            )
+            a_update_list.append(angle_self_update)
+
+        e_updated = self.list_update(e_update_list, "edge")
+        a_updated = self.list_update(a_update_list, "angle")
+        return n_updated, e_updated, a_updated
+
+    @torch.jit.unused
+    def forward_moe_gp(
+        self,
+        node_ebd_ext: torch.Tensor,  # 1 x n_global x n_dim
+        edge_ebd: torch.Tensor,  # n_local_edge x e_dim
+        h2: torch.Tensor,  # n_local_edge x 3
+        angle_ebd: torch.Tensor,  # n_local_angle x a_dim
+        sw: torch.Tensor,  # n_local_edge
+        a_sw: torch.Tensor,  # n_local_angle
+        edge_index: torch.Tensor,  # 2 x n_local_edge
+        angle_index: torch.Tensor,  # 3 x n_local_angle
+        type_embedding: torch.Tensor,  # 1 x n_local_node x n_dim
+        local_start: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Graph-parallel MoE forward over one rank's local node tokens."""
+        if node_ebd_ext.dim() != 3 or node_ebd_ext.shape[0] != 1:
+            raise RuntimeError("GP MoE expects node_ebd_ext with shape [1, N, n_dim].")
+        if type_embedding.dim() != 3 or type_embedding.shape[0] != 1:
+            raise RuntimeError(
+                "GP MoE expects type_embedding with shape [1, N, n_dim]."
+            )
+        if edge_index.dim() != 2 or edge_index.shape[0] != 2:
+            raise RuntimeError("GP MoE expects edge_index with shape [2, n_edge].")
+        if angle_index.dim() != 2 or angle_index.shape[0] != 3:
+            raise RuntimeError("GP MoE expects angle_index with shape [3, n_angle].")
+        if node_ebd_ext.shape[-1] != self.n_dim:
+            raise RuntimeError("GP MoE node_ebd_ext has an unexpected feature dim.")
+        if type_embedding.shape[-1] != self.n_dim:
+            raise RuntimeError("GP MoE type_embedding has an unexpected feature dim.")
+        if edge_ebd.dim() != 2 or edge_ebd.shape[-1] != self.e_dim:
+            raise RuntimeError("GP MoE edge_ebd must have shape [n_edge, e_dim].")
+        if h2.dim() != 2 or h2.shape[-1] != 3:
+            raise RuntimeError("GP MoE h2 must have shape [n_edge, 3].")
+        if angle_ebd.dim() != 2 or angle_ebd.shape[-1] != self.a_dim:
+            raise RuntimeError("GP MoE angle_ebd must have shape [n_angle, a_dim].")
+        if h2.shape[0] != edge_ebd.shape[0] or sw.shape[0] != edge_ebd.shape[0]:
+            raise RuntimeError("GP MoE edge tensors have inconsistent leading sizes.")
+        if edge_index.shape[1] != edge_ebd.shape[0]:
+            raise RuntimeError("GP MoE edge_index and edge tensors disagree.")
+        if (
+            angle_index.shape[1] != angle_ebd.shape[0]
+            or a_sw.shape[0] != angle_ebd.shape[0]
+        ):
+            raise RuntimeError("GP MoE angle tensors have inconsistent leading sizes.")
+
+        nb = 1
+        nloc = type_embedding.shape[1]
+        nall = node_ebd_ext.shape[1]
+        if local_start < 0 or local_start + nloc > nall:
+            raise RuntimeError("GP MoE local node range is outside node_ebd_ext.")
+        node_ebd = node_ebd_ext[:, local_start : local_start + nloc, :]
+        n_edge = edge_ebd.shape[0]
+        n_angle = angle_ebd.shape[0]
+
+        n2e_index = edge_index[0] - local_start
+        n_ext2e_index = edge_index[1]
+        n2a_index = angle_index[0] - local_start
+        eij2a_index = angle_index[1]
+        eik2a_index = angle_index[2]
+
+        if n_edge > 0:
+            if torch.any(n2e_index < 0) or torch.any(n2e_index >= nloc):
+                raise RuntimeError("GP MoE local edge owners are outside local nodes.")
+            if torch.any(n_ext2e_index < 0) or torch.any(n_ext2e_index >= nall):
+                raise RuntimeError("GP MoE edge neighbors are outside node_ebd_ext.")
+        if n_angle > 0:
+            if torch.any(n2a_index < 0) or torch.any(n2a_index >= nloc):
+                raise RuntimeError("GP MoE local angle owners are outside local nodes.")
+            if torch.any(eij2a_index < 0) or torch.any(eij2a_index >= n_edge):
+                raise RuntimeError("GP MoE angle eij indices are outside local edges.")
+            if torch.any(eik2a_index < 0) or torch.any(eik2a_index >= n_edge):
+                raise RuntimeError("GP MoE angle eik indices are outside local edges.")
+
+        # Neighbor node embedding keeps global indexing into the gathered nodes.
+        nei_node_ebd = torch.index_select(
+            node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
+        )
+
+        grrg = self.symmetrization_op_dynamic(
+            edge_ebd,
+            h2,
+            sw,
+            owner=n2e_index,
+            num_owner=nloc,
+            nb=nb,
+            nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+        drrd = self.symmetrization_op_dynamic(
+            nei_node_ebd,
+            h2,
+            sw,
+            owner=n2e_index,
+            num_owner=nloc,
+            nb=nb,
+            nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+
+        node_m1_input = node_ebd.reshape(nloc, self.n_dim)
+        node_m2_input = torch.cat([grrg, drrd], dim=-1).reshape(nloc, self.n_sym_dim)
+
+        edge_info = torch.cat(
+            [
+                torch.index_select(node_ebd.reshape(-1, self.n_dim), 0, n2e_index),
+                nei_node_ebd,
+                edge_ebd,
+            ],
+            dim=-1,
+        )
+
+        node_ebd_for_angle = node_ebd[..., : self.n_a_compress_dim]
+        edge_ebd_for_angle = edge_ebd[..., : self.e_a_compress_dim]
+        node_for_angle_info = torch.index_select(
+            node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
+            0,
+            n2a_index,
+        )
+        edge_for_angle_k = torch.index_select(edge_ebd_for_angle, 0, eik2a_index)
+        edge_for_angle_j = torch.index_select(edge_ebd_for_angle, 0, eij2a_index)
+        angle_info = torch.cat(
+            [angle_ebd, node_for_angle_info, edge_for_angle_k, edge_for_angle_j],
+            dim=-1,
+        )
+
+        node_router_out = self.node_router(type_embedding)
+        edge_router_out = self.edge_router(type_embedding)
+        angle_router_out = self.angle_router(type_embedding)
+
+        with record_function("moe_phase1"):
+            node_m1_out, node_m2_out, edge_merged_out, angle_merged_out = (
+                self.moe_phase1(
+                    node_m1_input=node_m1_input,
+                    node_m2_input=node_m2_input,
+                    edge_input=edge_info,
+                    angle_input=angle_info,
+                    node_router_out=node_router_out,
+                    edge_router_out=edge_router_out,
+                    angle_router_out=angle_router_out,
+                    n2e_index=n2e_index,
+                    n2a_index=n2a_index,
+                )
+            )
+
+        node_edge_out, edge_self_out = edge_merged_out.split(
+            [self.n_dim, self.e_dim], dim=-1
+        )
+        edge_angle1_out, angle_self_out = angle_merged_out.split(
+            [self.e_dim, self.a_dim], dim=-1
+        )
+
+        node_edge_agg = (
+            aggregate(
+                node_edge_out * sw.unsqueeze(-1),
+                n2e_index,
+                average=False,
+                num_owner=nloc,
+            ).reshape(nb, nloc, self.n_dim)
+            / self.dynamic_e_sel
+        )
+
+        edge_angle_agg = aggregate(
+            edge_angle1_out * a_sw.unsqueeze(-1),
+            eij2a_index,
+            average=False,
+            num_owner=n_edge,
+        ) / (self.dynamic_a_sel**0.5)
+
+        edge_angle2_out = self.act(self.edge_angle_linear2_moe(edge_angle_agg))
+
         n_update_list: list[torch.Tensor] = [
             node_ebd,
             node_m1_out.reshape(nb, nloc, self.n_dim),
@@ -1532,7 +2043,7 @@ class RepFlowLayer(torch.nn.Module):
         return data
 
     @classmethod
-    def deserialize(cls, data: dict) -> "RepFlowLayer":
+    def deserialize(cls, data: dict) -> RepFlowLayer:
         """Deserialize the networks from a dict.
 
         Parameters

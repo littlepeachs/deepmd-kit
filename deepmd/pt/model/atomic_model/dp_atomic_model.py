@@ -318,6 +318,143 @@ class DPAtomicModel(BaseAtomicModel):
             )
         return fit_ret
 
+    def forward_common_atomic_flat(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_batch: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        extended_ptr: torch.Tensor | None = None,
+        central_ext_index: torch.Tensor | None = None,
+        nlist_ext: torch.Tensor | None = None,
+        a_nlist: torch.Tensor | None = None,
+        a_nlist_ext: torch.Tensor | None = None,
+        nlist_mask: torch.Tensor | None = None,
+        a_nlist_mask: torch.Tensor | None = None,
+        edge_index: torch.Tensor | None = None,
+        angle_index: torch.Tensor | None = None,
+        flat_graph_partition: Any | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Forward pass with flat batch format."""
+        if self.do_grad_r() or self.do_grad_c():
+            extended_coord.requires_grad_(True)
+
+        if (
+            hasattr(self.fitting_net, "get_dim_fparam")
+            and self.fitting_net.get_dim_fparam() > 0
+            and fparam is None
+        ):
+            default_fparam_tensor = self.fitting_net.get_default_fparam()
+            assert default_fparam_tensor is not None
+            fparam_input_for_des = torch.tile(
+                default_fparam_tensor.to(device=extended_coord.device).unsqueeze(0),
+                [ptr.numel() - 1, 1],
+            )
+        else:
+            fparam_input_for_des = fparam
+
+        descriptor_out = self.descriptor.forward_flat(
+            extended_coord,
+            extended_atype,
+            extended_batch,
+            nlist,
+            mapping,
+            batch,
+            ptr,
+            fparam=fparam_input_for_des if self.add_chg_spin_ebd else None,
+            central_ext_index=central_ext_index,
+            nlist_ext=nlist_ext,
+            a_nlist=a_nlist,
+            a_nlist_ext=a_nlist_ext,
+            nlist_mask=nlist_mask,
+            a_nlist_mask=a_nlist_mask,
+            edge_index=edge_index,
+            angle_index=angle_index,
+            flat_graph_partition=flat_graph_partition,
+        )
+
+        descriptor = descriptor_out.get("descriptor")
+        rot_mat = descriptor_out.get("rot_mat")
+        g2 = descriptor_out.get("g2")
+        h2 = descriptor_out.get("h2")
+
+        if self.enable_eval_descriptor_hook:
+            self.eval_descriptor_list.append(descriptor.detach())
+
+        if central_ext_index is None:
+            from deepmd.pt.utils.nlist import get_central_ext_index
+
+            central_ext_index = get_central_ext_index(extended_batch, ptr)
+        atype = extended_atype[central_ext_index]
+
+        fit_descriptor = descriptor
+        fit_rot_mat = rot_mat
+        fit_atype = atype
+        fit_batch = batch
+        fit_atom_index = None
+        fit_aparam = aparam
+        if flat_graph_partition is not None:
+            if isinstance(flat_graph_partition, dict):
+                local_start = int(flat_graph_partition["local_start"])
+                local_end = int(flat_graph_partition["local_end"])
+                atom_index = flat_graph_partition["atom_index"]
+            else:
+                local_start = int(flat_graph_partition.local_start)
+                local_end = int(flat_graph_partition.local_end)
+                atom_index = flat_graph_partition.atom_index
+            fit_atom_index = atom_index.to(device=descriptor.device, dtype=torch.long)
+            if descriptor.shape[0] == batch.shape[0]:
+                fit_descriptor = descriptor[local_start:local_end]
+            if rot_mat is not None and rot_mat.shape[0] == batch.shape[0]:
+                fit_rot_mat = rot_mat[local_start:local_end]
+            fit_atype = atype[local_start:local_end]
+            fit_batch = batch[local_start:local_end]
+            if (
+                aparam is not None
+                and aparam.dim() > 0
+                and aparam.shape[0] == batch.shape[0]
+            ):
+                fit_aparam = aparam[local_start:local_end]
+
+        fit_ret = self.fitting_net.forward_flat(
+            fit_descriptor,
+            fit_atype,
+            fit_batch,
+            ptr,
+            atom_index=fit_atom_index,
+            gr=fit_rot_mat,
+            g2=g2,
+            h2=h2,
+            fparam=fparam,
+            aparam=fit_aparam,
+        )
+
+        atom_mask = self.make_atom_mask(fit_atype).to(torch.int32)
+        if self.atom_excl is not None:
+            atom_mask *= self.atom_excl(fit_atype.unsqueeze(0)).squeeze(0)
+
+        for kk in fit_ret.keys():
+            out_shape = fit_ret[kk].shape
+            out_shape2 = 1
+            for ss in out_shape[1:]:
+                out_shape2 *= ss
+            fit_ret[kk] = (
+                fit_ret[kk].reshape([out_shape[0], out_shape2]) * atom_mask[:, None]
+            ).view(out_shape)
+        fit_ret["mask"] = atom_mask
+
+        if self.enable_eval_fitting_last_layer_hook and "middle_output" in fit_ret:
+            self.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
+            )
+
+        return fit_ret
+
     def compute_or_load_stat(
         self,
         sampled_func: Callable[[], list[dict]],

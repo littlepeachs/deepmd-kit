@@ -123,16 +123,17 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         type_map: list[str] | None = None,
         add_chg_spin_ebd: bool = False,
         # MoE EP params (not part of RepFlowArgs, set at runtime).
-        ep_group=None,
+        ep_group: object | None = None,
         ep_rank: int = 0,
         ep_size: int = 1,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
 
         # Obtain EP runtime params from thread-local context (set by Trainer).
         # This avoids putting non-serializable ProcessGroup objects in the config dict.
         from deepmd.pt.utils.moe_context import get_moe_ep_context
+
         ctx_ep_group, ctx_ep_rank, ctx_ep_size = get_moe_ep_context()
         if ctx_ep_group is not None:
             ep_group = ctx_ep_group
@@ -611,6 +612,98 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if h2 is not None else None,
             sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if sw is not None else None,
         )
+
+    def forward_flat(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_batch: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+        fparam: torch.Tensor | None = None,
+        central_ext_index: torch.Tensor | None = None,
+        nlist_ext: torch.Tensor | None = None,
+        a_nlist: torch.Tensor | None = None,
+        a_nlist_ext: torch.Tensor | None = None,
+        nlist_mask: torch.Tensor | None = None,
+        a_nlist_mask: torch.Tensor | None = None,
+        edge_index: torch.Tensor | None = None,
+        angle_index: torch.Tensor | None = None,
+        flat_graph_partition: Any | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute the descriptor with flat batch format."""
+        extended_coord = extended_coord.to(dtype=self.prec)
+        node_ebd_ext = self.type_embedding(extended_atype)
+
+        if self.add_chg_spin_ebd:
+            assert fparam is not None
+            assert self.chg_embedding is not None
+            assert self.spin_embedding is not None
+
+            charge = fparam[extended_batch, 0].to(dtype=torch.int64) + 100
+            spin = fparam[extended_batch, 1].to(dtype=torch.int64)
+            chg_ebd = self.chg_embedding(charge)
+            spin_ebd = self.spin_embedding(spin)
+            sys_cs_embd = self.act(
+                self.mix_cs_mlp(torch.cat((chg_ebd, spin_ebd), dim=-1))
+            )
+            node_ebd_ext = node_ebd_ext + sys_cs_embd
+
+        if central_ext_index is None:
+            from deepmd.pt.utils.nlist import get_central_ext_index
+
+            central_ext_index = get_central_ext_index(extended_batch, ptr)
+        node_ebd_inp = node_ebd_ext[central_ext_index]
+
+        node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows.forward_flat(
+            nlist,
+            extended_coord,
+            extended_atype,
+            extended_batch,
+            node_ebd_ext,
+            mapping,
+            batch,
+            ptr,
+            central_ext_index=central_ext_index,
+            nlist_ext=nlist_ext,
+            a_nlist=a_nlist,
+            a_nlist_ext=a_nlist_ext,
+            nlist_mask=nlist_mask,
+            a_nlist_mask=a_nlist_mask,
+            edge_index=edge_index,
+            angle_index=angle_index,
+            flat_graph_partition=flat_graph_partition,
+        )
+
+        if self.concat_output_tebd:
+            if flat_graph_partition is not None:
+                if isinstance(flat_graph_partition, dict):
+                    local_start = int(flat_graph_partition["local_start"])
+                    local_end = int(flat_graph_partition["local_end"])
+                else:
+                    local_start = int(flat_graph_partition.local_start)
+                    local_end = int(flat_graph_partition.local_end)
+                node_ebd_inp = node_ebd_inp[local_start:local_end]
+            node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)
+
+        return {
+            "descriptor": node_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            "rot_mat": (
+                rot_mat.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                if rot_mat is not None
+                else None
+            ),
+            "g2": (
+                edge_ebd.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+                if edge_ebd is not None
+                else None
+            ),
+            "h2": (
+                h2.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION) if h2 is not None else None
+            ),
+        }
 
     @classmethod
     def update_sel(

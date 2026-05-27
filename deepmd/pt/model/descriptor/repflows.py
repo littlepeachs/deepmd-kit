@@ -230,7 +230,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         n_routing_experts: int = 0,
         moe_topk: int = 0,
         n_shared_experts: int = 0,
-        ep_group=None,
+        ep_group: object | None = None,
         ep_rank: int = 0,
         ep_size: int = 1,
     ) -> None:
@@ -590,7 +590,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
-        for idx, ll in enumerate(self.layers):
+        for ll in self.layers:
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parallel_mode
             if not parallel_mode:
@@ -693,6 +693,428 @@ class DescrptBlockRepflows(DescriptorBlock):
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
 
         return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
+
+    def forward_flat(
+        self,
+        nlist: torch.Tensor,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_batch: torch.Tensor,
+        extended_atype_embd: torch.Tensor,
+        mapping: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+        central_ext_index: torch.Tensor | None = None,
+        nlist_ext: torch.Tensor | None = None,
+        a_nlist: torch.Tensor | None = None,
+        a_nlist_ext: torch.Tensor | None = None,
+        nlist_mask: torch.Tensor | None = None,
+        a_nlist_mask: torch.Tensor | None = None,
+        edge_index: torch.Tensor | None = None,
+        angle_index: torch.Tensor | None = None,
+        flat_graph_partition: object | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Forward pass for a precomputed flat graph batch."""
+        from deepmd.pt.model.descriptor.env_mat import prod_env_mat_flat
+
+        nloc = batch.shape[0]
+        if (
+            central_ext_index is None
+            or nlist_ext is None
+            or a_nlist is None
+            or a_nlist_ext is None
+            or nlist_mask is None
+            or a_nlist_mask is None
+        ):
+            raise RuntimeError(
+                "Repflows flat forward requires precomputed graph fields from collate_fn."
+            )
+        coord_central = extended_coord[central_ext_index]
+        atype = extended_atype[central_ext_index]
+
+        atype_embd = extended_atype_embd[central_ext_index]
+        assert list(atype_embd.shape) == [nloc, self.n_dim]
+        node_ebd = self.act(atype_embd)
+        node_ebd_batched = node_ebd.unsqueeze(0)
+        atype_embd_batched = atype_embd.unsqueeze(0)
+
+        if flat_graph_partition is not None:
+            return self.forward_flat_gp(
+                node_ebd_batched,
+                atype_embd_batched,
+                nlist,
+                extended_coord,
+                atype,
+                coord_central,
+                nlist_ext,
+                a_nlist,
+                a_nlist_ext,
+                nlist_mask,
+                a_nlist_mask,
+                edge_index,
+                angle_index,
+                flat_graph_partition,
+                nloc,
+            )
+
+        dmatrix, diff, sw = prod_env_mat_flat(
+            extended_coord,
+            nlist_ext,
+            atype,
+            self.mean,
+            self.stddev,
+            self.e_rcut,
+            self.e_rcut_smth,
+            protection=self.env_protection,
+            use_exp_switch=self.use_exp_switch,
+            coord_flat=coord_central,
+        )
+
+        sw = torch.squeeze(sw, -1)
+        sw = sw.masked_fill(~nlist_mask, 0.0)
+
+        _, a_diff, a_sw = prod_env_mat_flat(
+            extended_coord,
+            a_nlist_ext,
+            atype,
+            self.mean[:, : self.a_sel],
+            self.stddev[:, : self.a_sel],
+            self.a_rcut,
+            self.a_rcut_smth,
+            protection=self.env_protection,
+            use_exp_switch=self.use_exp_switch,
+            coord_flat=coord_central,
+        )
+
+        a_sw = torch.squeeze(a_sw, -1)
+        a_sw = a_sw.masked_fill(~a_nlist_mask, 0.0)
+
+        edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
+        if self.edge_init_use_dist:
+            edge_input = safe_for_norm(diff, dim=-1, keepdim=True)
+
+        normalized_diff_i = a_diff / (
+            safe_for_norm(a_diff, dim=-1, keepdim=True) + 1e-6
+        )
+        normalized_diff_j = torch.transpose(normalized_diff_i, 1, 2)
+        cosine_ij = torch.matmul(normalized_diff_i, normalized_diff_j) * (1 - 1e-6)
+        angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
+
+        if self.use_dynamic_sel:
+            if edge_index is None or angle_index is None:
+                raise RuntimeError(
+                    "Dynamic flat forward requires precomputed edge_index and angle_index."
+                )
+            edge_input = edge_input[nlist_mask]
+            h2 = h2[nlist_mask]
+            sw = sw[nlist_mask]
+            a_nlist_mask_2d = a_nlist_mask[:, :, None] & a_nlist_mask[:, None, :]
+            angle_input = angle_input[a_nlist_mask_2d]
+            a_sw = (a_sw[:, :, None] * a_sw[:, None, :])[a_nlist_mask_2d]
+        else:
+            edge_index = torch.zeros([2, 1], device=nlist.device, dtype=nlist.dtype)
+            angle_index = torch.zeros([3, 1], device=nlist.device, dtype=nlist.dtype)
+
+        if not self.edge_init_use_dist:
+            edge_ebd = self.act(self.edge_embd(edge_input))
+        else:
+            edge_ebd = self.edge_embd(edge_input)
+        angle_ebd = self.angle_embd(angle_input)
+
+        node_ebd_batched = node_ebd.unsqueeze(0)
+        edge_ebd_batched = (
+            edge_ebd.unsqueeze(0) if not self.use_dynamic_sel else edge_ebd
+        )
+        h2_batched = h2.unsqueeze(0) if not self.use_dynamic_sel else h2
+        angle_ebd_batched = (
+            angle_ebd.unsqueeze(0) if not self.use_dynamic_sel else angle_ebd
+        )
+        nlist_batched = nlist.unsqueeze(0)
+        nlist_mask_batched = nlist_mask.unsqueeze(0)
+        sw_batched = sw.unsqueeze(0) if not self.use_dynamic_sel else sw
+        a_nlist_batched = a_nlist.unsqueeze(0)
+        a_nlist_mask_batched = a_nlist_mask.unsqueeze(0)
+        a_sw_batched = a_sw.unsqueeze(0) if not self.use_dynamic_sel else a_sw
+
+        for ll in self.layers:
+            node_ebd_ext_batched = node_ebd_batched
+
+            node_ebd_batched, edge_ebd_batched, angle_ebd_batched = ll.forward(
+                node_ebd_ext_batched,
+                edge_ebd_batched,
+                h2_batched,
+                angle_ebd_batched,
+                nlist_batched,
+                nlist_mask_batched,
+                sw_batched,
+                a_nlist_batched,
+                a_nlist_mask_batched,
+                a_sw_batched,
+                edge_index=edge_index,
+                angle_index=angle_index,
+                type_embedding=atype_embd_batched if self.use_moe else None,
+            )
+
+        if self.use_dynamic_sel:
+            h2g2 = RepFlowLayer._cal_hg_dynamic(
+                edge_ebd_batched,
+                h2_batched,
+                sw_batched,
+                owner=edge_index[0],
+                num_owner=nloc,
+                nb=1,
+                nloc=nloc,
+                scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
+            ).squeeze(0)
+        else:
+            h2g2 = RepFlowLayer._cal_hg(
+                edge_ebd_batched,
+                h2_batched,
+                nlist_mask_batched,
+                sw_batched,
+            )
+            h2g2 = h2g2.squeeze(0)
+
+        node_ebd = node_ebd_batched.squeeze(0)
+        edge_ebd = (
+            edge_ebd_batched.squeeze(0)
+            if not self.use_dynamic_sel
+            else edge_ebd_batched
+        )
+        h2 = h2_batched.squeeze(0) if not self.use_dynamic_sel else h2_batched
+        sw = sw_batched.squeeze(0) if not self.use_dynamic_sel else sw_batched
+
+        rot_mat = torch.permute(h2g2, (0, 2, 1))
+        return node_ebd, edge_ebd, h2, rot_mat, sw
+
+    def forward_flat_gp(
+        self,
+        node_ebd_batched: torch.Tensor,
+        atype_embd_batched: torch.Tensor,
+        nlist: torch.Tensor,
+        extended_coord: torch.Tensor,
+        atype: torch.Tensor,
+        coord_central: torch.Tensor,
+        nlist_ext: torch.Tensor,
+        a_nlist: torch.Tensor,
+        a_nlist_ext: torch.Tensor,
+        nlist_mask: torch.Tensor,
+        a_nlist_mask: torch.Tensor,
+        edge_index: torch.Tensor | None,
+        angle_index: torch.Tensor | None,
+        flat_graph_partition: object,
+        nloc: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Forward pass for one flat graph-parallel partition.
+
+        Full node embeddings are kept as layer input so local edges can read
+        cross-rank neighbor nodes.  Edge, angle, and routed node updates are
+        restricted to this rank's center-atom shard.  Between layers the local
+        node output is gathered back into a full flat node embedding for the
+        next layer; the final descriptor and rotation matrix remain local.
+        """
+        if not self.use_dynamic_sel:
+            raise NotImplementedError(
+                "flat graph parallel Repflows currently requires use_dynamic_sel=True"
+            )
+        if edge_index is None or angle_index is None:
+            raise RuntimeError(
+                "Flat graph parallel Repflows requires edge_index and angle_index."
+            )
+
+        from deepmd.pt.model.descriptor.env_mat import prod_env_mat_flat
+        from deepmd.pt.utils.graph_parallel import gather_node_tensor
+
+        def part_attr(name: str) -> object:
+            if isinstance(flat_graph_partition, dict):
+                return flat_graph_partition[name]
+            return getattr(flat_graph_partition, name)
+
+        local_start = int(part_attr("local_start"))
+        local_end = int(part_attr("local_end"))
+        local_size = int(part_attr("local_size"))
+        local_edge_mask = part_attr("edge_mask")
+        local_edge_index = part_attr("edge_index")
+        local_angle_mask = part_attr("angle_mask")
+        local_angle_index = part_attr("angle_index")
+        if not isinstance(local_edge_mask, torch.Tensor):
+            raise RuntimeError("Flat GP partition edge_mask must be a tensor.")
+        if not isinstance(local_edge_index, torch.Tensor):
+            raise RuntimeError("Flat GP partition edge_index must be a tensor.")
+        if not isinstance(local_angle_mask, torch.Tensor):
+            raise RuntimeError("Flat GP partition angle_mask must be a tensor.")
+        if not isinstance(local_angle_index, torch.Tensor):
+            raise RuntimeError("Flat GP partition angle_index must be a tensor.")
+        if local_edge_index.numel() > 0:
+            if torch.any(local_edge_index[0] < local_start) or torch.any(
+                local_edge_index[0] >= local_end
+            ):
+                raise RuntimeError("Flat GP local edge owners are out of range.")
+        if local_angle_index.numel() > 0:
+            if torch.any(local_angle_index[0] < local_start) or torch.any(
+                local_angle_index[0] >= local_end
+            ):
+                raise RuntimeError("Flat GP local angle owners are out of range.")
+            if torch.any(local_angle_index[1] < 0) or torch.any(
+                local_angle_index[2] < 0
+            ):
+                raise RuntimeError("Flat GP local angle edge refs are negative.")
+            if torch.any(
+                local_angle_index[1] >= local_edge_index.shape[1]
+            ) or torch.any(local_angle_index[2] >= local_edge_index.shape[1]):
+                raise RuntimeError("Flat GP local angle edge refs are out of range.")
+
+        local_nlist_ext = nlist_ext[local_start:local_end]
+        local_nlist_mask = nlist_mask[local_start:local_end]
+        local_a_nlist_ext = a_nlist_ext[local_start:local_end]
+        local_a_nlist_mask = a_nlist_mask[local_start:local_end]
+        local_atype = atype[local_start:local_end]
+        local_coord_central = coord_central[local_start:local_end]
+
+        dmatrix, diff, sw = prod_env_mat_flat(
+            extended_coord,
+            local_nlist_ext,
+            local_atype,
+            self.mean,
+            self.stddev,
+            self.e_rcut,
+            self.e_rcut_smth,
+            protection=self.env_protection,
+            use_exp_switch=self.use_exp_switch,
+            coord_flat=local_coord_central,
+        )
+        sw = torch.squeeze(sw, -1)
+        sw = sw.masked_fill(~local_nlist_mask, 0.0)
+
+        _, a_diff, a_sw = prod_env_mat_flat(
+            extended_coord,
+            local_a_nlist_ext,
+            local_atype,
+            self.mean[:, : self.a_sel],
+            self.stddev[:, : self.a_sel],
+            self.a_rcut,
+            self.a_rcut_smth,
+            protection=self.env_protection,
+            use_exp_switch=self.use_exp_switch,
+            coord_flat=local_coord_central,
+        )
+        a_sw = torch.squeeze(a_sw, -1)
+        a_sw = a_sw.masked_fill(~local_a_nlist_mask, 0.0)
+
+        edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
+        if self.edge_init_use_dist:
+            edge_input = safe_for_norm(diff, dim=-1, keepdim=True)
+
+        edge_input = edge_input[local_nlist_mask]
+        h2 = h2[local_nlist_mask]
+        sw = sw[local_nlist_mask]
+        if edge_input.shape[0] != local_edge_index.shape[1]:
+            raise RuntimeError(
+                "Local GP edge embedding count does not match partition edge_index."
+            )
+
+        normalized_diff_i = a_diff / (
+            safe_for_norm(a_diff, dim=-1, keepdim=True) + 1e-6
+        )
+        normalized_diff_j = torch.transpose(normalized_diff_i, 1, 2)
+        cosine_ij = torch.matmul(normalized_diff_i, normalized_diff_j) * (1 - 1e-6)
+        angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
+
+        local_angle_owner_mask = (angle_index[0] >= local_start) & (
+            angle_index[0] < local_end
+        )
+        local_a_nlist_mask_2d = (
+            local_a_nlist_mask[:, :, None] & local_a_nlist_mask[:, None, :]
+        )
+        angle_input = angle_input[local_a_nlist_mask_2d]
+        a_sw = (a_sw[:, :, None] * a_sw[:, None, :])[local_a_nlist_mask_2d]
+        local_angle_select = local_angle_mask[local_angle_owner_mask]
+        if local_angle_select.shape[0] != angle_input.shape[0]:
+            raise RuntimeError(
+                "Local GP angle mask count does not match local angle construction."
+            )
+        angle_input = angle_input[local_angle_select]
+        a_sw = a_sw[local_angle_select]
+        if angle_input.shape[0] != local_angle_index.shape[1]:
+            raise RuntimeError(
+                "Local GP angle embedding count does not match partition angle_index."
+            )
+
+        if not self.edge_init_use_dist:
+            edge_ebd = self.act(self.edge_embd(edge_input))
+        else:
+            edge_ebd = self.edge_embd(edge_input)
+        angle_ebd = self.angle_embd(angle_input)
+
+        for idx, ll in enumerate(self.layers):
+            if self.use_moe:
+                local_type_embedding = atype_embd_batched[:, local_start:local_end, :]
+                node_out, edge_out, angle_out = ll.forward_moe_gp(
+                    node_ebd_batched,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    sw,
+                    a_sw,
+                    edge_index=local_edge_index,
+                    angle_index=local_angle_index,
+                    type_embedding=local_type_embedding,
+                    local_start=local_start,
+                )
+                local_node_ebd = node_out.squeeze(0)
+            else:
+                node_out, edge_out, angle_out = ll.forward_gp(
+                    node_ebd_batched,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    sw,
+                    a_sw,
+                    edge_index=local_edge_index,
+                    angle_index=local_angle_index,
+                    local_start=local_start,
+                    local_size=local_size,
+                )
+                local_node_ebd = node_out.squeeze(0)
+            if idx != len(self.layers) - 1:
+                node_ebd_batched = gather_node_tensor(local_node_ebd, dim=0).unsqueeze(
+                    0
+                )
+            edge_ebd = edge_out
+            angle_ebd = angle_out
+
+        local_owner = local_edge_index[0] - local_start
+        h2g2 = RepFlowLayer._cal_hg_dynamic(
+            edge_ebd,
+            h2,
+            sw,
+            owner=local_owner,
+            num_owner=local_size,
+            nb=1,
+            nloc=local_size,
+            scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
+        ).squeeze(0)
+        local_rot_mat = torch.permute(h2g2, (0, 2, 1))
+
+        return (
+            local_node_ebd,
+            None,
+            None,
+            local_rot_mat,
+            None,
+        )
 
     def compute_input_stats(
         self,

@@ -197,5 +197,103 @@ class InvarFitting(GeneralFitting):
             )
         return result
 
+    def forward_flat(
+        self,
+        descriptor: torch.Tensor,
+        atype: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+        atom_index: torch.Tensor | None = None,
+        gr: torch.Tensor | None = None,
+        g2: torch.Tensor | None = None,
+        h2: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Forward pass with flat batch format."""
+        device = descriptor.device
+        batch = batch.to(device=device, dtype=torch.long)
+        ptr = ptr.to(device=device, dtype=torch.long)
+        atype = atype.to(device=device)
+
+        nframes = ptr.numel() - 1
+        total_atoms = descriptor.shape[0]
+        atom_counts = ptr[1:] - ptr[:-1]
+        max_nloc = int(atom_counts.max().item())
+        if atom_index is None:
+            flat_index = torch.arange(total_atoms, dtype=torch.long, device=device)
+        else:
+            flat_index = atom_index.to(device=device, dtype=torch.long)
+            if flat_index.numel() != total_atoms:
+                raise RuntimeError(
+                    "atom_index length must match the flat descriptor length."
+                )
+        local_index = flat_index - ptr[batch]
+
+        descriptor_batch = torch.zeros(
+            (nframes, max_nloc, descriptor.shape[1]),
+            dtype=descriptor.dtype,
+            device=device,
+        )
+        atype_batch = torch.full(
+            (nframes, max_nloc),
+            -1,
+            dtype=atype.dtype,
+            device=device,
+        )
+        gr_batch = None
+        if gr is not None:
+            gr_batch = torch.zeros(
+                (nframes, max_nloc, *gr.shape[1:]),
+                dtype=gr.dtype,
+                device=device,
+            )
+        aparam_batch = None
+        if aparam is not None:
+            aparam_batch = torch.zeros(
+                (nframes, max_nloc, *aparam.shape[1:]),
+                dtype=aparam.dtype,
+                device=device,
+            )
+
+        descriptor_batch[batch, local_index] = descriptor
+        atype_batch[batch, local_index] = atype
+        if gr is not None:
+            assert gr_batch is not None
+            gr_batch[batch, local_index] = gr
+        if aparam is not None:
+            assert aparam_batch is not None
+            aparam_batch[batch, local_index] = aparam
+
+        result_batch = self.forward(
+            descriptor_batch,
+            atype_batch,
+            gr=gr_batch,
+            g2=g2,
+            h2=h2,
+            fparam=fparam,
+            aparam=aparam_batch,
+        )
+
+        valid_atom_mask = torch.arange(
+            max_nloc, dtype=torch.long, device=device
+        ).unsqueeze(0) < atom_counts.unsqueeze(1)
+        result_flat: dict[str, torch.Tensor] = {}
+        for key, value in result_batch.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.dim() >= 2
+                and value.shape[0] == nframes
+                and value.shape[1] == max_nloc
+            ):
+                if atom_index is None:
+                    result_flat[key] = value[valid_atom_mask]
+                else:
+                    result_flat[key] = value[batch, local_index]
+            else:
+                result_flat[key] = value
+
+        return result_flat
+
     # make jit happy with torch 2.0.0
     exclude_types: list[int]

@@ -3,11 +3,15 @@ import datetime
 import functools
 import json
 import logging
+import os
 import time
 from collections.abc import (
     Callable,
     Generator,
     Iterable,
+)
+from contextlib import (
+    nullcontext,
 )
 from copy import (
     deepcopy,
@@ -77,6 +81,7 @@ from deepmd.pt.utils.learning_rate import (
 from deepmd.pt.utils.lmdb_dataset import (
     LmdbDataset,
     _collate_lmdb_batch,
+    _collate_lmdb_mixed_batch,
     _SameNlocBatchSamplerTorch,
 )
 from deepmd.pt.utils.stat import (
@@ -108,6 +113,7 @@ from torch.distributed.optim import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import (
     DataLoader,
+    DistributedSampler,
 )
 
 from deepmd.utils.path import (
@@ -117,6 +123,91 @@ from deepmd.utils.path import (
 from torch.profiler import profile, record_function, ProfilerActivity
 
 log = logging.getLogger(__name__)
+
+_FLAT_GRAPH_INPUT_KEYS = (
+    "batch",
+    "ptr",
+    "extended_atype",
+    "extended_batch",
+    "extended_image",
+    "extended_ptr",
+    "mapping",
+    "central_ext_index",
+    "nlist",
+    "nlist_ext",
+    "a_nlist",
+    "a_nlist_ext",
+    "nlist_mask",
+    "a_nlist_mask",
+    "edge_index",
+    "angle_index",
+)
+
+
+def validate_graph_parallel_config(
+    config: dict[str, Any],
+    *,
+    graph_parallel: bool | None = None,
+) -> bool:
+    """Validate config constraints for graph-parallel training.
+
+    This intentionally does not query torch.distributed state so it can run
+    before process-group initialization and from direct Trainer API paths.
+    """
+    training_params = config.get("training", {})
+    use_graph_parallel = (
+        training_params.get("graph_parallel", False)
+        if graph_parallel is None
+        else graph_parallel
+    )
+    if not use_graph_parallel:
+        return False
+
+    model_params = config.get("model", {})
+    if "model_dict" in model_params:
+        raise ValueError(
+            "training.graph_parallel=True currently supports only single-task training."
+        )
+
+    model_type = model_params.get("type", "ener")
+    if model_type not in {"ener", "standard"}:
+        raise ValueError(
+            "training.graph_parallel=True currently supports only "
+            "model.type 'ener' or 'standard'. "
+            f"Got model.type={model_type!r}."
+        )
+
+    descriptor_params = model_params.get("descriptor") or {}
+    descriptor_type = descriptor_params.get("type")
+    if descriptor_type != "dpa3":
+        raise ValueError(
+            "training.graph_parallel=True currently supports only "
+            "descriptor.type 'dpa3'. "
+            f"Got descriptor.type={descriptor_type!r}."
+        )
+
+    repflow_params = descriptor_params.get("repflow") or {}
+    if not repflow_params.get("use_dynamic_sel", False):
+        raise ValueError(
+            "training.graph_parallel=True currently requires "
+            "model.descriptor.repflow.use_dynamic_sel=True."
+        )
+    if not repflow_params.get("smooth_edge_update", False):
+        raise ValueError(
+            "training.graph_parallel=True currently requires "
+            "model.descriptor.repflow.smooth_edge_update=True."
+        )
+
+    fitting_params = model_params.get("fitting_net") or {}
+    fitting_type = fitting_params.get("type", "ener")
+    if fitting_type != "ener":
+        raise ValueError(
+            "training.graph_parallel=True currently supports only ordinary "
+            "energy fitting with fitting_net.type omitted or set to 'ener'. "
+            f"Got fitting_net.type={fitting_type!r}."
+        )
+
+    return True
 
 
 class Trainer:
@@ -134,12 +225,16 @@ class Trainer:
         finetune_links: dict[str, str] | None = None,
         init_frz_model: str | None = None,
         use_moe_ep: bool = False,
-        ep_group=None,
-        dp_group=None,
+        ep_group: object | None = None,
+        dp_group: object | None = None,
         ep_rank: int = 0,
         ep_size: int = 1,
         dp_rank: int = 0,
         dp_size: int = 1,
+        use_graph_parallel: bool = False,
+        gp_group: object | None = None,
+        gp_rank: int = 0,
+        gp_size: int = 1,
     ) -> None:
         """Construct a DeePMD trainer.
 
@@ -171,6 +266,14 @@ class Trainer:
         self.num_model = len(self.model_keys)
         self.model_prob = None
 
+        if use_graph_parallel:
+            validate_graph_parallel_config(config, graph_parallel=True)
+            if gp_size <= 1:
+                raise ValueError(
+                    "training.graph_parallel=True requires a graph_parallel "
+                    "group size greater than 1."
+                )
+
         # MoE EP+DP group initialization (passed from get_trainer)
         self.use_moe_ep = use_moe_ep
         self.ep_group = ep_group
@@ -179,6 +282,14 @@ class Trainer:
         self.ep_size = ep_size
         self.dp_rank = dp_rank
         self.dp_size = dp_size
+        self.use_graph_parallel = use_graph_parallel
+        self.gp_group = gp_group
+        self.gp_rank = gp_rank
+        self.gp_size = gp_size
+        self._gp_batch_broadcast_validated: set[str] = set()
+        self._flat_graph_partitions: dict[str, Any] = {}
+        self._flat_graph_configs: dict[str, dict[str, Any]] = {}
+        self._gp_profile = bool(int(os.environ.get("DEEPMD_GP_PROFILE", "0")))
 
         # Iteration config
         self.num_steps = training_params.get("numb_steps")
@@ -244,6 +355,7 @@ class Trainer:
             _training_data: DpLoaderSet | LmdbDataset,
             _validation_data: DpLoaderSet | LmdbDataset | None,
             _training_params: dict[str, Any],
+            _task_key: str = "Default",
         ) -> tuple[
             DataLoader,
             Generator[Any, None, None],
@@ -254,19 +366,82 @@ class Trainer:
             def get_dataloader_and_iter_lmdb(
                 _data: LmdbDataset,
             ) -> tuple[DataLoader, Generator[Any, None, None]]:
+                _shuffle = _training_params.get("shuffle", True)
+                _seed = _training_params.get("seed", training_params.get("seed", 42))
+                if _seed is None:
+                    _seed = 42
+
                 if _data.mixed_batch:
-                    # TODO [mixed_batch=True]: Replace SameNlocBatchSampler with
-                    # RandomSampler(replacement=False) + padding collate_fn.
-                    # Changes needed:
-                    #   1. _collate_lmdb_batch: pad coord/force/atype to max_nloc,
-                    #      add "atom_mask" bool tensor (nframes, max_nloc)
-                    #   2. Use RandomSampler(_data, replacement=False) as sampler
-                    #   3. Use fixed batch_size in DataLoader (not batch_sampler)
-                    #   4. Model forward: apply atom_mask to descriptor/fitting
-                    #   5. Loss: mask out padded atoms in force loss
-                    raise NotImplementedError(
-                        "mixed_batch=True training is not yet supported."
+                    from torch.utils.data import (
+                        RandomSampler,
+                        SequentialSampler,
                     )
+
+                    if self.use_graph_parallel:
+                        # GP ranks must consume the same mixed batch.  Rank 0
+                        # of the GP group owns the loader stream and broadcasts
+                        # the batch in get_data().
+                        if _shuffle:
+                            generator = torch.Generator()
+                            generator.manual_seed(_seed)
+                            _sampler = RandomSampler(
+                                _data, replacement=False, generator=generator
+                            )
+                        else:
+                            _sampler = SequentialSampler(_data)
+                    elif self.world_size > 1:
+                        _sampler = DistributedSampler(
+                            _data,
+                            num_replicas=self.world_size,
+                            rank=self.rank,
+                            shuffle=_shuffle,
+                            seed=_seed,
+                            drop_last=False,
+                        )
+                    elif _shuffle:
+                        generator = torch.Generator()
+                        generator.manual_seed(_seed)
+                        _sampler = RandomSampler(
+                            _data, replacement=False, generator=generator
+                        )
+                    else:
+                        _sampler = SequentialSampler(_data)
+
+                    model_for_graph = (
+                        self.model[_task_key] if self.multi_task else self.model
+                    )
+                    descriptor = model_for_graph.atomic_model.descriptor
+                    if not hasattr(descriptor, "repflows"):
+                        raise ValueError(
+                            "mixed_batch=True currently requires a flat-graph "
+                            "capable descriptor, for example DPA3/RepFlow."
+                        )
+                    graph_config = {
+                        "rcut": descriptor.get_rcut(),
+                        "sel": descriptor.get_sel(),
+                        "a_rcut": descriptor.repflows.a_rcut,
+                        "a_sel": descriptor.repflows.a_sel,
+                        "mixed_types": descriptor.mixed_types(),
+                        "ntypes": descriptor.get_ntypes(),
+                        "pair_exclude_types": getattr(
+                            model_for_graph.atomic_model,
+                            "pair_exclude_types",
+                            [],
+                        ),
+                    }
+                    self._flat_graph_configs[_task_key] = graph_config
+
+                    _dataloader = DataLoader(
+                        _data,
+                        batch_size=_data.batch_size,
+                        sampler=_sampler,
+                        num_workers=0,
+                        collate_fn=_collate_lmdb_mixed_batch,
+                        pin_memory=(DEVICE != "cpu"),
+                    )
+                    _data_iter = cycle_iterator(_dataloader)
+                    return _dataloader, _data_iter
+
                 # mixed_batch=False: group frames by nloc, each batch same nloc.
                 # SameNlocBatchSampler yields list[int] per batch, all same nloc.
                 # Auto batch_size is computed per-nloc-group inside the sampler.
@@ -285,14 +460,15 @@ class Trainer:
                         _data._reader,
                         rank=self.rank,
                         world_size=self.world_size,
-                        shuffle=True,
-                        seed=_training_params.get("seed", None),
+                        shuffle=_shuffle,
+                        seed=_seed,
                         block_targets=_block_targets,
                     )
                 else:
                     _inner_sampler = SameNlocBatchSampler(
                         _data._reader,
-                        shuffle=True,
+                        shuffle=_shuffle,
+                        seed=_seed,
                         block_targets=_block_targets,
                     )
 
@@ -418,10 +594,21 @@ class Trainer:
             }
 
         # Model
+        if self.use_graph_parallel:
+            from deepmd.pt.utils.graph_parallel import set_graph_parallel_context
+
+            set_graph_parallel_context(
+                True,
+                self.gp_group,
+                self.gp_rank,
+                self.gp_size,
+                reduce_backward=False,
+            )
         if self.use_moe_ep:
             # Set MoE EP context (thread-local) for model construction.
             # This avoids putting ProcessGroup in config dict (which breaks deepcopy).
             from deepmd.pt.utils.moe_context import set_moe_ep_context
+
             set_moe_ep_context(self.ep_group, self.ep_rank, self.ep_size)
         self.model = get_model_for_wrapper(
             model_params,
@@ -555,6 +742,7 @@ class Trainer:
                     training_data[model_key],
                     validation_data[model_key],
                     training_params["data_dict"][model_key],
+                    model_key,
                 )
 
                 # training_data[model_key].print_summary(
@@ -1055,6 +1243,21 @@ class Trainer:
             "Ensure the model has MoEDispatchCombine layers."
         )
 
+    def _profile_mark(self, label: str, start: float) -> float:
+        """Log a lightweight GP timing mark when requested by env var."""
+        if not self._gp_profile:
+            return time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        log.info(
+            "GP_PROFILE rank=%s label=%s elapsed=%.6f",
+            self.rank,
+            label,
+            now - start,
+        )
+        return now
+
     def _load_optimizer_state(
         self, optimizer_state_dict: dict[str, Any] | None
     ) -> None:
@@ -1121,9 +1324,11 @@ class Trainer:
             cur_lr = self.lr_schedule.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
+            profile_t0 = time.perf_counter()
             input_dict, label_dict, log_dict = self.get_data(
                 is_train=True, task_key=task_key
             )
+            profile_t0 = self._profile_mark("get_data", profile_t0)
             if SAMPLER_RECORD:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
@@ -1131,30 +1336,63 @@ class Trainer:
             if self.opt_type in ["Adam", "AdamW", "AdaMuon", "HybridMuon"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 pref_lr = cur_lr
-                with record_function("forward+backward"):
-                    model_pred, loss, more_loss = self.wrapper(
-                        **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                    )
-                # MoE EP+DP: manual gradient sync with correct groups (clean separation).
-                # Standard DDP all-reduces ALL gradients across world_size, which is incorrect
-                # for routing experts (should only sync within DP group). Use no_sync() to
-                # disable DDP's automatic sync, then manually sync with correct groups.
-                with record_function("loss_backward"):
-                    if self.use_moe_ep:
-                        with self.wrapper.no_sync():
-                            loss.backward()
-                        # Manual sync: routing experts → DP group, others → world group.
-                        from deepmd.pt.utils.moe_ep_dp import sync_moe_gradients
-                        sync_moe_gradients(
-                            self._get_inner_module(),
-                            self.dp_group,
-                            None,  # world_group (use default)
-                            self.dp_size,
-                            self.world_size,
+                if self.use_moe_ep and self.use_graph_parallel:
+                    from deepmd.pt.utils.collective_order import collective_ordering
+
+                    ordering_context = collective_ordering()
+                else:
+                    ordering_context = nullcontext()
+                with ordering_context:
+                    with record_function("forward+backward"):
+                        model_pred, loss, more_loss = self.wrapper(
+                            **input_dict,
+                            cur_lr=pref_lr,
+                            label=label_dict,
+                            task_key=task_key,
                         )
-                    else:
-                        # Standard DDP: automatic gradient sync during backward.
-                        loss.backward()
+                    profile_t0 = self._profile_mark("forward_loss", profile_t0)
+                    # MoE EP+DP: manual gradient sync with correct groups (clean separation).
+                    # Standard DDP all-reduces ALL gradients across world_size, which is incorrect
+                    # for routing experts (should only sync within DP group). Use no_sync() to
+                    # disable DDP's automatic sync, then manually sync with correct groups.
+                    with record_function("loss_backward"):
+                        if self.use_moe_ep or self.use_graph_parallel:
+                            with self.wrapper.no_sync():
+                                backward_loss = loss
+                                if self.use_graph_parallel:
+                                    # GP force/virial backward mixes GP collectives
+                                    # with MoE EP all-to-all nodes. Keep autograd
+                                    # execution single-threaded so every rank
+                                    # traverses collective nodes in the same order.
+                                    with torch.autograd.set_multithreading_enabled(
+                                        False
+                                    ):
+                                        backward_loss.backward()
+                                else:
+                                    backward_loss.backward()
+                            profile_t0 = self._profile_mark("backward", profile_t0)
+                            # Manual sync: routing experts -> DP group,
+                            # shared/non-routing params -> world group.  GP
+                            # sums shared gradients because ranks own graph
+                            # shards of the same batch, not data-parallel
+                            # replicas.
+                            from deepmd.pt.utils.moe_ep_dp import sync_moe_gradients
+
+                            sync_moe_gradients(
+                                self._get_inner_module(),
+                                self.dp_group,
+                                None,  # world_group (use default)
+                                self.dp_size,
+                                self.world_size,
+                                non_routing_divisor=(
+                                    1.0 if self.use_graph_parallel else None
+                                ),
+                            )
+                            profile_t0 = self._profile_mark("grad_sync", profile_t0)
+                        else:
+                            # Standard DDP: automatic gradient sync during backward.
+                            loss.backward()
+                            profile_t0 = self._profile_mark("backward", profile_t0)
                 # === Initialize gradient diagnostics variables ===
                 total_norm: torch.Tensor | None = None
                 pre_clip_named_norms: list[tuple[str, float]] = []
@@ -1203,6 +1441,7 @@ class Trainer:
                     with torch.device(DEVICE):
                         self.optimizer.step()
                     self.scheduler.step()
+                    profile_t0 = self._profile_mark("optimizer", profile_t0)
             elif self.opt_type == "LKF":
                 if isinstance(self.loss, EnergyStdLoss):
                     KFOptWrapper = KFOptimizerWrapper(
@@ -1511,7 +1750,12 @@ class Trainer:
                     and _step_id != self.start_step
                 )
                 or (display_step_id) == self.num_steps
-            ) and (self.zero_stage > 0 or self.use_moe_ep or self.rank == 0 or dist.get_rank() == 0):
+            ) and (
+                self.zero_stage > 0
+                or self.use_moe_ep
+                or self.rank == 0
+                or dist.get_rank() == 0
+            ):
                 # Handle the case if rank 0 aborted and re-assigned
                 # NOTE: For MoE EP, all ranks must call save_model (collective op in moe_state_dict_to_global)
                 self.latest_model = Path(self.save_ckpt + f"-{display_step_id}.pt")
@@ -1655,12 +1899,20 @@ class Trainer:
                     f"The profiling trace has been saved under {self.tensorboard_log_dir}"
                 )
             if not self.enable_profiler and self.profiling:
-                prof.export_chrome_trace(self.profiling_file.split('.')[0]+f'_{self.rank}.json')
+                prof.export_chrome_trace(
+                    self.profiling_file.split(".")[0] + f"_{self.rank}.json"
+                )
                 log.info(
-                    f"The profiling trace has been saved to: {self.profiling_file.split('.')[0]+f'_{self.rank}.json'}"
+                    "The profiling trace has been saved to: "
+                    f"{self.profiling_file.split('.')[0]}_{self.rank}.json"
                 )
                 if self.rank == 0:
-                    print(prof.key_averages().table( sort_by="cuda_time_total", row_limit=20))
+                    log.info(
+                        "\n%s",
+                        prof.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=20
+                        ),
+                    )
 
     def save_model(self, save_path: str, lr: float = 0.0, step: int = 0) -> None:
         module = self._get_inner_module()
@@ -1687,6 +1939,7 @@ class Trainer:
             if self.use_moe_ep:
                 # MoE with EP: gather routing expert params to rank 0 with global indices.
                 from deepmd.pt.utils.moe_checkpoint import moe_state_dict_to_global
+
                 experts_per_gpu = self._get_experts_per_gpu(module)
                 model_state = moe_state_dict_to_global(
                     module, self.ep_rank, self.ep_size, experts_per_gpu, self.ep_group
@@ -1727,16 +1980,41 @@ class Trainer:
             iterator = iterator[task_key]
         if iterator is None:
             return {}, {}, {}
-        batch_data = next(iterator)
+        if self.use_graph_parallel:
+            from deepmd.pt.utils.graph_parallel import broadcast_batch_data
+
+            validate_broadcast = task_key not in self._gp_batch_broadcast_validated
+            batch_data = broadcast_batch_data(
+                next(iterator) if self.gp_rank == 0 else None,
+                group=self.gp_group,
+                validate=validate_broadcast,
+            )
+            if validate_broadcast:
+                self._gp_batch_broadcast_validated.add(task_key)
+        else:
+            batch_data = next(iterator)
+
+        is_mixed_batch = "batch" in batch_data and "ptr" in batch_data
+        if self.use_graph_parallel and not is_mixed_batch:
+            raise ValueError(
+                "training.graph_parallel=True currently supports only "
+                "LMDB mixed_batch=True data."
+            )
+
         for key in batch_data.keys():
-            if key == "sid" or key == "fid" or key == "box" or "find_" in key:
+            if key == "sid" or key == "fid" or "find_" in key:
+                continue
+            elif key == "box" and not is_mixed_batch:
+                continue
+            elif key == "batch" or key == "ptr":
                 continue
             elif not isinstance(batch_data[key], list):
                 if batch_data[key] is not None:
                     batch_data[key] = batch_data[key].to(DEVICE, non_blocking=True)
             else:
                 batch_data[key] = [
-                    item.to(DEVICE, non_blocking=True) for item in batch_data[key]
+                    item.to(DEVICE, non_blocking=True) if item is not None else None
+                    for item in batch_data[key]
                 ]
         # we may need a better way to classify which are inputs and which are labels
         # now wrapper only supports the following inputs:
@@ -1748,6 +2026,49 @@ class Trainer:
             "fparam",
             "aparam",
         ]
+
+        if is_mixed_batch:
+            input_keys = input_keys + list(_FLAT_GRAPH_INPUT_KEYS)
+            batch_data["batch"] = batch_data["batch"].to(DEVICE, non_blocking=True)
+            batch_data["ptr"] = batch_data["ptr"].to(DEVICE, non_blocking=True)
+            if "nlist" not in batch_data:
+                graph_config = self._flat_graph_configs.get(task_key)
+                if graph_config is None:
+                    raise RuntimeError(
+                        f"Missing flat graph config for mixed-batch task {task_key}."
+                    )
+                from deepmd.pt.utils.nlist import build_precomputed_flat_graph
+
+                batch_data.update(
+                    build_precomputed_flat_graph(
+                        batch_data["coord"],
+                        batch_data["atype"],
+                        batch_data["batch"],
+                        batch_data["ptr"],
+                        graph_config["rcut"],
+                        graph_config["sel"],
+                        graph_config["a_rcut"],
+                        graph_config["a_sel"],
+                        mixed_types=graph_config["mixed_types"],
+                        box=batch_data.get("box"),
+                        pair_exclude_types=graph_config.get("pair_exclude_types"),
+                        ntypes=graph_config.get("ntypes"),
+                    )
+                )
+            if self.use_graph_parallel:
+                from deepmd.pt.utils.graph_parallel_flat import (
+                    build_flat_graph_partition,
+                )
+
+                self._flat_graph_partitions[task_key] = build_flat_graph_partition(
+                    int(batch_data["ptr"][-1].item()),
+                    batch_data["edge_index"],
+                    batch_data["angle_index"],
+                    batch=batch_data["batch"],
+                    rank=self.gp_rank,
+                    world_size=self.gp_size,
+                )
+
         input_dict = dict.fromkeys(input_keys)
         label_dict = {}
         for item_key in batch_data:
@@ -1757,6 +2078,10 @@ class Trainer:
             else:
                 if item_key not in ["sid", "fid"]:
                     label_dict[item_key] = batch_data[item_key]
+        if self.use_graph_parallel:
+            input_dict["flat_graph_partition"] = self._flat_graph_partitions.get(
+                task_key
+            )
         log_dict = {}
         if "fid" in batch_data:
             log_dict["fid"] = batch_data["fid"]

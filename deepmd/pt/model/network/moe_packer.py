@@ -22,10 +22,6 @@ Output (30a per row):
 
 from __future__ import annotations
 
-from typing import (
-    Optional,
-)
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -46,14 +42,26 @@ def validate_dim_ratio(n_dim: int, e_dim: int, a_dim: int) -> None:
     """
     if not (n_dim == 4 * a_dim and e_dim == 2 * a_dim):
         raise ValueError(
-            f"MoE requires n_dim:e_dim:a_dim = 4:2:1, "
-            f"got {n_dim}:{e_dim}:{a_dim}"
+            f"MoE requires n_dim:e_dim:a_dim = 4:2:1, got {n_dim}:{e_dim}:{a_dim}"
         )
 
 
 def _ceildiv(a: int, b: int) -> int:
     """Integer ceiling division."""
     return (a + b - 1) // b
+
+
+def _new_zeros_with_grad(
+    reference: torch.Tensor,
+    shape: tuple[int, ...],
+    *deps: torch.Tensor,
+) -> torch.Tensor:
+    """Create zeros while preserving autograd edges to empty inputs."""
+    out = reference.new_zeros(shape)
+    for dep in (reference, *deps):
+        if dep.is_floating_point() or dep.is_complex():
+            out = out + dep.sum() * 0
+    return out
 
 
 def _concat_pad_groups(
@@ -82,7 +90,7 @@ def _concat_pad_groups(
     )
 
     if n == 0:
-        return tensor.new_zeros(0, packed_width)
+        return _new_zeros_with_grad(tensor, (0, packed_width))
 
     # Pad rows to a multiple of group_size.
     n_groups = _ceildiv(n, group_size)
@@ -125,7 +133,7 @@ def _split_unpad_groups(
     Tensor, shape ``[n_valid, feat_dim]``
     """
     if packed.shape[0] == 0 or n_valid == 0:
-        return packed.new_zeros(0, feat_dim)
+        return _new_zeros_with_grad(packed, (0, feat_dim))
 
     concat_width = group_size * feat_dim
     # Remove column padding, then reshape to individual items.
@@ -155,16 +163,16 @@ class MoEPacker:
         self.D_edge_in = 10 * a_dim
         self.D_angle_in = 4 * a_dim
         self.D_packed_in = 40 * a_dim
-        self.edge_concat_in = 4   # 4 × 10a = 40a
-        self.angle_concat_in = 10  # 10 × 4a = 40a
+        self.edge_concat_in = 4  # 4 x 10a = 40a
+        self.angle_concat_in = 10  # 10 x 4a = 40a
 
         # Output dims (combine).
         self.D_node_out = 8 * a_dim
         self.D_edge_out = 6 * a_dim
         self.D_angle_out = 3 * a_dim
         self.D_packed_out = 30 * a_dim
-        self.edge_concat_out = 4   # 4 × 6a = 24a → pad to 30a
-        self.angle_concat_out = 10  # 10 × 3a = 30a exact
+        self.edge_concat_out = 4  # 4 x 6a = 24a, pad to 30a
+        self.angle_concat_out = 10  # 10 x 3a = 30a exact
 
     # ------------------------------------------------------------------
     # Dispatch packing (input side, 40a per row)
@@ -172,12 +180,12 @@ class MoEPacker:
 
     def pack_for_dispatch(
         self,
-        node_input_sorted: torch.Tensor,   # [N_node_exp, 28a]
-        edge_input_sorted: torch.Tensor,   # [N_edge_exp, 10a]
+        node_input_sorted: torch.Tensor,  # [N_node_exp, 28a]
+        edge_input_sorted: torch.Tensor,  # [N_edge_exp, 10a]
         angle_input_sorted: torch.Tensor,  # [N_angle_exp, 4a]
-        node_counts_per_gpu: list[int],    # [ep_size]
-        edge_counts_per_gpu: list[int],    # [ep_size]
-        angle_counts_per_gpu: list[int],   # [ep_size]
+        node_counts_per_gpu: list[int],  # [ep_size]
+        edge_counts_per_gpu: list[int],  # [ep_size]
+        angle_counts_per_gpu: list[int],  # [ep_size]
     ) -> tuple[torch.Tensor, list[int]]:
         """Pack sorted features into ``[N_total_rows, 40a]``.
 
@@ -216,14 +224,14 @@ class MoEPacker:
 
             # Node: [n_node, 28a] → pad to [n_node, 40a]
             if n_node > 0:
-                node_slice = node_input_sorted[node_offset:node_offset + n_node]
+                node_slice = node_input_sorted[node_offset : node_offset + n_node]
                 node_padded = F.pad(node_slice, (0, self.D_packed_in - self.D_node_in))
                 gpu_parts.append(node_padded)
             node_offset += n_node
 
             # Edge: [n_edge, 10a] → groups of 4 → [ceil(n_edge/4), 40a]
             if n_edge > 0:
-                edge_slice = edge_input_sorted[edge_offset:edge_offset + n_edge]
+                edge_slice = edge_input_sorted[edge_offset : edge_offset + n_edge]
                 edge_packed = _concat_pad_groups(
                     edge_slice, self.edge_concat_in, self.D_packed_in
                 )
@@ -232,7 +240,7 @@ class MoEPacker:
 
             # Angle: [n_angle, 4a] → groups of 10 → [ceil(n_angle/10), 40a]
             if n_angle > 0:
-                angle_slice = angle_input_sorted[angle_offset:angle_offset + n_angle]
+                angle_slice = angle_input_sorted[angle_offset : angle_offset + n_angle]
                 angle_packed = _concat_pad_groups(
                     angle_slice, self.angle_concat_in, self.D_packed_in
                 )
@@ -250,7 +258,12 @@ class MoEPacker:
         if blocks:
             packed = torch.cat(blocks, dim=0)
         else:
-            packed = node_input_sorted.new_zeros(0, self.D_packed_in)
+            packed = _new_zeros_with_grad(
+                node_input_sorted,
+                (0, self.D_packed_in),
+                edge_input_sorted,
+                angle_input_sorted,
+            )
 
         return packed, send_splits
 
@@ -260,10 +273,10 @@ class MoEPacker:
 
     def unpack_from_dispatch(
         self,
-        recv_tensor: torch.Tensor,    # [N_total_recv, 40a]
-        node_counts: list[int],        # [ep_size] per-source-GPU node counts
-        edge_counts: list[int],        # [ep_size] per-source-GPU edge counts
-        angle_counts: list[int],       # [ep_size] per-source-GPU angle counts
+        recv_tensor: torch.Tensor,  # [N_total_recv, 40a]
+        node_counts: list[int],  # [ep_size] per-source-GPU node counts
+        edge_counts: list[int],  # [ep_size] per-source-GPU edge counts
+        angle_counts: list[int],  # [ep_size] per-source-GPU angle counts
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Unpack received tensor into node/edge/angle features.
 
@@ -295,13 +308,13 @@ class MoEPacker:
 
             # Node rows: slice columns [:28a]
             if n_node > 0:
-                node_rows = recv_tensor[row_offset:row_offset + n_node]
-                node_parts.append(node_rows[:, :self.D_node_in])
+                node_rows = recv_tensor[row_offset : row_offset + n_node]
+                node_parts.append(node_rows[:, : self.D_node_in])
             row_offset += n_node
 
             # Edge rows: _split_unpad_groups
             if n_edge_rows > 0:
-                edge_rows = recv_tensor[row_offset:row_offset + n_edge_rows]
+                edge_rows = recv_tensor[row_offset : row_offset + n_edge_rows]
                 edge_parts.append(
                     _split_unpad_groups(
                         edge_rows, self.edge_concat_in, self.D_edge_in, n_edge
@@ -311,7 +324,7 @@ class MoEPacker:
 
             # Angle rows: _split_unpad_groups
             if n_angle_rows > 0:
-                angle_rows = recv_tensor[row_offset:row_offset + n_angle_rows]
+                angle_rows = recv_tensor[row_offset : row_offset + n_angle_rows]
                 angle_parts.append(
                     _split_unpad_groups(
                         angle_rows, self.angle_concat_in, self.D_angle_in, n_angle
@@ -319,9 +332,21 @@ class MoEPacker:
                 )
             row_offset += n_angle_rows
 
-        node_out = torch.cat(node_parts, dim=0) if node_parts else recv_tensor.new_zeros(0, self.D_node_in)
-        edge_out = torch.cat(edge_parts, dim=0) if edge_parts else recv_tensor.new_zeros(0, self.D_edge_in)
-        angle_out = torch.cat(angle_parts, dim=0) if angle_parts else recv_tensor.new_zeros(0, self.D_angle_in)
+        node_out = (
+            torch.cat(node_parts, dim=0)
+            if node_parts
+            else _new_zeros_with_grad(recv_tensor, (0, self.D_node_in))
+        )
+        edge_out = (
+            torch.cat(edge_parts, dim=0)
+            if edge_parts
+            else _new_zeros_with_grad(recv_tensor, (0, self.D_edge_in))
+        )
+        angle_out = (
+            torch.cat(angle_parts, dim=0)
+            if angle_parts
+            else _new_zeros_with_grad(recv_tensor, (0, self.D_angle_in))
+        )
 
         return node_out, edge_out, angle_out
 
@@ -331,9 +356,9 @@ class MoEPacker:
 
     def pack_for_combine(
         self,
-        node_output: torch.Tensor,     # [N_node_recv, 8a]
-        edge_output: torch.Tensor,     # [N_edge_recv, 6a]
-        angle_output: torch.Tensor,    # [N_angle_recv, 3a]
+        node_output: torch.Tensor,  # [N_node_recv, 8a]
+        edge_output: torch.Tensor,  # [N_edge_recv, 6a]
+        angle_output: torch.Tensor,  # [N_angle_recv, 3a]
         node_counts: list[int],
         edge_counts: list[int],
         angle_counts: list[int],
@@ -370,14 +395,16 @@ class MoEPacker:
 
             # Node: [n_node, 8a] → pad to [n_node, 30a]
             if n_node > 0:
-                node_slice = node_output[node_offset:node_offset + n_node]
-                node_padded = F.pad(node_slice, (0, self.D_packed_out - self.D_node_out))
+                node_slice = node_output[node_offset : node_offset + n_node]
+                node_padded = F.pad(
+                    node_slice, (0, self.D_packed_out - self.D_node_out)
+                )
                 gpu_parts.append(node_padded)
             node_offset += n_node
 
             # Edge: [n_edge, 6a] → groups of 4 → pad to 30a
             if n_edge > 0:
-                edge_slice = edge_output[edge_offset:edge_offset + n_edge]
+                edge_slice = edge_output[edge_offset : edge_offset + n_edge]
                 edge_packed = _concat_pad_groups(
                     edge_slice, self.edge_concat_out, self.D_packed_out
                 )
@@ -386,7 +413,7 @@ class MoEPacker:
 
             # Angle: [n_angle, 3a] → groups of 10 → 30a (exact fit)
             if n_angle > 0:
-                angle_slice = angle_output[angle_offset:angle_offset + n_angle]
+                angle_slice = angle_output[angle_offset : angle_offset + n_angle]
                 angle_packed = _concat_pad_groups(
                     angle_slice, self.angle_concat_out, self.D_packed_out
                 )
@@ -399,7 +426,12 @@ class MoEPacker:
         if blocks:
             return torch.cat(blocks, dim=0)
         else:
-            return node_output.new_zeros(0, self.D_packed_out)
+            return _new_zeros_with_grad(
+                node_output,
+                (0, self.D_packed_out),
+                edge_output,
+                angle_output,
+            )
 
     # ------------------------------------------------------------------
     # Combine unpacking (returned side, 30a per row → individual outputs)
@@ -407,7 +439,7 @@ class MoEPacker:
 
     def unpack_from_combine(
         self,
-        returned: torch.Tensor,        # [N_total_send, 30a]
+        returned: torch.Tensor,  # [N_total_send, 30a]
         node_counts: list[int],
         edge_counts: list[int],
         angle_counts: list[int],
@@ -438,17 +470,19 @@ class MoEPacker:
             n_edge = edge_counts[g]
             n_angle = angle_counts[g]
             n_edge_rows = _ceildiv(n_edge, self.edge_concat_out) if n_edge > 0 else 0
-            n_angle_rows = _ceildiv(n_angle, self.angle_concat_out) if n_angle > 0 else 0
+            n_angle_rows = (
+                _ceildiv(n_angle, self.angle_concat_out) if n_angle > 0 else 0
+            )
 
             # Node rows: slice columns [:8a]
             if n_node > 0:
-                node_rows = returned[row_offset:row_offset + n_node]
-                node_parts.append(node_rows[:, :self.D_node_out])
+                node_rows = returned[row_offset : row_offset + n_node]
+                node_parts.append(node_rows[:, : self.D_node_out])
             row_offset += n_node
 
             # Edge rows
             if n_edge_rows > 0:
-                edge_rows = returned[row_offset:row_offset + n_edge_rows]
+                edge_rows = returned[row_offset : row_offset + n_edge_rows]
                 edge_parts.append(
                     _split_unpad_groups(
                         edge_rows, self.edge_concat_out, self.D_edge_out, n_edge
@@ -458,7 +492,7 @@ class MoEPacker:
 
             # Angle rows
             if n_angle_rows > 0:
-                angle_rows = returned[row_offset:row_offset + n_angle_rows]
+                angle_rows = returned[row_offset : row_offset + n_angle_rows]
                 angle_parts.append(
                     _split_unpad_groups(
                         angle_rows, self.angle_concat_out, self.D_angle_out, n_angle
@@ -466,9 +500,21 @@ class MoEPacker:
                 )
             row_offset += n_angle_rows
 
-        node_out = torch.cat(node_parts, dim=0) if node_parts else returned.new_zeros(0, self.D_node_out)
-        edge_out = torch.cat(edge_parts, dim=0) if edge_parts else returned.new_zeros(0, self.D_edge_out)
-        angle_out = torch.cat(angle_parts, dim=0) if angle_parts else returned.new_zeros(0, self.D_angle_out)
+        node_out = (
+            torch.cat(node_parts, dim=0)
+            if node_parts
+            else _new_zeros_with_grad(returned, (0, self.D_node_out))
+        )
+        edge_out = (
+            torch.cat(edge_parts, dim=0)
+            if edge_parts
+            else _new_zeros_with_grad(returned, (0, self.D_edge_out))
+        )
+        angle_out = (
+            torch.cat(angle_parts, dim=0)
+            if angle_parts
+            else _new_zeros_with_grad(returned, (0, self.D_angle_out))
+        )
 
         return node_out, edge_out, angle_out
 
@@ -480,7 +526,7 @@ class MoEPacker:
 
 def exchange_metadata(
     send_info: torch.Tensor,
-    ep_group: Optional[dist.ProcessGroup],
+    ep_group: dist.ProcessGroup | None,
 ) -> torch.Tensor:
     """Exchange per-GPU metadata (token counts) via All-to-All.
 

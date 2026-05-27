@@ -3721,6 +3721,12 @@ If MPI is used, the value should be considered as the batch size per task.'
         "Should be of the same length as `systems`, "
         "specifying the probability of each system."
     )
+    doc_mixed_batch = (
+        "Whether to enable LMDB mixed-batch training with different numbers of atoms "
+        "per frame. When set to True, the PyTorch LMDB dataloader flattens atom-wise "
+        "fields and precomputes graph indices in the collate function. "
+        "The alias `mix_batch` is accepted. Default is False."
+    )
 
     args = [
         Argument(
@@ -3757,6 +3763,14 @@ If MPI is used, the value should be considered as the batch size per task.'
             default=None,
             doc=doc_sys_probs,
             alias=["sys_weights"],
+        ),
+        Argument(
+            "mixed_batch",
+            bool,
+            optional=True,
+            default=False,
+            alias=["mix_batch"],
+            doc=doc_mixed_batch + doc_only_pt_supported,
         ),
     ]
 
@@ -3800,6 +3814,12 @@ def validation_data_args() -> list[
         "specifying the probability of each system."
     )
     doc_numb_btch = "An integer that specifies the number of batches to be sampled for each validation period."
+    doc_mixed_batch = (
+        "Whether to enable LMDB mixed-batch validation with different numbers of atoms "
+        "per frame. When set to True, the PyTorch LMDB dataloader flattens atom-wise "
+        "fields and precomputes graph indices in the collate function. "
+        "The alias `mix_batch` is accepted. Default is False."
+    )
 
     args = [
         Argument(
@@ -3846,6 +3866,14 @@ def validation_data_args() -> list[
             alias=[
                 "numb_batch",
             ],
+        ),
+        Argument(
+            "mixed_batch",
+            bool,
+            optional=True,
+            default=False,
+            alias=["mix_batch"],
+            doc=doc_mixed_batch + doc_only_pt_supported,
         ),
     ]
 
@@ -4137,11 +4165,30 @@ def training_args(
             int,
             optional=True,
             default=1,
-            doc=doc_only_pt_supported
-            + "Expert Parallelism group size for MoE models. "
+            doc=doc_only_pt_supported + "Expert Parallelism group size for MoE models. "
             "world_size must be divisible by moe_ep_size. "
             "The Data Parallelism group size is world_size / moe_ep_size. "
             "Set to 1 (default) to disable EP and use standard DDP.",
+        ),
+        Argument(
+            "graph_parallel",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported
+            + "Enable the first mixed-batch graph-parallel plumbing. "
+            "This mode reuses the MoE EP group and currently requires "
+            "moe_ep_size == world_size.",
+        ),
+        Argument(
+            "graph_parallel_size",
+            int,
+            optional=True,
+            default=0,
+            doc=doc_only_pt_supported
+            + "Graph-parallel group size. The initial implementation requires "
+            "graph_parallel_size == moe_ep_size == world_size when "
+            "graph_parallel is true. Set to 0 to reuse moe_ep_size.",
         ),
     ]
 
