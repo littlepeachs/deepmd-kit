@@ -380,8 +380,19 @@ class Trainer:
                     if self.use_graph_parallel:
                         # GP ranks must consume the same mixed batch.  Rank 0
                         # of the GP group owns the loader stream and broadcasts
-                        # the batch in get_data().
-                        if _shuffle:
+                        # the batch in get_data().  With DP replicas, shard
+                        # the dataset by DP rank so each GP group sees a
+                        # different mini-batch.
+                        if self.dp_size > 1:
+                            _sampler = DistributedSampler(
+                                _data,
+                                num_replicas=self.dp_size,
+                                rank=self.dp_rank,
+                                shuffle=_shuffle,
+                                seed=_seed,
+                                drop_last=False,
+                            )
+                        elif _shuffle:
                             generator = torch.Generator()
                             generator.manual_seed(_seed)
                             _sampler = RandomSampler(
@@ -1385,7 +1396,10 @@ class Trainer:
                                 self.dp_size,
                                 self.world_size,
                                 non_routing_divisor=(
-                                    1.0 if self.use_graph_parallel else None
+                                    self.dp_size if self.use_graph_parallel else None
+                                ),
+                                routing_divisor=(
+                                    self.dp_size if self.use_graph_parallel else None
                                 ),
                             )
                             profile_t0 = self._profile_mark("grad_sync", profile_t0)

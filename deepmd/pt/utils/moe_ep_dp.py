@@ -120,6 +120,7 @@ def sync_moe_gradients(
     world_size: int,
     *,
     non_routing_divisor: float | None = None,
+    routing_divisor: float | None = None,
 ) -> None:
     """All-reduce gradients with the correct group and divisor.
 
@@ -142,14 +143,21 @@ def sync_moe_gradients(
     non_routing_divisor : int or float, optional
         Divisor applied after all-reducing non-routing/shared gradients.
         Defaults to ``world_size`` for the original EP+DP averaging semantics.
-        Graph parallelism passes ``1`` because ranks hold graph shards of the
-        same sample and their shared-parameter gradients must be summed.
+        Graph parallelism passes ``dp_size`` because ranks inside each GP group
+        hold graph shards of the same sample and DP replicas should be averaged.
+    routing_divisor : int or float, optional
+        Divisor applied after all-reducing routing-expert gradients across the
+        DP group. Defaults to ``world_size`` for the original EP+DP semantics.
+        Graph parallelism with DP replicas passes ``dp_size`` because each EP/GP
+        group already sums the shards for one sample replica.
     """
     # Early return: if world_size == 1, no synchronization needed
     if world_size == 1:
         return
     if non_routing_divisor is None:
         non_routing_divisor = world_size
+    if routing_divisor is None:
+        routing_divisor = world_size
 
     def _ensure_grad_for_collective(
         param: torch.nn.Parameter,
@@ -190,11 +198,12 @@ def sync_moe_gradients(
             if not _ensure_grad_for_collective(param, dp_group):
                 continue
             # Routing expert grads: all-reduce across DP group only (same expert
-            # exists only on dp_size ranks in the same DP column).
-            # Divide by world_size (not dp_size) because All-to-All backward
-            # already aggregates gradients from ep_size ranks within the EP group.
+            # exists only on dp_size ranks in the same DP column).  The divisor
+            # is configurable because GP uses EP ranks as graph shards, while
+            # the original EP+DP path averages with the historical world_size
+            # scale after All-to-All backward.
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
-            param.grad.div_(world_size)
+            param.grad.div_(routing_divisor)
         else:
             if not _ensure_grad_for_collective(param, world_group):
                 continue

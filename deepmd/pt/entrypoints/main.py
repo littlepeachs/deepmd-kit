@@ -240,10 +240,15 @@ def get_trainer(
                     gp_size_config = ep_size_config
                 if use_graph_parallel:
                     world_size = dist.get_world_size()
-                    if ep_size_config != world_size:
+                    if ep_size_config <= 1:
+                        raise ValueError(
+                            "training.graph_parallel=True requires "
+                            "training.moe_ep_size > 1."
+                        )
+                    if world_size % ep_size_config != 0:
                         raise ValueError(
                             "training.graph_parallel=True currently requires "
-                            "training.moe_ep_size == world_size. "
+                            "world_size to be divisible by training.moe_ep_size. "
                             f"Got moe_ep_size={ep_size_config}, "
                             f"world_size={world_size}."
                         )
@@ -255,11 +260,6 @@ def get_trainer(
                             f"moe_ep_size={ep_size_config}."
                         )
                 if (use_moe and ep_size_config > 1) or use_graph_parallel:
-                    if ep_size_config <= 1:
-                        raise ValueError(
-                            "training.graph_parallel=True requires "
-                            "training.moe_ep_size > 1."
-                        )
                     if use_moe and ep_size_config > 1:
                         use_moe_ep = True
                     from deepmd.pt.utils.moe_ep_dp import init_ep_dp_groups
@@ -278,10 +278,17 @@ def get_trainer(
                             set_graph_parallel_context,
                         )
 
-                        gp_ranks = [
-                            dist.get_rank() - ep_rank + idx for idx in range(ep_size)
-                        ]
-                        gp_group = dist.new_group(gp_ranks)
+                        # GP follows the same row layout as EP: each DP replica
+                        # owns one contiguous EP/GP group.  All ranks create all
+                        # groups in the same order to keep NCCL group creation
+                        # well-defined when dp_size > 1.
+                        for dp_idx in range(dp_size):
+                            gp_ranks = [
+                                dp_idx * ep_size + idx for idx in range(ep_size)
+                            ]
+                            group = dist.new_group(gp_ranks)
+                            if dp_rank == dp_idx:
+                                gp_group = group
                         set_graph_parallel_context(
                             True,
                             gp_group,
