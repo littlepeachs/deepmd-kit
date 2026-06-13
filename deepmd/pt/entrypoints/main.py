@@ -534,6 +534,8 @@ def train(
 
     # Initialize DDP
     if os.environ.get("LOCAL_RANK") is not None:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(LOCAL_RANK)
         dist.init_process_group(backend="cuda:nccl,cpu:gloo")
 
     trainer = get_trainer(
