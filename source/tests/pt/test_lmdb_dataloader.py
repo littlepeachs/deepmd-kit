@@ -24,6 +24,11 @@ from deepmd.dpmodel.utils.lmdb_data import (
 from deepmd.pt.utils.lmdb_dataset import (
     LmdbDataset,
     _collate_lmdb_batch,
+    _collate_lmdb_mixed_batch,
+    make_lmdb_mixed_batch_collate,
+)
+from deepmd.pt.utils.graph_parallel_flat import (
+    build_all_flat_graph_partitions,
 )
 from deepmd.utils.data import (
     DataRequirementItem,
@@ -226,6 +231,22 @@ class TestTrainerInterface:
         ds = LmdbDataset(lmdb_dir, type_map=["O", "H"], batch_size=2)
         assert len(ds.dataloaders) == 1
 
+    def test_mixed_batch_stat_dataloaders(self, multi_nloc_lmdb):
+        ds = LmdbDataset(
+            multi_nloc_lmdb,
+            type_map=["O", "H"],
+            batch_size=2,
+            mixed_batch=True,
+        )
+
+        assert len(ds.systems) == 3
+        assert len(ds.dataloaders) == 3
+        for dl in ds.dataloaders:
+            with torch.device("cpu"):
+                batch = next(iter(dl))
+            assert batch["coord"].ndim == 3
+            assert batch["coord"].shape[1] in {4, 6, 8}
+
     def test_index(self, lmdb_dir):
         ds = LmdbDataset(lmdb_dir, type_map=["O", "H"], batch_size=2)
         assert ds.index == [5]
@@ -352,6 +373,147 @@ class TestCollate:
             {"coord": np.zeros((2, 3)), "box": None},
         ]
         assert _collate_lmdb_batch(frames)["box"] is None
+
+    def test_mixed_batch_collate_flattens_atomwise_keys(self, multi_nloc_lmdb):
+        ds = LmdbDataset(
+            multi_nloc_lmdb,
+            type_map=["O", "H"],
+            batch_size=3,
+            mixed_batch=True,
+        )
+        frames = [ds[0], ds[10], ds[20]]
+
+        with torch.device("cpu"):
+            batch = _collate_lmdb_mixed_batch(frames)
+
+        counts = [frame["coord"].shape[0] for frame in frames]
+        ptr = np.concatenate([[0], np.cumsum(counts)])
+        np.testing.assert_array_equal(batch["ptr"].numpy(), ptr)
+        np.testing.assert_array_equal(
+            batch["batch"].numpy(),
+            np.repeat(np.arange(len(frames)), counts),
+        )
+        with torch.device("cpu"):
+            torch.testing.assert_close(
+                batch["coord"],
+                torch.as_tensor(np.concatenate([frame["coord"] for frame in frames])),
+            )
+            torch.testing.assert_close(
+                batch["force"],
+                torch.as_tensor(np.concatenate([frame["force"] for frame in frames])),
+            )
+            torch.testing.assert_close(
+                batch["atype"],
+                torch.as_tensor(np.concatenate([frame["atype"] for frame in frames])),
+            )
+            torch.testing.assert_close(
+                batch["energy"],
+                torch.as_tensor(np.stack([frame["energy"] for frame in frames])),
+            )
+            torch.testing.assert_close(
+                batch["natoms"],
+                torch.as_tensor(np.stack([frame["natoms"] for frame in frames])),
+            )
+        assert batch["fid"] == [0, 10, 20]
+        assert batch["find_energy"] == 1.0
+        assert batch["find_force"] == 1.0
+
+    def test_mixed_batch_collate_builds_consistent_flat_graph(self, multi_nloc_lmdb):
+        ds = LmdbDataset(
+            multi_nloc_lmdb,
+            type_map=["O", "H"],
+            batch_size=2,
+            mixed_batch=True,
+        )
+        collate = make_lmdb_mixed_batch_collate(
+            {
+                "rcut": 4.0,
+                "sel": [4, 4],
+                "a_rcut": 4.0,
+                "a_sel": 4,
+                "mixed_types": True,
+                "ntypes": 2,
+            }
+        )
+
+        with torch.device("cpu"):
+            batch = collate([ds[0], ds[10]])
+
+        total_atoms = int(batch["ptr"][-1].item())
+        assert batch["coord"].shape == (total_atoms, 3)
+        assert batch["edge_index"].shape[0] == 2
+        assert batch["angle_index"].shape[0] == 3
+        assert batch["nlist"].shape[0] == total_atoms
+        edge_index = batch["edge_index"]
+        assert torch.all(edge_index[0] >= 0)
+        assert torch.all(edge_index[0] < total_atoms)
+        assert torch.all(edge_index[1] >= 0)
+        assert torch.all(edge_index[1] < total_atoms)
+        torch.testing.assert_close(
+            batch["batch"][edge_index[0]],
+            batch["batch"][edge_index[1]],
+        )
+        if batch["angle_index"].numel() > 0:
+            assert torch.all(batch["angle_index"][1:] >= 0)
+            assert torch.all(batch["angle_index"][1:] < edge_index.shape[1])
+
+
+class TestFlatGraphPartition:
+    """Test flat graph partition semantics used by graph parallelism."""
+
+    def test_partitions_cover_centers_and_edges_once(self):
+        with torch.device("cpu"):
+            edge_index = torch.tensor(
+                [
+                    [0, 0, 1, 2, 3, 4, 4, 5, 6],
+                    [1, 2, 0, 1, 4, 3, 6, 4, 5],
+                ],
+                dtype=torch.long,
+            )
+            # angle rows are [center atom, edge-id 1, edge-id 2].  Some angle
+            # candidates reference an edge outside the same center partition and
+            # must be dropped after edge-id remapping.
+            angle_index = torch.tensor(
+                [
+                    [0, 0, 2, 4, 5],
+                    [0, 0, 2, 5, 7],
+                    [1, 2, 4, 6, 8],
+                ],
+                dtype=torch.long,
+            )
+            batch = torch.tensor([0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+
+        parts = build_all_flat_graph_partitions(
+            total_atoms=7,
+            edge_index=edge_index,
+            angle_index=angle_index,
+            batch=batch,
+            world_size=3,
+        )
+
+        with torch.device("cpu"):
+            atom_index = torch.cat([part.atom_index for part in parts])
+            torch.testing.assert_close(atom_index, torch.arange(7))
+            edge_ids = torch.cat([part.edge_ids for part in parts])
+            torch.testing.assert_close(edge_ids.sort().values, torch.arange(9))
+        for part in parts:
+            assert torch.all(part.edge_index[0] >= part.local_start)
+            assert torch.all(part.edge_index[0] < part.local_end)
+            torch.testing.assert_close(
+                part.batch,
+                batch[part.local_start : part.local_end],
+            )
+            if part.angle_index.numel() == 0:
+                continue
+            assert torch.all(part.angle_index[1:] >= 0)
+            assert torch.all(part.angle_index[1:] < part.edge_index.shape[1])
+
+        with torch.device("cpu"):
+            angle_ids = torch.cat([part.angle_ids for part in parts])
+            torch.testing.assert_close(
+                angle_ids.sort().values,
+                torch.tensor([0, 1, 3, 4], dtype=torch.long),
+            )
 
 
 # ============================================================

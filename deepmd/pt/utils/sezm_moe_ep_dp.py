@@ -57,10 +57,16 @@ def sync_moe_gradients(
     world_group: object | None,
     dp_size: int,
     world_size: int,
+    non_routing_divisor: float | None = None,
+    routing_expert_divisor: float | None = None,
 ) -> None:
     """Synchronize SeZM MoE gradients with the correct group and divisor."""
     if world_size == 1:
         return
+    if non_routing_divisor is None:
+        non_routing_divisor = float(world_size)
+    if routing_expert_divisor is None:
+        routing_expert_divisor = float(world_size)
 
     for name, param in model.named_parameters():
         if param.grad is None:
@@ -68,12 +74,14 @@ def sync_moe_gradients(
         if _is_routing_expert_param(name):
             # In pure EP (dp_size == 1), A2A backward has already accumulated
             # all ep_size contributions. Skip the size-1 NCCL all-reduce to avoid
-            # unnecessary CUDA/NCCL allocation, but still divide by world_size.
+            # unnecessary CUDA/NCCL allocation. The divisor is mode-dependent:
+            # data-parallel EP averages by world_size, shared-axis GP sums.
             if dp_size > 1:
                 dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
+            param.grad.div_(routing_expert_divisor)
         else:
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=world_group)
-        param.grad.div_(world_size)
+            param.grad.div_(non_routing_divisor)
 
 
 __all__ = ["_is_routing_expert_param", "init_ep_dp_groups", "sync_moe_gradients"]

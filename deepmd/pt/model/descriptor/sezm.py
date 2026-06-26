@@ -1150,6 +1150,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         edge_mask: torch.Tensor,
         force_embedding: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
+        flat_graph_partition: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the descriptor from a sparse edge list.
@@ -1180,6 +1181,18 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             The scalar descriptor with shape ``(nf, nloc, channels)`` and the
             final equivariant latent with shape ``(nf * nloc, D_final, 1, channels)``.
         """
+        if flat_graph_partition is not None:
+            return self.forward_with_edges_gp(
+                extended_coord=extended_coord,
+                extended_atype=extended_atype,
+                edge_index=edge_index,
+                edge_vec=edge_vec,
+                edge_mask=edge_mask,
+                force_embedding=force_embedding,
+                charge_spin=charge_spin,
+                flat_graph_partition=flat_graph_partition,
+            )
+
         # === Step 1. Setup dimensions ===
         extended_coord = extended_coord.to(self.compute_dtype)
         nf, nloc = extended_atype.shape[:2]
@@ -1301,6 +1314,170 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         descriptor = x_scalar.reshape(nf, nloc, self.channels)  # (nf, nloc, C)
         return descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION), x.contiguous()
 
+    def forward_with_edges_gp(
+        self,
+        *,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+        flat_graph_partition: Any,
+        force_embedding: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the sparse-edge descriptor for one flat GP atom shard."""
+        if self.use_full_attn_res or self.use_block_attn_res:
+            raise NotImplementedError(
+                "SeZM flat graph parallelism does not yet support descriptor-level "
+                "full_attn_res/block_attn_res."
+            )
+
+        def part_attr(name: str) -> Any:
+            if isinstance(flat_graph_partition, dict):
+                return flat_graph_partition[name]
+            return getattr(flat_graph_partition, name)
+
+        local_start = int(part_attr("local_start"))
+        local_end = int(part_attr("local_end"))
+        local_size = int(part_attr("local_size"))
+
+        extended_coord = extended_coord.to(self.compute_dtype)
+        nf, nloc = extended_atype.shape[:2]
+        if nf != 1:
+            raise NotImplementedError(
+                "SeZM flat graph parallel sparse-edge forward expects one "
+                "flattened frame axis."
+            )
+
+        with nvtx_range("type_embedding"):
+            atype_loc = extended_atype[:, :nloc]
+            atype_flat = atype_loc.reshape(-1)
+            type_ebed = self.type_embedding(atype_loc).reshape(
+                -1, self.channels
+            )  # (N, C)
+            if self.charge_spin_embedding is not None:
+                type_ebed = self._apply_charge_spin_embedding(
+                    type_ebed,
+                    charge_spin,
+                    nf=nf,
+                    nloc=nloc,
+                )
+            n_nodes = type_ebed.shape[0]
+
+        if local_start < 0 or local_end < local_start or local_end > n_nodes:
+            raise RuntimeError("SeZM flat GP partition atom range is out of bounds.")
+        if local_size != local_end - local_start:
+            raise RuntimeError("SeZM flat GP partition local_size is inconsistent.")
+
+        with nvtx_range("build_edge_cache"):
+            edge_cache = build_edge_cache_from_edges(
+                type_ebed=type_ebed,
+                atype_flat=atype_flat,
+                edge_index=edge_index,
+                edge_vec=edge_vec,
+                edge_mask=edge_mask,
+                compute_dtype=self.compute_dtype,
+                eps=self.eps,
+                inner_clamp=self.inner_clamp,
+                bridging_switch=self.bridging_switch,
+                edge_envelope=self.edge_envelope,
+                radial_basis=self.radial_basis,
+                has_exclude_types=bool(self.exclude_types),
+                edge_type_keep_mask=self._edge_type_keep_mask,
+                random_gamma=self.random_gamma,
+                wigner_calc=self.wigner_calc,
+            )
+
+        lmax_0 = self.l_schedule[0]
+        ebed_dim_0 = get_so3_dim_of_lmax(lmax_0)
+        x0 = type_ebed
+        x0_out = x0
+
+        with nvtx_range("radial_embedding"):
+            radial_feat_flat = self.radial_embedding(edge_cache.edge_rbf)
+            radial_feat = radial_feat_flat.reshape(
+                radial_feat_flat.shape[0], self.lmax + 1, self.channels
+            )
+
+        with nvtx_range("env_film"):
+            if self.use_env_seed:
+                film = self.env_seed_embedding(
+                    edge_cache=edge_cache,
+                    atype_flat=atype_flat,
+                    n_nodes=n_nodes,
+                )
+                scale_logits = film[:, : self.channels]
+                shift_logits = film[:, self.channels :]
+                scale_hat = self.film_scale_norm(scale_logits)
+                shift_hat = self.film_shift_norm(shift_logits)
+                scale_strength = torch.exp(self.film_scale_strength_log)
+                shift_strength = torch.exp(self.film_shift_strength_log)
+                scale = 1.0 + scale_strength * torch.tanh(scale_hat)
+                shift = shift_strength * torch.tanh(shift_hat)
+                x0_out = x0 * scale + shift
+
+        x_local = type_ebed.new_zeros(
+            local_size, ebed_dim_0, 1, self.channels
+        )  # (L, D, 1, C)
+        x_local[:, 0, 0, :] = x0_out[local_start:local_end]
+
+        with nvtx_range("gie"):
+            if self.use_gie:
+                gie_full = self.gie(
+                    n_nodes=n_nodes,
+                    edge_cache=edge_cache,
+                    radial_feat=radial_feat[:, 1:, :],
+                )
+                x_local = x_local + gie_full[local_start:local_end].unsqueeze(2)
+
+        with nvtx_range("radial_fuse"):
+            radial_feat = radial_feat.to(dtype=self.dtype)
+            radial_feat = radial_feat + rearrange(
+                edge_cache.edge_type_feat.to(dtype=self.dtype), "E C -> E 1 C"
+            )
+            rad_feat_per_block = [
+                radial_feat[:, :rad_len, :] for rad_len in self.rad_sizes_per_block
+            ]
+
+        with nvtx_range("blocks"):
+            x_local = x_local.to(dtype=self.dtype)
+            if force_embedding is not None:
+                x_local = x_local + force_embedding[local_start:local_end].to(
+                    dtype=self.dtype
+                )
+            edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
+            from deepmd.pt.utils.graph_parallel import gather_node_tensor
+
+            x_full = gather_node_tensor(x_local, dim=0)
+            if x_full.shape[0] != n_nodes:
+                raise RuntimeError(
+                    "SeZM flat GP expected gathered node features to match the "
+                    f"full atom count ({n_nodes}), got {x_full.shape[0]}."
+                )
+            with self._compute_mode_ctx(extended_coord.device):
+                x_local = self._forward_blocks_gp(
+                    x_full=x_full,
+                    x_local=x_local,
+                    edge_cache=edge_cache,
+                    radial_feat_per_block=rad_feat_per_block,
+                    local_start=local_start,
+                    local_end=local_end,
+                    type_embedding=type_ebed.to(dtype=self.dtype),
+                    ep_group=self.moe_ep_group,
+                )
+
+        with nvtx_range("output_ffn"):
+            x_scalar = (
+                x_local[:, 0:1, :, :]
+                .reshape(local_size, 1, 1, self.channels)
+                .to(dtype=self.compute_dtype)
+            )
+            x_scalar = x_scalar + self.output_ffn(x_scalar)
+
+        descriptor = x_scalar.reshape(1, local_size, self.channels)
+        return descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION), x_local.contiguous()
+
     def _forward_blocks(
         self,
         x: torch.Tensor,
@@ -1414,6 +1591,51 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             current_x=x,
         ).to(dtype=self.dtype)
         return x
+
+    def _forward_blocks_gp(
+        self,
+        *,
+        x_full: torch.Tensor,
+        x_local: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat_per_block: list[torch.Tensor],
+        local_start: int,
+        local_end: int,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
+    ) -> torch.Tensor:
+        """Run interaction blocks for one flat graph-parallel atom shard."""
+        if self.use_full_attn_res or self.use_block_attn_res:
+            raise NotImplementedError(
+                "SeZM flat graph parallelism does not yet support descriptor-level "
+                "full_attn_res/block_attn_res."
+            )
+        if x_local.shape[0] != local_end - local_start:
+            raise RuntimeError(
+                "SeZM GP local feature count does not match flat graph partition."
+            )
+
+        from deepmd.pt.utils.graph_parallel import gather_node_tensor
+
+        for i, block in enumerate(self.blocks):
+            current_dim = self.ebed_dims[i]
+            current_full = x_full[:, :current_dim, :, :]
+            current_local = x_local[:, :current_dim, :, :]
+            blk_radial = radial_feat_per_block[i]
+            with nvtx_range(f"block_{i}"):
+                x_local = block.forward_gp(
+                    x_full=current_full,
+                    x_local=current_local,
+                    edge_cache=edge_cache,
+                    radial_feat=blk_radial,
+                    local_start=local_start,
+                    local_end=local_end,
+                    type_embedding=type_embedding,
+                    ep_group=ep_group,
+                )
+            if i != len(self.blocks) - 1:
+                x_full = gather_node_tensor(x_local, dim=0)
+        return x_local
 
     def _apply_charge_spin_embedding(
         self,

@@ -167,10 +167,12 @@ def get_trainer(
         # LMDB path: single string → LmdbDataset
         if isinstance(training_systems, str) and is_lmdb(training_systems):
             auto_prob = training_dataset_params.get("auto_prob", None)
+            mixed_batch = training_dataset_params.get("mixed_batch", False)
             train_data_single = LmdbDataset(
                 training_systems,
                 model_params_single["type_map"],
                 training_dataset_params["batch_size"],
+                mixed_batch=mixed_batch,
                 auto_prob_style=auto_prob,
             )
             if (
@@ -178,10 +180,12 @@ def get_trainer(
                 and isinstance(validation_systems, str)
                 and is_lmdb(validation_systems)
             ):
+                val_mixed_batch = validation_dataset_params.get("mixed_batch", False)
                 validation_data_single = LmdbDataset(
                     validation_systems,
                     model_params_single["type_map"],
                     validation_dataset_params["batch_size"],
+                    mixed_batch=val_mixed_batch,
                 )
             elif validation_systems is not None:
                 validation_data_single = _make_dp_loader_set(
@@ -206,6 +210,61 @@ def get_trainer(
         )
 
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    use_graph_parallel = training.validate_graph_parallel_config(config)
+    gp_group = None
+    gp_rank = 0
+    gp_size = 1
+    if use_graph_parallel and not (dist.is_available() and dist.is_initialized()):
+        raise ValueError(
+            "training.graph_parallel=True requires distributed launch via torchrun."
+        )
+    if dist.is_available() and dist.is_initialized():
+        if torch.cuda.is_available():
+            torch.cuda.set_device(LOCAL_RANK)
+        if use_graph_parallel:
+            if multi_task:
+                raise ValueError(
+                    "training.graph_parallel=True currently supports only "
+                    "single-task training."
+                )
+            descriptor_params = config["model"].get("descriptor", {})
+            ep_size_config = int(descriptor_params.get("ep_size", 1))
+            gp_size_config = int(
+                config["training"].get("graph_parallel_size", ep_size_config)
+            )
+            world_size = dist.get_world_size()
+            if ep_size_config != world_size:
+                raise ValueError(
+                    "training.graph_parallel=True currently requires "
+                    "model.descriptor.ep_size == world_size. "
+                    f"Got ep_size={ep_size_config}, world_size={world_size}."
+                )
+            if gp_size_config != ep_size_config:
+                raise ValueError(
+                    "training.graph_parallel_size must equal "
+                    "model.descriptor.ep_size in the first GP+EP mode. "
+                    f"Got graph_parallel_size={gp_size_config}, "
+                    f"ep_size={ep_size_config}."
+                )
+            from deepmd.pt.utils.graph_parallel import set_graph_parallel_context
+
+            gp_size = gp_size_config
+            gp_rank = rank % gp_size
+            gp_ranks = [rank - gp_rank + idx for idx in range(gp_size)]
+            gp_group = dist.new_group(gp_ranks)
+            set_graph_parallel_context(
+                True,
+                gp_group,
+                gp_rank,
+                gp_size,
+                reduce_backward=False,
+            )
+            log.info(
+                "Rank %s: Graph parallel initialized, GP rank %s/%s",
+                rank,
+                gp_rank,
+                gp_size,
+            )
     data_seed = config["training"].get("seed", None)
     if not multi_task:
         (
@@ -244,6 +303,10 @@ def get_trainer(
         shared_links=shared_links,
         finetune_links=finetune_links,
         init_frz_model=init_frz_model,
+        use_graph_parallel=use_graph_parallel,
+        gp_group=gp_group if use_graph_parallel else None,
+        gp_rank=gp_rank if use_graph_parallel else 0,
+        gp_size=gp_size if use_graph_parallel else 1,
     )
     return trainer
 

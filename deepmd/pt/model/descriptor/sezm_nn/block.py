@@ -600,6 +600,81 @@ class SeZMInteractionBlock(nn.Module):
             y = y * self.adam_ffn_layer_scales[unit_idx]
         return y
 
+    def _run_so2_unit_gp(
+        self,
+        *,
+        x_full: torch.Tensor,
+        x_local: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+        local_start: int,
+        local_end: int,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
+    ) -> torch.Tensor:
+        """Run the SO(2) unit for local destinations with full source reads."""
+        n_full = x_full.shape[0]
+        n_local = x_local.shape[0]
+        ebed_dim = x_full.shape[1]
+        channels = self.channels
+        x_full_pre = self.pre_so2_norm(x_full)
+        x_local_pre = self.pre_so2_norm(x_local)
+        so2_unit_output = self.so2_conv.forward_gp(
+            x_full=x_full_pre.reshape(n_full, ebed_dim, channels),
+            x_local=x_local_pre.reshape(n_local, ebed_dim, channels),
+            edge_cache=edge_cache,
+            radial_feat=radial_feat,
+            local_start=local_start,
+            local_end=local_end,
+            type_embedding=type_embedding,
+            ep_group=ep_group,
+        )
+        return self.post_so2_norm(so2_unit_output.unsqueeze(2))
+
+    def forward_gp(
+        self,
+        *,
+        x_full: torch.Tensor,
+        x_local: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+        local_start: int,
+        local_end: int,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
+    ) -> torch.Tensor:
+        """Run one graph-parallel block for this rank's center-atom shard."""
+        if self.use_full_attn_res or self.use_block_attn_res:
+            raise NotImplementedError(
+                "SeZM flat graph parallelism does not yet support descriptor-level "
+                "full_attn_res/block_attn_res."
+            )
+        if x_local.shape[0] != local_end - local_start:
+            raise RuntimeError(
+                "SeZM GP local feature count does not match flat graph partition."
+            )
+
+        with nvtx_range("so2_conv"):
+            so2_unit_output = self._run_so2_unit_gp(
+                x_full=x_full,
+                x_local=x_local,
+                edge_cache=edge_cache,
+                radial_feat=radial_feat,
+                local_start=local_start,
+                local_end=local_end,
+                type_embedding=type_embedding,
+                ep_group=ep_group,
+            )
+            so2_state = x_local + so2_unit_output
+
+        with nvtx_range("ffn"):
+            ffn_state = so2_state
+            for i in range(self.ffn_blocks):
+                ffn_unit_output = self._run_ffn_unit(ffn_state, i)
+                ffn_state = ffn_state + ffn_unit_output
+
+        return ffn_state
+
     def _forward_with_residual_shortcuts(
         self,
         x: torch.Tensor,

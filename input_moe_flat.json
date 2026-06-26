@@ -1,0 +1,142 @@
+{
+  "_comment": "SeZM MoE + LMDB mixed_batch flat training. Run from the repository root or replace the LMDB paths.",
+  "model": {
+    "type": "SeZM",
+    "type_map": [
+      "O",
+      "H"
+    ],
+    "pair_exclude_types": [],
+    "descriptor": {
+      "type": "SeZM",
+      "sel": 120,
+      "rcut": 6.0,
+      "env_exp": [
+        7,
+        5
+      ],
+      "channels": 64,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_mlp": [
+        0
+      ],
+      "use_env_seed": true,
+      "random_gamma": true,
+      "l_schedule": [
+        3,
+        3,
+        2
+      ],
+      "mmax": 1,
+      "so2_norm": false,
+      "so2_layers": 4,
+      "so2_attn_res": "none",
+      "n_focus": 3,
+      "focus_dim": 0,
+      "n_atten_head": 1,
+      "mixed_attention": false,
+      "legacy_attention": true,
+      "ffn_neurons": 0,
+      "grid_mlp": false,
+      "ffn_blocks": 1,
+      "sandwich_norm": [
+        true,
+        false,
+        true,
+        false
+      ],
+      "mlp_bias": false,
+      "layer_scale": false,
+      "full_attn_res": "none",
+      "block_attn_res": "none",
+      "s2_activation": [
+        false,
+        true
+      ],
+      "lebedev_quadrature": [
+        false,
+        true
+      ],
+      "activation_function": "silu",
+      "glu_activation": true,
+      "use_amp": true,
+      "add_chg_spin_ebd": false,
+      "use_moe": true,
+      "n_routing_experts": 64,
+      "topk": 2,
+      "n_shared_experts": 1,
+      "ep_size": 8,
+      "routing_input": "dst",
+      "precision": "float32",
+      "seed": 42
+    },
+    "fitting_net": {
+      "neuron": [
+        0
+      ],
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 42
+    },
+    "use_compile": false,
+    "enable_tf32": true
+  },
+  "learning_rate": {
+    "type": "wsd",
+    "start_lr": 4.5e-4,
+    "stop_lr": 1e-6,
+    "warmup_steps": 5000,
+    "warmup_start_factor": 0.2,
+    "decay_phase_ratio": 0.65,
+    "decay_type": "cosine"
+  },
+  "loss": {
+    "type": "ener",
+    "loss_func": "mae",
+    "f_use_norm": true,
+    "start_pref_e": 20,
+    "limit_pref_e": 20,
+    "start_pref_f": 20,
+    "limit_pref_f": 20,
+    "start_pref_v": 0,
+    "limit_pref_v": 0
+  },
+  "optimizer": {
+    "type": "HybridMuon",
+    "muon_mode": "slice",
+    "enable_gram": true,
+    "magma_muon": false,
+    "lr_adjust": 0.0,
+    "weight_decay": 0.001
+  },
+  "training": {
+    "stat_file": "./se_zm_moe_flat.hdf5",
+    "training_data": {
+      "systems": "examples/lmdb_downsample_data/water_training.lmdb",
+      "batch_size": "max:2048",
+      "mixed_batch": true
+    },
+    "validation_data": {
+      "systems": "examples/lmdb_downsample_data/water_validation.lmdb",
+      "batch_size": "max:2048",
+      "mixed_batch": true,
+      "numb_btch": 1
+    },
+    "numb_steps": 1000000,
+    "gradient_max_norm": 5.0,
+    "save_ckpt": "model_moe_flat.ckpt",
+    "save_freq": 1000,
+    "max_ckpt_keep": 3,
+    "enable_ema": false,
+    "disp_file": "lcurve_moe_flat.out",
+    "disp_freq": 100,
+    "disp_avg": true,
+    "disp_training": true,
+    "time_training": true,
+    "tensorboard": false,
+    "enable_profiler": false,
+    "zero_stage": 0,
+    "seed": 7
+  }
+}

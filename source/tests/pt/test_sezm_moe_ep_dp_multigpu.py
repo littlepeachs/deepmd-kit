@@ -100,6 +100,13 @@ def expected_world_grad(pre_grad: torch.Tensor, world_size: int) -> torch.Tensor
     return expected
 
 
+def expected_world_sum(pre_grad: torch.Tensor) -> torch.Tensor:
+    """Compute expected world-summed gradient without data-parallel averaging."""
+    expected = pre_grad.detach().clone()
+    dist.all_reduce(expected, op=dist.ReduceOp.SUM)
+    return expected
+
+
 def assert_dp_group_consistent(tensor: torch.Tensor, group: object | None) -> None:
     """Assert all ranks in a DP group have the same tensor."""
     group_size = dist.get_world_size(group=group) if group is not None else 1
@@ -203,6 +210,35 @@ class TestSeZMMoEEPDP(unittest.TestCase):
                 f"{model.routing_stack.routing_matrix_m0.grad.flatten()[0].item():.17e} "
                 f"expected={expected.flatten()[0].item():.17e}\n"
             )
+
+    def test_shared_axis_gp_divisors_world2(self) -> None:
+        if self.world != 2:
+            self.skipTest("shared-axis GP divisor test runs with 2 ranks")
+        _, dp_group, _, _, _, dp_size = init_ep_dp_groups(self.world)
+        model = TinyGradModel(self.device)
+        pre = assign_known_grads(model, self.rank)
+        expected_routing = pre["routing_stack.routing_matrix_m0"]
+        expected_shared = expected_world_sum(pre["shared_stack.shared_matrix_m0"])
+
+        sync_moe_gradients(
+            model,
+            dp_group,
+            None,
+            dp_size,
+            self.world,
+            non_routing_divisor=1.0,
+            routing_expert_divisor=1.0,
+        )
+
+        torch.testing.assert_close(
+            model.routing_stack.routing_matrix_m0.grad,
+            expected_routing,
+        )
+        torch.testing.assert_close(
+            model.shared_stack.shared_matrix_m0.grad,
+            expected_shared,
+        )
+        assert_world_consistent(model.shared_stack.shared_matrix_m0.grad)
 
     def test_8gpu_ep4_dp2(self) -> None:
         if self.world != 8:

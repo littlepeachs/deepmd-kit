@@ -4397,6 +4397,10 @@ If MPI is used, the value should be considered as the batch size per task.'
 - "prob_sys_size" : the probability of a system is proportional to the number of batches in the system\n\n\
 - "prob_sys_size;stt_idx:end_idx:weight;stt_idx:end_idx:weight;..." : the list of systems is divided into blocks. A block is specified by `stt_idx:end_idx:weight`, where `stt_idx` is the starting index of the system, `end_idx` is then ending (not including) index of the system, the probabilities of the systems in this block sums up to `weight`, and the relatively probabilities within this block is proportional to the number of batches in the system.'
     doc_sys_probs = "A list of float if specified. Should be of the same length as `systems`, specifying the probability of each system."
+    doc_mixed_batch = (
+        "For PyTorch LMDB datasets, allow frames with different atom counts in "
+        "one batch. This enables the flat mixed-batch training path."
+    )
     doc_min_pair_dist = (
         "Minimum pairwise atomic distance threshold in Å. "
         "Frames containing any atom pair closer than this distance are excluded "
@@ -4447,6 +4451,13 @@ If MPI is used, the value should be considered as the batch size per task.'
             alias=["sys_weights"],
         ),
         Argument(
+            "mixed_batch",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_mixed_batch,
+        ),
+        Argument(
             "min_pair_dist",
             float,
             optional=True,
@@ -4493,6 +4504,10 @@ def validation_data_args() -> list[
 - "prob_sys_size;stt_idx:end_idx:weight;stt_idx:end_idx:weight;..." : the list of systems is divided into blocks. A block is specified by `stt_idx:end_idx:weight`, where `stt_idx` is the starting index of the system, `end_idx` is then ending (not including) index of the system, the probabilities of the systems in this block sums up to `weight`, and the relatively probabilities within this block is proportional to the number of batches in the system.'
     doc_sys_probs = "A list of float if specified. Should be of the same length as `systems`, specifying the probability of each system."
     doc_numb_btch = "An integer that specifies the number of batches to be sampled for each validation period."
+    doc_mixed_batch = (
+        "For PyTorch LMDB datasets, allow frames with different atom counts in "
+        "one batch. This enables the flat mixed-batch validation path."
+    )
 
     args = [
         Argument(
@@ -4529,6 +4544,13 @@ def validation_data_args() -> list[
             default=None,
             doc=doc_sys_probs,
             alias=["sys_weights"],
+        ),
+        Argument(
+            "mixed_batch",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_mixed_batch,
         ),
         Argument(
             "numb_btch",
@@ -4694,6 +4716,17 @@ def training_args(
         "Default is 0. Requires distributed launch via torchrun. "
         "Currently supports single-task training; does not support LKF or change_bias_after_training."
     )
+    doc_graph_parallel = (
+        "Enable the PyTorch SeZM flat graph-parallel training path. "
+        "The first supported mode is a shared axis with "
+        "world_size == graph_parallel_size == model.descriptor.ep_size and "
+        "requires LMDB mixed_batch=True data."
+    )
+    doc_graph_parallel_size = (
+        "Number of ranks in the graph-parallel group. In the first supported "
+        "SeZM GP+MoE mode, this must equal model.descriptor.ep_size and the "
+        "distributed world size."
+    )
 
     arg_training_data = training_data_args()
     arg_validation_data = validation_data_args()
@@ -4851,6 +4884,22 @@ def training_args(
             optional=True,
             default=0,
             doc=doc_only_pt_supported + doc_zero_stage,
+        ),
+        Argument(
+            "graph_parallel",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_graph_parallel,
+        ),
+        Argument(
+            "graph_parallel_size",
+            int,
+            optional=True,
+            default=1,
+            doc=doc_only_pt_supported + doc_graph_parallel_size,
+            extra_check=lambda x: x > 0,
+            extra_check_errmsg="must be greater than 0",
         ),
         Argument(
             "enable_compile",

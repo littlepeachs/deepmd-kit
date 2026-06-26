@@ -248,8 +248,8 @@ class LmdbDataReader:
       by nloc and yields same-nloc batches. Auto batch_size is computed
       per-nloc-group.
     - ``mixed_batch=True`` (new format): frames with different nloc can
-      coexist in one batch (requires padding + mask in collate_fn).
-      Currently raises ``NotImplementedError`` at collation time.
+      coexist in one batch. PyTorch collates these frames into flat atom-wise
+      tensors with ``batch``/``ptr`` metadata.
 
     Parameters
     ----------
@@ -275,7 +275,7 @@ class LmdbDataReader:
           drops every frame whose ``nloc > N`` from the dataset. By
           construction every retained batch has at most ``N`` atoms.
     mixed_batch : bool
-        If True, allow different nloc in the same batch (future).
+        If True, allow different nloc in the same batch.
         If False (default), enforce same-nloc-per-batch.
     """
 
@@ -322,25 +322,23 @@ class LmdbDataReader:
         # Safe because we use num_workers=0 in DataLoader.
         self._txn = self._env.begin()
 
-        # Scan per-frame nloc only when needed for same-nloc batching.
-        # For mixed_batch=True, skip the scan entirely (future: padding handles it).
+        # Keep per-frame nlocs even for mixed_batch=True.  Training batches use
+        # flat collation, but stat collection still relies on same-nloc groups
+        # so that torch.cat sees compatible shapes.
         # ``orig_frame_nlocs`` / ``orig_frame_system_ids`` are indexed by the
         # *original* LMDB frame index. After a potential ``filter:N`` drop we
         # rebuild ``self._frame_nlocs`` / ``self._frame_system_ids`` so they
         # are parallel arrays over the *dataset* index space (0..len(self));
         # the dataset-to-original mapping lives in ``self._retained_keys``.
-        if not mixed_batch:
-            # Fast path: use pre-computed frame_nlocs from metadata if available.
-            # Falls back to scanning each frame's atom_types shape (~10 us/frame).
-            meta_nlocs = meta.get("frame_nlocs")
-            if meta_nlocs is not None:
-                orig_frame_nlocs = [int(n) for n in meta_nlocs]
-            else:
-                orig_frame_nlocs = _scan_frame_nlocs(
-                    self._env, self.nframes, self._frame_fmt, self._natoms
-                )
+        # Fast path: use pre-computed frame_nlocs from metadata if available.
+        # Falls back to scanning each frame's atom_types shape (~10 us/frame).
+        meta_nlocs = meta.get("frame_nlocs")
+        if meta_nlocs is not None:
+            orig_frame_nlocs = [int(n) for n in meta_nlocs]
         else:
-            orig_frame_nlocs = []
+            orig_frame_nlocs = _scan_frame_nlocs(
+                self._env, self.nframes, self._frame_fmt, self._natoms
+            )
 
         # Parse frame_system_ids for auto_prob support. ``_nsystems`` must stay
         # at ``max(original_sid) + 1`` even after filter:N so that user-facing
@@ -376,17 +374,6 @@ class LmdbDataReader:
                     "Expected int, 'auto', 'auto:N', 'max:N', or 'filter:N'."
                 )
 
-        # ``filter:N`` needs per-frame nloc to drop oversized frames; the
-        # ``mixed_batch=True`` fast path skips the nloc scan entirely, so the
-        # two options are incompatible. Fail fast rather than silently
-        # retaining every frame and breaking the documented contract.
-        if self._filter_rule is not None and mixed_batch:
-            raise ValueError(
-                "batch_size='filter:N' is incompatible with mixed_batch=True: "
-                "per-frame nloc is unavailable in the mixed-batch fast path. "
-                "Use mixed_batch=False, or switch to 'max:N' / a fixed int."
-            )
-
         # Determine which original-index frames survive the filter. Without
         # ``filter:N`` every frame is retained.
         if self._filter_rule is not None:
@@ -412,10 +399,7 @@ class LmdbDataReader:
         # space so that every downstream consumer (nloc_groups, system_groups,
         # SameNlocBatchSampler, _expand_indices_by_blocks) operates in a
         # single, self-consistent indexing scheme.
-        if not mixed_batch:
-            self._frame_nlocs = [orig_frame_nlocs[k] for k in retained_keys]
-        else:
-            self._frame_nlocs = []
+        self._frame_nlocs = [orig_frame_nlocs[k] for k in retained_keys]
 
         if orig_frame_system_ids is not None:
             self._frame_system_ids: list[int] | None = [
@@ -425,12 +409,9 @@ class LmdbDataReader:
             self._frame_system_ids = None
 
         # Group retained frames by nloc using dataset indices (0..len-1).
-        if not mixed_batch:
-            self._nloc_groups: dict[int, list[int]] = {}
-            for ds_idx, nloc in enumerate(self._frame_nlocs):
-                self._nloc_groups.setdefault(nloc, []).append(ds_idx)
-        else:
-            self._nloc_groups = {}
+        self._nloc_groups: dict[int, list[int]] = {}
+        for ds_idx, nloc in enumerate(self._frame_nlocs):
+            self._nloc_groups.setdefault(nloc, []).append(ds_idx)
 
         # Group retained frames by original system id; the sid numbering is
         # preserved (no compression) so user-facing auto_prob slices stay

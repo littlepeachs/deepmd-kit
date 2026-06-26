@@ -960,21 +960,22 @@ class TestMaxFilterBatchSize(unittest.TestCase):
                 LmdbDataReader(self._uniform_path, self._type_map, batch_size=spec)
             self.assertIn("positive", str(ctx.exception))
 
-    def test_filter_with_mixed_batch_rejected(self):
-        """``filter:N`` + ``mixed_batch=True`` must fail loudly.
+    def test_filter_with_mixed_batch_keeps_nloc_groups(self):
+        """``mixed_batch=True`` still scans nlocs for stat collection."""
+        reader = LmdbDataReader(
+            self._mixed_path,
+            self._type_map,
+            batch_size="filter:10",
+            mixed_batch=True,
+        )
 
-        The mixed-batch fast path skips the per-frame nloc scan, so
-        filter:N cannot honour its documented ``nloc > N`` drop.
-        """
-        with self.assertRaises(ValueError) as ctx:
-            LmdbDataReader(
-                self._mixed_path,
-                self._type_map,
-                batch_size="filter:10",
-                mixed_batch=True,
-            )
-        self.assertIn("filter", str(ctx.exception))
-        self.assertIn("mixed_batch", str(ctx.exception))
+        self.assertEqual(len(reader), 8)
+        self.assertEqual(reader._retained_keys, [0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(reader.frame_nlocs, [6, 6, 6, 6, 9, 9, 9, 9])
+        self.assertEqual(sorted(reader.nloc_groups), [6, 9])
+        for nloc, indices in reader.nloc_groups.items():
+            self.assertTrue(indices)
+            self.assertTrue(all(reader.frame_nlocs[idx] == nloc for idx in indices))
 
     def test_auto_prob_with_filter_still_works(self):
         """compute_block_targets + sampler survive a fully-dropped block."""

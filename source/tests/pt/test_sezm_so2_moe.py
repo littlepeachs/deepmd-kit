@@ -217,6 +217,91 @@ def test_use_moe_true_requires_type_embedding() -> None:
         module(x, cache, radial_feat)
 
 
+def test_use_moe_dst_routing_reads_destination_embedding() -> None:
+    module = _make_so2(use_moe=True, moe_config=_moe_config(routing_input="dst"))
+    x, cache, radial_feat = _inputs(module)
+    type_embedding = torch.arange(
+        4 * module.channels,
+        dtype=module.dtype,
+        device=_device_of(module),
+    ).reshape(4, module.channels)
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_moe(
+        x_local: torch.Tensor,
+        routing_key: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        captured["routing_key"] = routing_key.detach().clone()
+        return torch.zeros_like(x_local)
+
+    module.moe_conv.forward = capture_moe  # type: ignore[method-assign]
+
+    module(x, cache, radial_feat, type_embedding=type_embedding)
+
+    torch.testing.assert_close(
+        captured["routing_key"],
+        type_embedding.index_select(0, cache.dst),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+def test_use_moe_dst_routing_gp_reads_local_destination_embedding() -> None:
+    module = _make_so2(use_moe=True, moe_config=_moe_config(routing_input="dst"))
+    x, cache, radial_feat = _inputs(module)
+    type_embedding = torch.arange(
+        4 * module.channels,
+        dtype=module.dtype,
+        device=_device_of(module),
+    ).reshape(4, module.channels)
+    local_start, local_end = 1, 3
+    edge_mask = (cache.dst >= local_start) & (cache.dst < local_end)
+    local_cache = cache._replace(
+        src=cache.src[edge_mask],
+        dst=cache.dst[edge_mask],
+        edge_type_feat=cache.edge_type_feat[edge_mask],
+        edge_vec=cache.edge_vec[edge_mask],
+        edge_rbf=cache.edge_rbf[edge_mask],
+        edge_env=cache.edge_env[edge_mask],
+        D_full=cache.D_full[edge_mask],
+        Dt_full=cache.Dt_full[edge_mask],
+        D_to_m_cache={},
+        Dt_from_m_cache={},
+        edge_src_gate=(
+            None if cache.edge_src_gate is None else cache.edge_src_gate[edge_mask]
+        ),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_moe(
+        x_local: torch.Tensor,
+        routing_key: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        captured["routing_key"] = routing_key.detach().clone()
+        return torch.zeros_like(x_local)
+
+    module.moe_conv.forward = capture_moe  # type: ignore[method-assign]
+
+    module.forward_gp(
+        x_full=x,
+        x_local=x[local_start:local_end],
+        edge_cache=local_cache,
+        radial_feat=radial_feat[edge_mask],
+        local_start=local_start,
+        local_end=local_end,
+        type_embedding=type_embedding,
+    )
+
+    torch.testing.assert_close(
+        captured["routing_key"],
+        type_embedding.index_select(0, cache.dst[edge_mask]),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
 @pytest.mark.parametrize("routing_input", ["dst", "src", "src+dst"])
 def test_use_moe_true_routing_input_variants(routing_input: str) -> None:
     module = _make_so2(
@@ -230,6 +315,54 @@ def test_use_moe_true_routing_input_variants(routing_input: str) -> None:
 
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("routing_input", ["dst", "src", "src+dst"])
+def test_use_moe_true_forward_gp_matches_full_local_shard(
+    routing_input: str,
+) -> None:
+    module = _make_so2(
+        use_moe=True,
+        moe_config=_moe_config(routing_input=routing_input),
+    )
+    _randomize_parameters(module)
+    x, cache, radial_feat = _inputs(module)
+    type_embedding = _type_embedding(module)
+    local_start, local_end = 1, 3
+    edge_mask = (cache.dst >= local_start) & (cache.dst < local_end)
+    local_cache = cache._replace(
+        src=cache.src[edge_mask],
+        dst=cache.dst[edge_mask],
+        edge_type_feat=cache.edge_type_feat[edge_mask],
+        edge_vec=cache.edge_vec[edge_mask],
+        edge_rbf=cache.edge_rbf[edge_mask],
+        edge_env=cache.edge_env[edge_mask],
+        D_full=cache.D_full[edge_mask],
+        Dt_full=cache.Dt_full[edge_mask],
+        D_to_m_cache={},
+        Dt_from_m_cache={},
+        edge_src_gate=(
+            None if cache.edge_src_gate is None else cache.edge_src_gate[edge_mask]
+        ),
+    )
+
+    full_out = module(x, cache, radial_feat, type_embedding=type_embedding)
+    gp_out = module.forward_gp(
+        x_full=x,
+        x_local=x[local_start:local_end],
+        edge_cache=local_cache,
+        radial_feat=radial_feat[edge_mask],
+        local_start=local_start,
+        local_end=local_end,
+        type_embedding=type_embedding,
+    )
+
+    torch.testing.assert_close(
+        gp_out,
+        full_out[local_start:local_end],
+        atol=1e-12,
+        rtol=1e-12,
+    )
 
 
 def test_use_moe_true_backward() -> None:

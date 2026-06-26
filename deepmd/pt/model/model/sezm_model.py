@@ -633,6 +633,23 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         force_input: Float[Tensor, "nf nloc 3"] | None = None,
         noise_mask: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
+        batch: torch.Tensor | None = None,
+        ptr: torch.Tensor | None = None,
+        extended_atype: torch.Tensor | None = None,
+        extended_batch: torch.Tensor | None = None,
+        extended_image: torch.Tensor | None = None,
+        extended_ptr: torch.Tensor | None = None,
+        mapping: torch.Tensor | None = None,
+        central_ext_index: torch.Tensor | None = None,
+        nlist: torch.Tensor | None = None,
+        nlist_ext: torch.Tensor | None = None,
+        a_nlist: torch.Tensor | None = None,
+        a_nlist_ext: torch.Tensor | None = None,
+        nlist_mask: torch.Tensor | None = None,
+        a_nlist_mask: torch.Tensor | None = None,
+        edge_index: torch.Tensor | None = None,
+        angle_index: torch.Tensor | None = None,
+        flat_graph_partition: Any | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass using standard neighbor list.
@@ -668,6 +685,36 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Model predictions including atom_energy, energy, force, virial,
             atom_virial, and mask.
         """
+        if batch is not None and ptr is not None:
+            return self.forward_flat(
+                coord=coord,
+                atype=atype,
+                batch=batch,
+                ptr=ptr,
+                box=box,
+                fparam=fparam,
+                aparam=aparam,
+                do_atomic_virial=do_atomic_virial,
+                force_input=force_input,
+                noise_mask=noise_mask,
+                charge_spin=charge_spin,
+                extended_atype=extended_atype,
+                extended_batch=extended_batch,
+                extended_image=extended_image,
+                extended_ptr=extended_ptr,
+                mapping=mapping,
+                central_ext_index=central_ext_index,
+                nlist=nlist,
+                nlist_ext=nlist_ext,
+                a_nlist=a_nlist,
+                a_nlist_ext=a_nlist_ext,
+                nlist_mask=nlist_mask,
+                a_nlist_mask=a_nlist_mask,
+                edge_index=edge_index,
+                angle_index=angle_index,
+                flat_graph_partition=flat_graph_partition,
+            )
+
         model_ret = self.forward_common(
             coord,
             atype,
@@ -730,6 +777,441 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             model_predict = model_ret
             model_predict["updated_coord"] += coord
         return model_predict
+
+    def forward_flat(
+        self,
+        *,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+        box: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+        force_input: torch.Tensor | None = None,
+        noise_mask: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
+        extended_atype: torch.Tensor | None = None,
+        extended_batch: torch.Tensor | None = None,
+        extended_image: torch.Tensor | None = None,
+        extended_ptr: torch.Tensor | None = None,
+        mapping: torch.Tensor | None = None,
+        central_ext_index: torch.Tensor | None = None,
+        nlist: torch.Tensor | None = None,
+        nlist_ext: torch.Tensor | None = None,
+        a_nlist: torch.Tensor | None = None,
+        a_nlist_ext: torch.Tensor | None = None,
+        nlist_mask: torch.Tensor | None = None,
+        a_nlist_mask: torch.Tensor | None = None,
+        edge_index: torch.Tensor | None = None,
+        angle_index: torch.Tensor | None = None,
+        flat_graph_partition: Any | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Forward pass for flattened mixed-nloc LMDB batches."""
+        del extended_ptr, nlist, a_nlist, a_nlist_ext, a_nlist_mask, angle_index
+        if self.get_active_mode() == "dens":
+            raise NotImplementedError(
+                "SeZM flat mixed_batch does not support dens mode."
+            )
+        if force_input is not None or noise_mask is not None:
+            raise NotImplementedError(
+                "SeZM flat mixed_batch does not support force_input/noise_mask."
+            )
+        if fparam is not None:
+            raise NotImplementedError(
+                "SeZM flat mixed_batch does not yet support frame parameters."
+            )
+        if charge_spin is not None:
+            raise NotImplementedError(
+                "SeZM flat mixed_batch does not yet support charge_spin inputs."
+            )
+        if do_atomic_virial:
+            raise NotImplementedError(
+                "Atomic virial is not implemented for SeZM flat mixed_batch."
+            )
+        required_graph = (
+            extended_atype,
+            extended_batch,
+            extended_image,
+            mapping,
+            central_ext_index,
+            nlist_ext,
+            nlist_mask,
+            edge_index,
+        )
+        if any(item is None for item in required_graph):
+            raise RuntimeError(
+                "SeZM flat mixed_batch requires precomputed flat graph fields "
+                "from Trainer.get_data()."
+            )
+
+        cc, bb, fp, ap, input_prec = self._input_type_cast(
+            coord,
+            box=box,
+            fparam=fparam,
+            aparam=aparam,
+        )
+        del fp
+        cc = cc.reshape(-1, 3)
+        atype = atype.reshape(-1)
+        batch = batch.to(device=cc.device, dtype=torch.long)
+        ptr = ptr.to(device=cc.device, dtype=torch.long)
+        if ap is not None:
+            ap = ap.reshape(1, atype.numel(), -1)
+
+        if self.do_grad_r("energy") or self.do_grad_c("energy"):
+            cc = cc.clone().detach().requires_grad_(True)
+        else:
+            cc = cc.detach()
+        if self.do_grad_c("energy") and bb is not None:
+            bb = bb.clone().detach().requires_grad_(True)
+
+        from deepmd.pt.utils.nlist import rebuild_extended_coord_from_flat_graph
+
+        assert extended_batch is not None
+        assert extended_image is not None
+        assert mapping is not None
+        extended_coord = rebuild_extended_coord_from_flat_graph(
+            cc,
+            bb,
+            mapping.to(device=cc.device, dtype=torch.long),
+            extended_batch.to(device=cc.device, dtype=torch.long),
+            extended_image.to(device=cc.device),
+        )
+
+        model_ret = self.core_compute_flat(
+            coord=cc,
+            atype=atype,
+            batch=batch,
+            ptr=ptr,
+            extended_coord=extended_coord,
+            extended_atype=extended_atype,
+            extended_batch=extended_batch,
+            mapping=mapping,
+            central_ext_index=central_ext_index,
+            nlist_ext=nlist_ext,
+            nlist_mask=nlist_mask,
+            edge_index=edge_index,
+            flat_graph_partition=flat_graph_partition,
+            aparam=ap,
+        )
+        model_ret = self._compute_derivatives_flat(
+            model_ret,
+            coord=cc,
+            extended_coord=extended_coord,
+            extended_batch=extended_batch,
+            batch=batch,
+            ptr=ptr,
+        )
+
+        model_predict: dict[str, torch.Tensor] = {
+            "atom_energy": model_ret["energy"],
+            "energy": model_ret["energy_redu"],
+        }
+        if "dforce" in model_ret:
+            model_predict["force"] = model_ret["dforce"]
+        if "energy_derv_c_redu" in model_ret:
+            model_predict["virial"] = model_ret["energy_derv_c_redu"].reshape(-1, 9)
+        if "mask" in model_ret:
+            model_predict["mask"] = model_ret["mask"]
+
+        return self._output_type_cast(model_predict, input_prec)
+
+    def build_edge_list_from_flat_graph(
+        self,
+        *,
+        extended_coord: torch.Tensor,
+        central_ext_index: torch.Tensor,
+        nlist_ext: torch.Tensor,
+        nlist_mask: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_ids: torch.Tensor | None = None,
+        dummy_owner: int | None = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build SeZM sparse edge tensors from precomputed flat graph indices."""
+        device = extended_coord.device
+        edge_index = edge_index.to(device=device, dtype=torch.long)
+        nlist_ext = nlist_ext.to(device=device, dtype=torch.long)
+        nlist_mask = nlist_mask.to(device=device, dtype=torch.bool)
+        central_ext_index = central_ext_index.to(device=device, dtype=torch.long)
+
+        owner = edge_index[0]
+        src_local = edge_index[1]
+        neighbor_ext = nlist_ext[nlist_mask]
+        if edge_ids is not None:
+            edge_ids = edge_ids.to(device=device, dtype=torch.long)
+            neighbor_ext = neighbor_ext.index_select(0, edge_ids)
+        if neighbor_ext.numel() != edge_index.shape[1]:
+            raise RuntimeError(
+                "SeZM flat edge vector construction does not match edge_index."
+            )
+        center_ext = central_ext_index.index_select(0, owner)
+        coord_for_diff = extended_coord.to(
+            dtype=self.atomic_model.descriptor.compute_dtype
+        )
+        edge_vec = coord_for_diff.index_select(
+            0, neighbor_ext
+        ) - coord_for_diff.index_select(0, center_ext)
+        sezm_edge_index = torch.stack([src_local, owner], dim=0)
+        edge_mask = torch.ones(
+            sezm_edge_index.shape[1],
+            dtype=torch.bool,
+            device=device,
+        )
+
+        if dummy_owner is not None:
+            dummy_index = torch.tensor(
+                [[0], [dummy_owner]],
+                dtype=torch.long,
+                device=device,
+            )
+            dummy_vec = edge_vec.new_zeros((1, 3))
+            sezm_edge_index = torch.cat([sezm_edge_index, dummy_index], dim=1)
+            edge_vec = torch.cat([edge_vec, dummy_vec], dim=0)
+            edge_mask = torch.cat(
+                [edge_mask, torch.zeros(1, dtype=torch.bool, device=device)],
+                dim=0,
+            )
+        return sezm_edge_index, edge_vec, edge_mask
+
+    def core_compute_flat(
+        self,
+        *,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_batch: torch.Tensor,
+        mapping: torch.Tensor,
+        central_ext_index: torch.Tensor,
+        nlist_ext: torch.Tensor,
+        nlist_mask: torch.Tensor,
+        edge_index: torch.Tensor,
+        flat_graph_partition: Any | None = None,
+        aparam: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute SeZM atom outputs from a flat precomputed pair graph."""
+        del extended_atype, extended_batch, mapping
+        n_atoms = int(ptr[-1].item())
+        descriptor_model = self.atomic_model.descriptor
+        atype = atype.to(device=coord.device, dtype=torch.long)
+
+        local_start = 0
+        local_end = n_atoms
+        local_size = n_atoms
+        local_batch = batch
+        local_edge_index = edge_index
+        local_edge_ids = None
+        if flat_graph_partition is not None:
+            if self.inter_potential is not None:
+                raise NotImplementedError(
+                    "SeZM flat graph parallelism does not yet support inter_potential."
+                )
+
+            def part_attr(name: str) -> Any:
+                if isinstance(flat_graph_partition, dict):
+                    return flat_graph_partition[name]
+                return getattr(flat_graph_partition, name)
+
+            local_start = int(part_attr("local_start"))
+            local_end = int(part_attr("local_end"))
+            local_size = int(part_attr("local_size"))
+            if local_size != local_end - local_start:
+                raise RuntimeError("SeZM flat GP partition local_size is inconsistent.")
+            local_edge_index = part_attr("edge_index")
+            local_edge_ids = part_attr("edge_ids")
+            local_batch_attr = part_attr("batch")
+            if isinstance(local_batch_attr, torch.Tensor):
+                local_batch = local_batch_attr.to(device=coord.device, dtype=torch.long)
+            else:
+                local_batch = batch[local_start:local_end]
+
+        if not isinstance(local_edge_index, torch.Tensor):
+            raise RuntimeError("SeZM flat edge_index must be a tensor.")
+        if local_edge_ids is not None and not isinstance(local_edge_ids, torch.Tensor):
+            raise RuntimeError("SeZM flat GP edge_ids must be a tensor.")
+
+        sezm_edge_index, edge_vec, edge_mask = self.build_edge_list_from_flat_graph(
+            extended_coord=extended_coord,
+            central_ext_index=central_ext_index,
+            nlist_ext=nlist_ext,
+            nlist_mask=nlist_mask,
+            edge_index=local_edge_index,
+            edge_ids=local_edge_ids,
+            dummy_owner=(local_start if local_size > 0 else None),
+        )
+
+        with nvtx_range("SeZM/descriptor_flat"):
+            descriptor, _ = descriptor_model.forward_with_edges(
+                extended_coord=coord.reshape(1, n_atoms, 3),
+                extended_atype=atype.reshape(1, n_atoms),
+                edge_index=sezm_edge_index,
+                edge_vec=edge_vec,
+                edge_mask=edge_mask,
+                flat_graph_partition=flat_graph_partition,
+            )
+        if self.atomic_model.enable_eval_descriptor_hook:
+            self.atomic_model.eval_descriptor_list.append(descriptor.detach())
+
+        fit_atype = atype[local_start:local_end]
+        fit_aparam = (
+            None
+            if aparam is None
+            else aparam[:, local_start:local_end, ...].contiguous()
+        )
+        with nvtx_range("SeZM/fitting_net_flat"):
+            fit_ret = self.atomic_model.fitting_net(
+                descriptor,
+                fit_atype.reshape(1, local_size),
+                fparam=None,
+                aparam=fit_aparam,
+            )
+        if self.atomic_model.enable_eval_fitting_last_layer_hook:
+            assert "middle_output" in fit_ret, (
+                "eval_fitting_last_layer not supported for this fitting net!"
+            )
+            self.atomic_model.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
+            )
+        with nvtx_range("SeZM/apply_out_stat_flat"):
+            fit_ret = self.atomic_model.apply_out_stat(
+                fit_ret,
+                fit_atype.reshape(1, local_size),
+            )
+
+        atom_mask = self.atomic_model.make_atom_mask(
+            fit_atype.reshape(1, local_size)
+        ).to(torch.int32)
+        if self.atomic_model.atom_excl is not None:
+            atom_mask *= self.atomic_model.atom_excl(fit_atype.reshape(1, local_size))
+        for key in fit_ret.keys():
+            out_shape = fit_ret[key].shape
+            flat_dim = 1
+            for axis_size in out_shape[2:]:
+                flat_dim *= axis_size
+            fit_ret[key] = (
+                fit_ret[key].reshape([out_shape[0], out_shape[1], flat_dim])
+                * atom_mask[:, :, None]
+            ).view(out_shape)
+        fit_ret["mask"] = atom_mask
+
+        if self.inter_potential is not None:
+            fit_ret["energy"] = fit_ret[
+                "energy"
+            ] + self.inter_potential.forward_from_edges(
+                edge_vec,
+                sezm_edge_index,
+                atype,
+                edge_mask,
+                n_atoms,
+            )
+
+        flat_ret: dict[str, torch.Tensor] = {}
+        for key, value in fit_ret.items():
+            if value.ndim >= 2 and value.shape[0] == 1:
+                flat_ret[key] = value.squeeze(0)
+            else:
+                flat_ret[key] = value
+
+        energy_atomic = flat_ret["energy"]
+        energy_redu = energy_atomic.new_zeros(
+            (ptr.numel() - 1, energy_atomic.shape[-1])
+        )
+        energy_redu.index_add_(0, local_batch, energy_atomic)
+        if flat_graph_partition is not None:
+            from deepmd.pt.utils.graph_parallel import (
+                gather_node_tensor,
+                graph_reduce_backward_enabled,
+                reduce_graph_tensor,
+            )
+
+            energy_redu = reduce_graph_tensor(energy_redu)
+            output_backward = graph_reduce_backward_enabled()
+            flat_ret["energy_local"] = energy_atomic
+            flat_ret["energy"] = gather_node_tensor(
+                energy_atomic,
+                dim=0,
+                backward=output_backward,
+            )
+            if "mask" in flat_ret:
+                flat_ret["mask_local"] = flat_ret["mask"]
+                flat_ret["mask"] = gather_node_tensor(
+                    flat_ret["mask"],
+                    dim=0,
+                    backward=output_backward,
+                )
+        flat_ret["energy_redu"] = energy_redu
+        return flat_ret
+
+    def _compute_derivatives_flat(
+        self,
+        fit_ret: dict[str, torch.Tensor],
+        *,
+        coord: torch.Tensor,
+        extended_coord: torch.Tensor,
+        extended_batch: torch.Tensor,
+        batch: torch.Tensor,
+        ptr: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute force and virial derivatives for flat mixed batches."""
+        del batch
+        energy_atomic = fit_ret.get("energy_local", fit_ret["energy"])
+        energy_sum = energy_atomic.sum()
+        if "energy_local" in fit_ret and energy_atomic.numel() == 0:
+            energy_sum = energy_sum + coord.sum() * 0.0
+
+        if self.do_grad_r("energy"):
+            energy_derv_r = torch.autograd.grad(
+                outputs=energy_sum,
+                inputs=coord,
+                create_graph=self.training,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if energy_derv_r is None:
+                energy_derv_r = coord.new_zeros(coord.shape)
+            if "energy_local" in fit_ret:
+                from deepmd.pt.utils.graph_parallel import reduce_graph_tensor
+
+                energy_derv_r = reduce_graph_tensor(energy_derv_r)
+            fit_ret["energy_derv_r"] = -energy_derv_r.unsqueeze(-2)
+            fit_ret["dforce"] = -energy_derv_r
+
+        if self.do_grad_c("energy"):
+            energy_sum = energy_atomic.sum()
+            if "energy_local" in fit_ret and energy_atomic.numel() == 0:
+                energy_sum = energy_sum + extended_coord.sum() * 0.0
+            energy_derv_ext = torch.autograd.grad(
+                outputs=energy_sum,
+                inputs=extended_coord,
+                create_graph=self.training,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if energy_derv_ext is None:
+                energy_derv_ext = extended_coord.new_zeros(extended_coord.shape)
+            extended_force = -energy_derv_ext
+            extended_virial = torch.einsum(
+                "ik,ij->ikj",
+                extended_force,
+                extended_coord,
+            ).reshape(extended_coord.shape[0], 9)
+            energy_derv_c_redu = extended_virial.new_zeros((ptr.numel() - 1, 9))
+            energy_derv_c_redu.index_add_(
+                0,
+                extended_batch.to(device=extended_coord.device, dtype=torch.long),
+                extended_virial,
+            )
+            if "energy_local" in fit_ret:
+                from deepmd.pt.utils.graph_parallel import reduce_graph_tensor
+
+                energy_derv_c_redu = reduce_graph_tensor(energy_derv_c_redu)
+            fit_ret["energy_derv_c_redu"] = energy_derv_c_redu.unsqueeze(1)
+
+        return fit_ret
 
     def forward_common(
         self,

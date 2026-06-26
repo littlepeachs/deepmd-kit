@@ -1024,6 +1024,8 @@ class SO2Convolution(nn.Module):
         radial_feat: torch.Tensor,
         type_embedding: torch.Tensor | None = None,
         ep_group: object | None = None,
+        x_dst: torch.Tensor | None = None,
+        type_embedding_dst: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -1044,11 +1046,16 @@ class SO2Convolution(nn.Module):
         """
         src, dst = edge_cache.src, edge_cache.dst
         n_node = x.shape[0]
+        n_dst_node = n_node if x_dst is None else x_dst.shape[0]
         n_edge = src.numel()
 
         # === Step 1. Pre-focus channel mixing on full width ===
         with nvtx_range("SO2Conv/pre_focus_mix"):
             x = self.pre_focus_mix(x.unsqueeze(2)).squeeze(2)
+            if x_dst is None:
+                x_dst = x
+            else:
+                x_dst = self.pre_focus_mix(x_dst.unsqueeze(2)).squeeze(2)
 
         # === Step 2. Rotate to edge-aligned local frame ===
         with nvtx_range("SO2Conv/rotate_to_local"):
@@ -1197,15 +1204,22 @@ class SO2Convolution(nn.Module):
         else:
             if type_embedding is None:
                 raise ValueError("use_moe=True requires type_embedding in forward")
+            uses_dst_routing = self.routing_input in {"dst", "src+dst"}
+            if type_embedding_dst is None:
+                if uses_dst_routing and n_dst_node != n_node:
+                    raise ValueError(
+                        "GP/local destination MoE routing requires type_embedding_dst."
+                    )
+                type_embedding_dst = type_embedding
             if self.routing_input == "dst":
-                routing_key = type_embedding.index_select(0, dst)
+                routing_key = type_embedding_dst.index_select(0, dst)
             elif self.routing_input == "src":
                 routing_key = type_embedding.index_select(0, src)
             else:
                 routing_key = torch.cat(
                     [
                         type_embedding.index_select(0, src),
-                        type_embedding.index_select(0, dst),
+                        type_embedding_dst.index_select(0, dst),
                     ],
                     dim=-1,
                 )
@@ -1274,19 +1288,29 @@ class SO2Convolution(nn.Module):
                         dtype=edge_weight.dtype
                     )
                 x_message = x_message * edge_weight.unsqueeze(-1)
-                out = x.new_zeros(x.shape, dtype=self.compute_dtype)
+                out = x.new_zeros(
+                    n_dst_node,
+                    self.ebed_dim_full,
+                    self.hidden_channels,
+                    dtype=self.compute_dtype,
+                )
                 out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
                 out.mul_(edge_cache.inv_sqrt_deg.to(dtype=self.compute_dtype))
-                out = out.to(dtype=self.dtype)  # (N, D, C_wide)
+                out = out.to(dtype=self.dtype)  # (N_dst, D, C_wide)
             else:
                 # === Step 8.1. Build attention logits from scalar channels ===
                 compute_dtype = self.compute_dtype
-                x_l0_node = x[:, 0, :].reshape(
-                    n_node, self.attn_n_focus, self.attn_focus_dim
-                )  # (N, Fa, Ca)
+                x_l0_node = x_dst[:, 0, :].reshape(
+                    n_dst_node, self.attn_n_focus, self.attn_focus_dim
+                )  # (N_dst, Fa, Ca)
                 qk_input = self.attn_qk_norm(x_l0_node.to(dtype=compute_dtype))
-                q_node = self.attn_q_proj(qk_input)  # (N, Fa, Ca)
-                k_node = self.attn_k_proj(qk_input)  # (N, Fa, Ca)
+                q_node = self.attn_q_proj(qk_input)  # (N_dst, Fa, Ca)
+                x_l0_src_node = x[:, 0, :].reshape(
+                    n_node, self.attn_n_focus, self.attn_focus_dim
+                )
+                k_node = self.attn_k_proj(
+                    self.attn_qk_norm(x_l0_src_node.to(dtype=compute_dtype))
+                )  # (N_src, Fa, Ca)
                 q_edge = q_node.index_select(0, dst).reshape(
                     n_edge, self.attn_n_focus, self.n_atten_head, self.head_dim
                 )  # (E, Fa, H, Ch), Ca = H * Ch
@@ -1319,7 +1343,7 @@ class SO2Convolution(nn.Module):
                     logits=attn_logits,
                     edge_env=edge_cache.edge_env.to(dtype=compute_dtype),
                     dst=dst,
-                    n_nodes=n_node,
+                    n_nodes=n_dst_node,
                     z_bias_raw=self.adamw_attn_z_bias_raw,
                     eps=self.eps,
                     src_weight=(
@@ -1349,7 +1373,7 @@ class SO2Convolution(nn.Module):
                     n_edge, 1, self.attn_n_focus, self.n_atten_head, 1
                 )
                 out_heads = torch.zeros(
-                    n_node,
+                    n_dst_node,
                     self.ebed_dim_full,
                     self.attn_n_focus,
                     self.n_atten_head,
@@ -1368,12 +1392,12 @@ class SO2Convolution(nn.Module):
                     )
                 )  # (N, F, H)
                 out_heads = out_heads * attn_output_gate.reshape(
-                    n_node, 1, self.attn_n_focus, self.n_atten_head, 1
-                )  # (N, D, Fa, H, Ch)
+                    n_dst_node, 1, self.attn_n_focus, self.n_atten_head, 1
+                )  # (N_dst, D, Fa, H, Ch)
 
                 # === Step 8.5. Output projection and merge heads ===
                 out_focus = out_heads.reshape(
-                    n_node,
+                    n_dst_node,
                     self.ebed_dim_full,
                     self.attn_n_focus,
                     self.attn_focus_dim,
@@ -1381,13 +1405,55 @@ class SO2Convolution(nn.Module):
                 if self.attn_o_proj is not None:
                     out_focus = self.attn_o_proj(out_focus)
                 out = out_focus.reshape(
-                    n_node, self.ebed_dim_full, self.hidden_channels
-                ).to(dtype=self.dtype)  # (N, D, C_wide)
+                    n_dst_node, self.ebed_dim_full, self.hidden_channels
+                ).to(dtype=self.dtype)  # (N_dst, D, C_wide)
 
         # === Step 9. Final channel mixing ===
         with nvtx_range("SO2Conv/post_focus_mix"):
             out = self.post_focus_mix(out.unsqueeze(2)).squeeze(2)
-        return out  # (N, D, C)
+        return out  # (N_dst, D, C)
+
+    def forward_gp(
+        self,
+        *,
+        x_full: torch.Tensor,
+        x_local: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+        local_start: int,
+        local_end: int,
+        type_embedding: torch.Tensor | None = None,
+        ep_group: object | None = None,
+    ) -> torch.Tensor:
+        """Run SO(2) convolution with full source reads and local destinations."""
+        local_size = local_end - local_start
+        if x_local.shape[0] != local_size:
+            raise RuntimeError(
+                "SO2 GP local feature count does not match flat graph partition."
+            )
+        dst_local = edge_cache.dst - int(local_start)
+        if dst_local.numel() > 0:
+            if torch.any(dst_local < 0) or torch.any(dst_local >= local_size):
+                raise RuntimeError("SO2 GP edge destinations are out of local range.")
+        local_edge_cache = edge_cache._replace(
+            dst=dst_local,
+            deg=edge_cache.deg[local_start:local_end],
+            inv_sqrt_deg=edge_cache.inv_sqrt_deg[local_start:local_end],
+        )
+        type_embedding_local = (
+            None
+            if type_embedding is None
+            else type_embedding[local_start:local_end].contiguous()
+        )
+        return self.forward(
+            x_full,
+            local_edge_cache,
+            radial_feat,
+            type_embedding=type_embedding,
+            ep_group=ep_group,
+            x_dst=x_local,
+            type_embedding_dst=type_embedding_local,
+        )
 
     def serialize(self) -> dict[str, Any]:
         trainable = all(p.requires_grad for p in self.parameters())
